@@ -6,6 +6,7 @@ import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useFlag } from "../../../../lib/flags";
 import {
   fetchVaultDetail,
   depositToVault,
@@ -13,6 +14,8 @@ import {
   type VaultDetail,
   type EpochPhase,
 } from "../../../../lib/api/vaults";
+
+const ABSENT = "—";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -43,6 +46,7 @@ function fmtDateShort(iso: string) {
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
+  const vaultsEnabled = useFlag("vaults");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,10 +59,15 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
 
   useEffect(() => {
+    if (!vaultsEnabled) return;
+    setLoading(true);
+    setError(null);
     fetchVaultDetail(id, token)
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, [id, token]);
+  }, [id, token, vaultsEnabled]);
+
+  const nav = vault?.sharePrice && vault.sharePrice > 0 ? vault.sharePrice : null;
 
   const handleDeposit = async () => {
     if (!vault || !token) return;
@@ -116,20 +125,26 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
             <span>{vault?.name ?? id}</span>
           </div>
 
-          {loading && (
+          {!vaultsEnabled && (
+            <div style={{ padding: "12px 16px", border: "1px solid var(--border-default)", background: "var(--bg-raised)", color: "var(--text-mid)", fontSize: 12 }}>
+              Vaults are not available on this deployment.
+            </div>
+          )}
+
+          {vaultsEnabled && loading && (
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               <div className="skeleton" style={{ height: 80, width: "100%" }} />
               <div className="skeleton" style={{ height: 200, width: "100%" }} />
             </div>
           )}
 
-          {error && (
+          {vaultsEnabled && error && (
             <div style={{ padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
-              {error}
+              Failed to load vault: {error}
             </div>
           )}
 
-          {!loading && !error && !vault && (
+          {vaultsEnabled && !loading && !error && !vault && (
             <div style={{ fontSize: 13, color: "var(--text-lo)" }}>Vault not found.</div>
           )}
 
@@ -143,11 +158,11 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
                     <div>
                       <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 22, fontWeight: 600, marginBottom: 4 }}>{vault.name}</h1>
-                      <div style={{ fontSize: 12, color: "var(--text-mid)" }}>{vault.description}</div>
+                      <div style={{ fontSize: 12, color: "var(--text-mid)", overflowWrap: "anywhere" }}>{vault.description}</div>
                     </div>
                     <div style={{ textAlign: "right" }}>
                       <div className="num" style={{ fontSize: 22, fontWeight: 700, color: "var(--call)" }}>
-                        {(vault.apy * 100).toFixed(1)}%
+                        {vault.apy != null ? `${(vault.apy * 100).toFixed(1)}%` : ABSENT}
                       </div>
                       <div style={{ fontSize: 10, color: "var(--text-lo)" }}>trailing APY</div>
                     </div>
@@ -156,9 +171,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   {/* Stats row */}
                   <div style={{ display: "flex", gap: 0, borderTop: "1px solid var(--border-default)", marginTop: 12 }}>
                     {[
-                      { label: "TVL", value: fmtUsd(vault.tvl) },
-                      { label: "Share Price", value: `$${vault.sharePrice.toFixed(4)}` },
-                      { label: "Epoch", value: `#${vault.currentEpoch}` },
+                      { label: "TVL", value: vault.tvl != null ? fmtUsd(vault.tvl) : ABSENT },
+                      { label: "Share Price", value: nav != null ? `$${nav.toFixed(4)}` : ABSENT },
+                      { label: "Epoch", value: vault.currentEpoch != null ? `#${vault.currentEpoch}` : ABSENT },
                       { label: "Mgmt Fee", value: vault.feeStructure.managementPct > 0 ? `${vault.feeStructure.managementPct}%` : "None" },
                       { label: "Perf Fee", value: `${vault.feeStructure.performancePct}%` },
                     ].map((s, i) => (
@@ -176,10 +191,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                 {/* Epoch timeline */}
                 <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 12 }}>Epoch Timeline</div>
+                  {!vault.currentPhase && (
+                    <div style={{ fontSize: 11, color: "var(--text-lo)" }}>No epoch has started yet.</div>
+                  )}
                   <div style={{ display: "flex", gap: 0 }}>
                     {(["deposit", "active", "settlement"] as EpochPhase[]).map((phase, i) => {
                       const isCurrent = phase === vault.currentPhase;
-                      const isPast = (["deposit", "active", "settlement"] as EpochPhase[]).indexOf(vault.currentPhase) > i;
+                      const isPast = vault.currentPhase != null && (["deposit", "active", "settlement"] as EpochPhase[]).indexOf(vault.currentPhase) > i;
                       return (
                         <div key={phase} style={{ flex: 1, position: "relative" }}>
                           <div style={{
@@ -194,7 +212,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                           }}>
                             {PHASE_LABELS[phase]}
                           </div>
-                          {isCurrent && (
+                          {isCurrent && vault.phaseEndsAt && (
                             <div style={{ fontSize: 9, color: "var(--text-lo)", marginTop: 2 }}>
                               Ends {fmtDate(vault.phaseEndsAt)}
                             </div>
@@ -203,19 +221,21 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       );
                     })}
                   </div>
-                  <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--bg-elevated)", border: `1px solid ${PHASE_COLORS[vault.currentPhase]}`, borderLeft: `3px solid ${PHASE_COLORS[vault.currentPhase]}` }}>
-                    <span style={{ fontSize: 11, color: PHASE_COLORS[vault.currentPhase], fontWeight: 600 }}>
-                      {vault.currentPhase === "deposit" && "Deposits open · Withdrawals processed at epoch start"}
-                      {vault.currentPhase === "active" && "Epoch in progress · Withdrawals queued until settlement"}
-                      {vault.currentPhase === "settlement" && "Settling position · Final P&L being calculated"}
-                    </span>
-                  </div>
+                  {vault.currentPhase && (
+                    <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--bg-elevated)", border: `1px solid ${PHASE_COLORS[vault.currentPhase]}`, borderLeft: `3px solid ${PHASE_COLORS[vault.currentPhase]}` }}>
+                      <span style={{ fontSize: 11, color: PHASE_COLORS[vault.currentPhase], fontWeight: 600 }}>
+                        {vault.currentPhase === "deposit" && "Deposits open · Withdrawals processed at epoch start"}
+                        {vault.currentPhase === "active" && "Epoch in progress · Withdrawals queued until settlement"}
+                        {vault.currentPhase === "settlement" && "Settling position · Final P&L being calculated"}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Payoff explanation */}
                 <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 8 }}>How This Vault Works</div>
-                  <div style={{ fontSize: 12, color: "var(--text-mid)", lineHeight: 1.7 }}>{vault.payoffExplanation}</div>
+                  <div style={{ fontSize: 12, color: "var(--text-mid)", lineHeight: 1.7, overflowWrap: "anywhere" }}>{vault.payoffExplanation}</div>
                 </div>
 
                 {/* Historical epochs */}
@@ -235,6 +255,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       </tr>
                     </thead>
                     <tbody>
+                      {vault.historicalEpochs.length === 0 && (
+                        <tr>
+                          <td colSpan={7} style={{ padding: "12px 16px", fontSize: 11, color: "var(--text-lo)", textAlign: "center" }}>
+                            No completed epochs yet.
+                          </td>
+                        </tr>
+                      )}
                       {vault.historicalEpochs.map(ep => (
                         <tr key={ep.epochNumber} style={{ borderBottom: "1px solid var(--border-subtle)" }}>
                           <td className="num" style={{ padding: "8px 12px", fontSize: 11, textAlign: "right", color: "var(--text-lo)" }}>#{ep.epochNumber}</td>
@@ -333,8 +360,14 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     {activeFlow === "deposit" && (
                       <div style={{ padding: 16 }}>
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
-                          Deposit USDC into the vault. Shares are issued at the current NAV of{" "}
-                          <span className="num" style={{ color: "var(--text-hi)" }}>${vault.sharePrice.toFixed(4)}</span>/share.
+                          {nav != null ? (
+                            <>
+                              Deposit USDC into the vault. Shares are issued at the current NAV of{" "}
+                              <span className="num" style={{ color: "var(--text-hi)" }}>${nav.toFixed(4)}</span>/share.
+                            </>
+                          ) : (
+                            "Deposit USDC into the vault. NAV per share is not available yet."
+                          )}
                         </div>
                         <div style={{ marginBottom: 12 }}>
                           <label style={{ fontSize: 10, color: "var(--text-lo)", display: "block", marginBottom: 4 }}>Amount (USDC)</label>
@@ -350,9 +383,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                               color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
                             }}
                           />
-                          {depositAmount && !isNaN(parseFloat(depositAmount)) && parseFloat(depositAmount) > 0 && (
+                          {nav != null && depositAmount && !isNaN(parseFloat(depositAmount)) && parseFloat(depositAmount) > 0 && (
                             <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
-                              ≈ {(parseFloat(depositAmount) / vault.sharePrice).toFixed(4)} shares
+                              ≈ {(parseFloat(depositAmount) / nav).toFixed(4)} shares
                             </div>
                           )}
                         </div>
@@ -397,9 +430,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                               color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
                             }}
                           />
-                          {withdrawShares && !isNaN(parseFloat(withdrawShares)) && parseFloat(withdrawShares) > 0 && (
+                          {nav != null && withdrawShares && !isNaN(parseFloat(withdrawShares)) && parseFloat(withdrawShares) > 0 && (
                             <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
-                              ≈ ${(parseFloat(withdrawShares) * vault.sharePrice).toFixed(2)} USDC at current NAV
+                              ≈ ${(parseFloat(withdrawShares) * nav).toFixed(2)} USDC at current NAV
                             </div>
                           )}
                         </div>

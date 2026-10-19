@@ -5,6 +5,9 @@ import Link from "next/link";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
 import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import { useFlag } from "../../../lib/flags";
+
+const ABSENT = "—";
 
 const STRATEGY_LABELS: Record<VaultStrategy, string> = {
   covered_call:      "Covered Call",
@@ -29,10 +32,6 @@ function capacityPct(tvl: number, capacity: number) {
   return Math.min(100, (tvl / capacity) * 100);
 }
 
-function fmt(n: number, d = 2) {
-  return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-
 function fmtUsd(n: number) {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
@@ -40,16 +39,20 @@ function fmtUsd(n: number) {
 }
 
 export default function VaultsPage() {
+  const vaultsEnabled = useFlag("vaults");
   const [vaults, setVaults] = useState<VaultSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!vaultsEnabled) return;
+    setLoading(true);
+    setError(null);
     fetchVaults()
       .then(v => { setVaults(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, []);
+  }, [vaultsEnabled]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "var(--bg)", overflow: "hidden", fontFamily: "var(--font-sans)" }}>
@@ -71,15 +74,16 @@ export default function VaultsPage() {
             <p style={{ fontSize: 13, color: "var(--text-mid)", maxWidth: 620 }}>
               Earn passive yield by providing liquidity to automated option-writing strategies.
               Premiums are collected each epoch and compounded into your share price.
-              {process.env.NEXT_PUBLIC_VAULTS !== "live" && (
-                <span style={{ marginLeft: 8, fontSize: 11, color: "var(--atm)", fontStyle: "italic" }}>
-                  (mock data — contracts not yet deployed)
-                </span>
-              )}
             </p>
           </div>
 
-          {loading && (
+          {!vaultsEnabled && (
+            <div style={{ padding: "12px 16px", border: "1px solid var(--border-default)", background: "var(--bg-raised)", color: "var(--text-mid)", fontSize: 12 }}>
+              Vaults are not available on this deployment.
+            </div>
+          )}
+
+          {vaultsEnabled && loading && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {[1, 2, 3].map(i => (
                 <div key={i} className="skeleton" style={{ height: 120, width: "100%" }} />
@@ -87,10 +91,14 @@ export default function VaultsPage() {
             </div>
           )}
 
-          {error && (
+          {vaultsEnabled && error && (
             <div style={{ padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
               Failed to load vaults: {error}
             </div>
+          )}
+
+          {vaultsEnabled && !loading && !error && vaults.length === 0 && (
+            <div style={{ fontSize: 13, color: "var(--text-lo)" }}>No vaults are live yet.</div>
           )}
 
           {/* APY tooltip overlay */}
@@ -120,11 +128,11 @@ export default function VaultsPage() {
           )}
 
           {/* Vault cards */}
-          {!loading && !error && (
+          {vaultsEnabled && !loading && !error && vaults.length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {vaults.map(vault => {
-                const cap = capacityPct(vault.tvl, vault.capacity);
-                const capColor = cap >= 90 ? "var(--put)" : cap >= 70 ? "var(--atm)" : "var(--call)";
+                const cap = vault.tvl != null && vault.capacity ? capacityPct(vault.tvl, vault.capacity) : null;
+                const capColor = cap === null ? "var(--text-lo)" : cap >= 90 ? "var(--put)" : cap >= 70 ? "var(--atm)" : "var(--call)";
                 return (
                   <div key={vault.id} style={{
                     border: "1px solid var(--border-default)", background: "var(--bg-raised)",
@@ -146,7 +154,7 @@ export default function VaultsPage() {
                           <div style={{ fontSize: 10, color: "var(--text-lo)" }}>{STRATEGY_LABELS[vault.strategy]}</div>
                         </div>
                       </div>
-                      <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.5 }}>{vault.description}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.5, overflowWrap: "anywhere" }}>{vault.description}</div>
                       {/* Risk rating */}
                       <div style={{ marginTop: 10 }}>
                         <span style={{
@@ -172,13 +180,13 @@ export default function VaultsPage() {
                           >ⓘ</button>
                         </div>
                         <div className="num" style={{ fontSize: 18, fontWeight: 700, color: "var(--call)" }}>
-                          {(vault.apy * 100).toFixed(1)}%
+                          {vault.apy != null ? `${(vault.apy * 100).toFixed(1)}%` : ABSENT}
                         </div>
                       </div>
                       {/* TVL */}
                       <div>
                         <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>TVL</div>
-                        <div className="num" style={{ fontSize: 18, fontWeight: 700, color: "var(--text-hi)" }}>{fmtUsd(vault.tvl)}</div>
+                        <div className="num" style={{ fontSize: 18, fontWeight: 700, color: "var(--text-hi)" }}>{vault.tvl != null ? fmtUsd(vault.tvl) : ABSENT}</div>
                       </div>
                       {/* Capacity */}
                       <div>
@@ -186,26 +194,30 @@ export default function VaultsPage() {
                           Capacity
                         </div>
                         <div className="num" style={{ fontSize: 12, color: capColor }}>
-                          {fmtUsd(vault.tvl)} / {fmtUsd(vault.capacity)}
+                          {vault.tvl != null && vault.capacity != null ? `${fmtUsd(vault.tvl)} / ${fmtUsd(vault.capacity)}` : ABSENT}
                         </div>
                         <div style={{ height: 3, background: "var(--bg-overlay)", marginTop: 4 }}>
-                          <div style={{ width: `${cap}%`, height: "100%", background: capColor, transition: "width 400ms" }} />
+                          <div style={{ width: `${cap ?? 0}%`, height: "100%", background: capColor, transition: "width 400ms" }} />
                         </div>
                       </div>
                       {/* Current epoch strike */}
                       <div>
                         <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>Current Strike</div>
                         <div className="num" style={{ fontSize: 13, fontWeight: 600, color: "var(--atm)" }}>
-                          {vault.currentStrike >= 1000
-                            ? `$${vault.currentStrike.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                            : `$${vault.currentStrike.toFixed(4)}`}
+                          {vault.currentStrike == null
+                            ? ABSENT
+                            : vault.currentStrike >= 1000
+                              ? `$${vault.currentStrike.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                              : `$${vault.currentStrike.toFixed(4)}`}
                         </div>
                       </div>
                       {/* Expiry */}
                       <div>
                         <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>Expiry</div>
                         <div className="num" style={{ fontSize: 13, color: "var(--text-mid)" }}>
-                          {new Date(vault.currentExpiry).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                          {vault.currentExpiry
+                            ? new Date(vault.currentExpiry).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+                            : ABSENT}
                         </div>
                       </div>
                       {/* Underlying */}
@@ -224,7 +236,7 @@ export default function VaultsPage() {
                       }}>
                         View Vault →
                       </Link>
-                      {cap >= 100 && (
+                      {cap !== null && cap >= 100 && (
                         <div style={{ fontSize: 10, color: "var(--put)", textAlign: "center" }}>Vault full</div>
                       )}
                     </div>
