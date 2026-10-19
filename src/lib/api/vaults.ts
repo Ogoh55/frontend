@@ -16,6 +16,9 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   GET /api/v1/vaults/{id}/epochs
+ *   → VaultEpochLedgerEntry[]   (append-only, derived from on-chain epoch events)
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -53,6 +56,27 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: "expired_worthless" | "exercised" | "active";
   pnlPct: number; // epoch return, positive = profit for depositors
+}
+
+/** Schema version of VaultEpochLedgerEntry. Bump on any breaking field change. */
+export const VAULT_EPOCH_LEDGER_SCHEMA_VERSION = 1;
+
+/**
+ * One append-only epoch ledger row, derived from on-chain epoch events.
+ * Rows are never edited in place; a correction is a new reconciliation row.
+ */
+export interface VaultEpochLedgerEntry {
+  schemaVersion: typeof VAULT_EPOCH_LEDGER_SCHEMA_VERSION;
+  vaultId: string;
+  epochNumber: number;
+  strategy: VaultStrategy;
+  startedAt: string; // ISO — on-chain epoch start timestamp
+  endedAt: string | null; // ISO — null while the epoch is still open
+  premium: number; // USD, total premium collected in the epoch
+  realizedPnl: number; // USD
+  navBefore: number; // USD per share at epoch start
+  navAfter: number | null; // USD per share at epoch end; null while open
+  feeTaken: number; // USD, management + performance fees taken in the epoch
 }
 
 /** The user's position in a vault. */
@@ -210,6 +234,18 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     throw new Error("Live vaults API not yet implemented");
   }
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+}
+
+export async function fetchVaultEpochHistory(
+  id: string,
+  _token?: string | null
+): Promise<VaultEpochLedgerEntry[]> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiGet<VaultEpochLedgerEntry[]>(`/api/v1/vaults/${id}/epochs`, token);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  // Mock: no ledger rows; backfill of pre-existing mock epochs is out of scope.
+  return Promise.resolve([]);
 }
 
 export async function depositToVault(
