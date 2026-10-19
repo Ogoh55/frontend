@@ -140,5 +140,34 @@
   "notFound": {
     "title": "Página no encontrada",
     "back": "Volver a la terminal"
+  },
+  "vaults": {
+    "capacity": "Capacidad",
+    "remaining": "{amount} disponibles",
+    "utilised": "{percent}% utilizado",
+    "limitsAsOf": "Límites al {time}",
+    "status": {
+      "open": "Los depósitos están abiertos para la época #{epoch}.",
+      "queued": "Los depósitos están cerrados en esta época. Un depósito ahora se encola para la época #{epoch}.",
+      "waitlist": "La bóveda está llena. Únete a la lista de espera; la entrada no está garantizada.",
+      "closed": "Los depósitos están cerrados en esta época. La siguiente ventana de depósito abre el {date}.",
+      "full": "La bóveda está llena. No queda capacidad.",
+      "paused": "El operador ha pausado los depósitos.",
+      "stale": "Los límites están desactualizados. Los depósitos son solo de lectura hasta que se actualicen."
+    },
+    "form": {
+      "submit": "Depositar",
+      "submitQueued": "Encolar depósito para la época #{epoch}",
+      "submitWaitlist": "Unirse a la lista de espera",
+      "maxHint": "Hasta {amount} por depósito",
+      "overMax": "El importe supera el límite de {amount} de esta bóveda.",
+      "pricedIn": "Valorado en la época #{epoch}.",
+      "pricedWaitlist": "La época se asigna cuando seas admitido desde la lista de espera.",
+      "sharesOpen": "Las participaciones aparecen cuando cierre esta ventana de depósito, {date}.",
+      "sharesQueued": "Las participaciones aparecen cuando cierre la siguiente ventana de depósito.",
+      "sharesWaitlist": "Las participaciones aparecen una vez admitido y cerrada esa ventana.",
+      "capacityChanged": "La bóveda se llenó mientras tu depósito estaba en curso, así que no fue aceptado. Reduce el importe o únete a la lista de espera.",
+      "submitFailed": "El depósito no se envió. Inténtalo de nuevo."
+    }
   }
 }

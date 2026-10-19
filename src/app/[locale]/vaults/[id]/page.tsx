@@ -5,11 +5,14 @@ import Link from "next/link";
 import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
+import { useTranslations } from "next-intl";
 import { useWalletStore } from "../../../../lib/store/wallet";
 import {
   fetchVaultDetail,
   depositToVault,
   withdrawFromVault,
+  deriveDepositState,
+  type DepositState,
   type VaultDetail,
   type EpochPhase,
 } from "../../../../lib/api/vaults";
@@ -40,13 +43,19 @@ function fmtDateShort(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function fmtDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
+  const t = useTranslations("vaults");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   const [depositAmount, setDepositAmount] = useState("");
   const [withdrawShares, setWithdrawShares] = useState("");
@@ -60,20 +69,45 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       .catch(e => { setError(e.message); setLoading(false); });
   }, [id, token]);
 
+  // Re-evaluate limit staleness while the page stays open.
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const depositState = vault ? deriveDepositState(vault, now) : null;
+  const depositAmountNum = parseFloat(depositAmount);
+  const overMax = !!depositState && depositState.status !== "waitlist" && depositAmountNum > depositState.maxDeposit;
+  const statusColor = depositState?.status === "open"
+    ? "var(--call)"
+    : depositState?.status === "queued" || depositState?.status === "waitlist"
+      ? "var(--atm)"
+      : "var(--put)";
+  const sharesLine = (s: DepositState, phaseEndsAt: string) =>
+    s.status === "open"
+      ? t("form.sharesOpen", { date: fmtDateTime(phaseEndsAt) })
+      : s.status === "queued" ? t("form.sharesQueued") : t("form.sharesWaitlist");
+
   const handleDeposit = async () => {
-    if (!vault || !token) return;
+    if (!vault || !token || !depositState?.canSubmit || overMax) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
+    const state = depositState;
     setTxStatus("pending");
     setTxMessage("");
     try {
       const result = await depositToVault(vault.id, amount, token);
+      const pricing = state.pricedInEpoch !== null
+        ? t("form.pricedIn", { epoch: state.pricedInEpoch })
+        : t("form.pricedWaitlist");
       setTxStatus("success");
-      setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
+      setTxMessage(`${pricing} ${sharesLine(state, vault.phaseEndsAt)} TX: ${result.tx_id}`);
       setDepositAmount("");
     } catch (e) {
+      // Backend rejections while the vault filled mid-flight get actionable copy, never the raw error.
+      const message = e instanceof Error ? e.message : "";
       setTxStatus("error");
-      setTxMessage(e instanceof Error ? e.message : "Deposit failed");
+      setTxMessage(/capacity|full/i.test(message) ? t("form.capacityChanged") : t("form.submitFailed"));
     }
   };
 
@@ -305,6 +339,35 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   </div>
                 </div>
 
+                {/* Capacity and deposit limits, derived by the same selector as the listing */}
+                {depositState && (
+                  <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 600, color: "var(--text-mid)", marginBottom: 8 }}>
+                      <span>{t("capacity")}</span>
+                      <span className="num">{fmtUsd(vault.tvl)} / {fmtUsd(vault.capacity)}</span>
+                    </div>
+                    <div style={{ height: 3, background: "var(--bg-overlay)" }}>
+                      <div style={{ width: `${depositState.utilisation}%`, height: "100%", background: "var(--brand)", transition: "width 400ms" }} />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-lo)", marginTop: 6 }}>
+                      <span>{t("remaining", { amount: fmtUsd(depositState.remainingCapacity) })}</span>
+                      <span>{t("utilised", { percent: Math.round(depositState.utilisation) })}</span>
+                    </div>
+                    <div style={{
+                      marginTop: 10, padding: "6px 8px", fontSize: 10, lineHeight: 1.5,
+                      color: statusColor, border: `1px solid ${statusColor}`, borderLeft: `3px solid ${statusColor}`,
+                    }}>
+                      {t(`status.${depositState.status}`, {
+                        epoch: depositState.pricedInEpoch ?? vault.currentEpoch + 1,
+                        date: fmtDateTime(vault.limits.nextDepositStart),
+                      })}
+                    </div>
+                    <div style={{ fontSize: 9, color: depositState.status === "stale" ? "var(--put)" : "var(--text-lo)", marginTop: 6 }}>
+                      {t("limitsAsOf", { time: fmtDateTime(depositState.limitsAsOf) })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Deposit / Withdraw flows */}
                 {!token ? (
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16, fontSize: 12, color: "var(--text-mid)", textAlign: "center" }}>
@@ -356,23 +419,43 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                           )}
                         </div>
-                        {/* Queued withdrawal notice if epoch is active */}
-                        {vault.currentPhase === "active" && (
-                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--atm)", padding: "6px 8px", background: "var(--atm-dim)" }}>
-                            Deposits during active epochs are queued for the next epoch start.
+                        {depositState?.canSubmit && (
+                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--text-lo)", lineHeight: 1.5 }}>
+                            <div>
+                              {depositState.pricedInEpoch !== null
+                                ? t("form.pricedIn", { epoch: depositState.pricedInEpoch })
+                                : t("form.pricedWaitlist")}{" "}
+                              {sharesLine(depositState, vault.phaseEndsAt)}
+                            </div>
+                            {depositState.status !== "waitlist" && (
+                              <div>{t("form.maxHint", { amount: fmtUsd(depositState.maxDeposit) })}</div>
+                            )}
+                          </div>
+                        )}
+                        {overMax && depositState && (
+                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--put)" }}>
+                            {t("form.overMax", { amount: fmtUsd(depositState.maxDeposit) })}
                           </div>
                         )}
                         <button
                           onClick={handleDeposit}
-                          disabled={txStatus === "pending" || !depositAmount || isNaN(parseFloat(depositAmount)) || parseFloat(depositAmount) <= 0}
+                          disabled={txStatus === "pending" || !depositState?.canSubmit || overMax || !(depositAmountNum > 0)}
                           style={{
-                            width: "100%", padding: "10px 0", background: "var(--brand)",
-                            color: "var(--bg)", border: "none", fontSize: 13, fontWeight: 700,
+                            width: "100%", padding: "10px 0",
+                            background: depositState?.canSubmit && !overMax ? "var(--brand)" : "var(--bg-overlay)",
+                            color: depositState?.canSubmit && !overMax ? "var(--bg)" : "var(--text-lo)",
+                            border: "none", fontSize: 13, fontWeight: 700,
                             cursor: txStatus === "pending" ? "default" : "pointer",
                             opacity: txStatus === "pending" ? 0.6 : 1,
                           }}
                         >
-                          {txStatus === "pending" ? "Confirming…" : "Deposit"}
+                          {txStatus === "pending"
+                            ? "Confirming…"
+                            : depositState?.status === "queued"
+                              ? t("form.submitQueued", { epoch: depositState.pricedInEpoch ?? 0 })
+                              : depositState?.status === "waitlist"
+                                ? t("form.submitWaitlist")
+                                : t("form.submit")}
                         </button>
                       </div>
                     )}

@@ -22,6 +22,24 @@ export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" 
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
+/**
+ * Backend-supplied deposit limits. Every value here is authoritative only as of
+ * `asOf`; past LIMITS_STALE_AFTER_MS the UI derives a read-only "stale" state
+ * instead of trusting the numbers.
+ */
+export interface VaultLimits {
+  /** Deposits are paused by the operator. */
+  paused: boolean;
+  /** Deposits that cannot be accepted now join the waitlist for the next epoch. */
+  waitlistEnabled: boolean;
+  /** Maximum USD a single depositor may add in one epoch. */
+  perEpochDepositLimit: number;
+  /** ISO start of the next deposit window. */
+  nextDepositStart: string;
+  /** ISO time the backend took this snapshot. */
+  asOf: string;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -40,6 +58,10 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  currentEpoch: number;
+  currentPhase: EpochPhase;
+  phaseEndsAt: string; // ISO — when the current phase ends
+  limits: VaultLimits;
 }
 
 /** One historical epoch record. */
@@ -66,15 +88,65 @@ export interface UserVaultPosition {
 
 /** Full detail for a single vault. */
 export interface VaultDetail extends VaultSummary {
-  currentEpoch: number;
-  currentPhase: EpochPhase;
-  phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
   feeStructure: { managementPct: number; performancePct: number };
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Deposit-limit selector
+// ---------------------------------------------------------------------------
+
+/** Limits older than this degrade the vault to read-only. */
+export const LIMITS_STALE_AFTER_MS = 60_000;
+
+export type DepositStatus = "open" | "queued" | "waitlist" | "closed" | "full" | "paused" | "stale";
+
+export interface DepositState {
+  status: DepositStatus;
+  /** Whether the deposit form may be submitted in this state. */
+  canSubmit: boolean;
+  /** Epoch the deposit will be priced in; null when it is not yet known. */
+  pricedInEpoch: number | null;
+  /** Remaining vault capacity in USD. */
+  remainingCapacity: number;
+  /** TVL as a percentage of capacity (0–100). */
+  utilisation: number;
+  /** Maximum USD accepted in one deposit (capacity or per-epoch limit, whichever is lower). */
+  maxDeposit: number;
+  limitsAsOf: string;
+}
+
+/**
+ * Single source of truth for deposit eligibility. Both the listing and the
+ * detail view call this so they cannot disagree.
+ */
+export function deriveDepositState(
+  vault: Pick<VaultSummary, "tvl" | "capacity" | "currentEpoch" | "currentPhase" | "limits">,
+  now: number = Date.now()
+): DepositState {
+  const { limits } = vault;
+  const remainingCapacity = Math.max(0, vault.capacity - vault.tvl);
+  const base = {
+    remainingCapacity,
+    utilisation: vault.capacity > 0 ? Math.min(100, (vault.tvl / vault.capacity) * 100) : 100,
+    maxDeposit: Math.min(remainingCapacity, limits.perEpochDepositLimit),
+    limitsAsOf: limits.asOf,
+  };
+  const reject = (status: DepositStatus): DepositState => ({ ...base, status, canSubmit: false, pricedInEpoch: null });
+
+  if (limits.paused) return reject("paused");
+  if (now - Date.parse(limits.asOf) > LIMITS_STALE_AFTER_MS) return reject("stale");
+  if (remainingCapacity <= 0) return limits.waitlistEnabled
+    ? { ...base, status: "waitlist", canSubmit: true, pricedInEpoch: null }
+    : reject("full");
+  if (vault.currentPhase !== "deposit") return limits.waitlistEnabled
+    ? { ...base, status: "queued", canSubmit: true, pricedInEpoch: vault.currentEpoch + 1 }
+    : reject("closed");
+  return { ...base, status: "open", canSubmit: true, pricedInEpoch: vault.currentEpoch };
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +170,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentEpoch: 47,
     currentPhase: "active",
     phaseEndsAt: "2026-10-03T16:00:00Z",
+    limits: { paused: false, waitlistEnabled: false, perEpochDepositLimit: 25000, nextDepositStart: "2026-10-10T12:00:00Z", asOf: "" },
     sharePrice: 1.042,
     totalShares: 272552,
     feeStructure: { managementPct: 0, performancePct: 10 },
@@ -127,6 +200,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentEpoch: 18,
     currentPhase: "active",
     phaseEndsAt: "2026-10-17T20:00:00Z",
+    limits: { paused: false, waitlistEnabled: true, perEpochDepositLimit: 100000, nextDepositStart: "2026-11-14T12:00:00Z", asOf: "" },
     sharePrice: 1.088,
     totalShares: 1700368,
     feeStructure: { managementPct: 0.5, performancePct: 15 },
@@ -154,6 +228,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentEpoch: 11,
     currentPhase: "deposit",
     phaseEndsAt: "2026-09-28T12:00:00Z",
+    limits: { paused: false, waitlistEnabled: false, perEpochDepositLimit: 50000, nextDepositStart: "2026-10-26T12:00:00Z", asOf: "" },
     sharePrice: 1.021,
     totalShares: 607247,
     feeStructure: { managementPct: 0, performancePct: 10 },
@@ -180,6 +255,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentEpoch: 28,
     currentPhase: "settlement",
     phaseEndsAt: "2026-09-28T16:00:00Z",
+    limits: { paused: false, waitlistEnabled: false, perEpochDepositLimit: 10000, nextDepositStart: "2026-10-05T16:00:00Z", asOf: "" },
     sharePrice: 1.194,
     totalShares: 82076,
     feeStructure: { managementPct: 0, performancePct: 20 },
@@ -196,12 +272,17 @@ const MOCK_VAULTS: VaultDetail[] = [
 // Public adapter
 // ---------------------------------------------------------------------------
 
+/** Mock limits are stamped at read time so the mock never reads as stale. */
+function withFreshLimits<T extends { limits: VaultLimits }>(v: T): T {
+  return { ...v, limits: { ...v.limits, asOf: new Date().toISOString() } };
+}
+
 export async function fetchVaults(): Promise<VaultSummary[]> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
     // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => withFreshLimits(summary)));
 }
 
 export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
@@ -209,7 +290,8 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+  const vault = MOCK_VAULTS.find(v => v.id === id);
+  return Promise.resolve(vault ? withFreshLimits(vault) : null);
 }
 
 export async function depositToVault(

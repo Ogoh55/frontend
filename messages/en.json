@@ -140,5 +140,34 @@
   "notFound": {
     "title": "Page not found",
     "back": "Back to the terminal"
+  },
+  "vaults": {
+    "capacity": "Capacity",
+    "remaining": "{amount} remaining",
+    "utilised": "{percent}% utilised",
+    "limitsAsOf": "Limits as of {time}",
+    "status": {
+      "open": "Deposits are open for epoch #{epoch}.",
+      "queued": "Deposits are closed this epoch. A deposit now is queued for epoch #{epoch}.",
+      "waitlist": "Vault is full. Join the waitlist; entry is not guaranteed.",
+      "closed": "Deposits are closed this epoch. The next deposit window opens {date}.",
+      "full": "Vault is full. No capacity remains.",
+      "paused": "Deposits are paused by the operator.",
+      "stale": "Limits are out of date. Deposits are read-only until they refresh."
+    },
+    "form": {
+      "submit": "Deposit",
+      "submitQueued": "Queue deposit for epoch #{epoch}",
+      "submitWaitlist": "Join waitlist",
+      "maxHint": "Up to {amount} per deposit",
+      "overMax": "Amount is above the {amount} limit for this vault.",
+      "pricedIn": "Priced in epoch #{epoch}.",
+      "pricedWaitlist": "Epoch is assigned when you are admitted from the waitlist.",
+      "sharesOpen": "Shares appear when this deposit window closes, {date}.",
+      "sharesQueued": "Shares appear when the next deposit window closes.",
+      "sharesWaitlist": "Shares appear once you are admitted and that window closes.",
+      "capacityChanged": "The vault filled while your deposit was in flight, so it was not accepted. Lower the amount or join the waitlist.",
+      "submitFailed": "Deposit was not submitted. Try again."
+    }
   }
 }

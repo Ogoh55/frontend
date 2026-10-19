@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useTranslations } from "next-intl";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
-import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import { deriveDepositState, fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
 
 const STRATEGY_LABELS: Record<VaultStrategy, string> = {
   covered_call:      "Covered Call",
@@ -39,16 +40,28 @@ function fmtUsd(n: number) {
   return `$${n.toFixed(2)}`;
 }
 
+function fmtDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 export default function VaultsPage() {
   const [vaults, setVaults] = useState<VaultSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const t = useTranslations("vaults");
 
   useEffect(() => {
     fetchVaults()
       .then(v => { setVaults(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
+  }, []);
+
+  // Re-evaluate limit staleness while the page stays open.
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
   }, []);
 
   return (
@@ -125,6 +138,8 @@ export default function VaultsPage() {
               {vaults.map(vault => {
                 const cap = capacityPct(vault.tvl, vault.capacity);
                 const capColor = cap >= 90 ? "var(--put)" : cap >= 70 ? "var(--atm)" : "var(--call)";
+                const deposit = deriveDepositState(vault, now);
+                const statusColor = deposit.status === "open" ? "var(--call)" : deposit.status === "queued" || deposit.status === "waitlist" ? "var(--atm)" : "var(--put)";
                 return (
                   <div key={vault.id} style={{
                     border: "1px solid var(--border-default)", background: "var(--bg-raised)",
@@ -191,6 +206,9 @@ export default function VaultsPage() {
                         <div style={{ height: 3, background: "var(--bg-overlay)", marginTop: 4 }}>
                           <div style={{ width: `${cap}%`, height: "100%", background: capColor, transition: "width 400ms" }} />
                         </div>
+                        <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
+                          {t("remaining", { amount: fmtUsd(deposit.remainingCapacity) })}
+                        </div>
                       </div>
                       {/* Current epoch strike */}
                       <div>
@@ -224,8 +242,13 @@ export default function VaultsPage() {
                       }}>
                         View Vault →
                       </Link>
-                      {cap >= 100 && (
-                        <div style={{ fontSize: 10, color: "var(--put)", textAlign: "center" }}>Vault full</div>
+                      {deposit.status !== "open" && (
+                        <div style={{ fontSize: 10, color: statusColor, textAlign: "center", maxWidth: 180 }}>
+                          {t(`status.${deposit.status}`, {
+                            epoch: deposit.pricedInEpoch ?? vault.currentEpoch + 1,
+                            date: fmtDateTime(vault.limits.nextDepositStart),
+                          })}
+                        </div>
                       )}
                     </div>
                   </div>

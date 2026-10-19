@@ -140,5 +140,34 @@
   "notFound": {
     "title": "Página não encontrada",
     "back": "Voltar ao terminal"
+  },
+  "vaults": {
+    "capacity": "Capacidade",
+    "remaining": "{amount} restantes",
+    "utilised": "{percent}% utilizado",
+    "limitsAsOf": "Limites em {time}",
+    "status": {
+      "open": "Os depósitos estão abertos para a época #{epoch}.",
+      "queued": "Os depósitos estão fechados nesta época. Um depósito agora entra na fila para a época #{epoch}.",
+      "waitlist": "O cofre está cheio. Entre na lista de espera; a entrada não é garantida.",
+      "closed": "Os depósitos estão fechados nesta época. A próxima janela de depósito abre em {date}.",
+      "full": "O cofre está cheio. Não há capacidade restante.",
+      "paused": "Os depósitos estão pausados pelo operador.",
+      "stale": "Os limites estão desatualizados. Os depósitos são somente leitura até que sejam atualizados."
+    },
+    "form": {
+      "submit": "Depositar",
+      "submitQueued": "Enfileirar depósito para a época #{epoch}",
+      "submitWaitlist": "Entrar na lista de espera",
+      "maxHint": "Até {amount} por depósito",
+      "overMax": "O valor está acima do limite de {amount} deste cofre.",
+      "pricedIn": "Precificado na época #{epoch}.",
+      "pricedWaitlist": "A época é atribuída quando você for admitido pela lista de espera.",
+      "sharesOpen": "As cotas aparecem quando esta janela de depósito fechar, {date}.",
+      "sharesQueued": "As cotas aparecem quando a próxima janela de depósito fechar.",
+      "sharesWaitlist": "As cotas aparecem assim que você for admitido e essa janela fechar.",
+      "capacityChanged": "O cofre encheu enquanto seu depósito estava em andamento, então ele não foi aceito. Reduza o valor ou entre na lista de espera.",
+      "submitFailed": "O depósito não foi enviado. Tente novamente."
+    }
   }
 }
