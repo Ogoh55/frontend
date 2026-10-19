@@ -1,26 +1,60 @@
 /**
- * Typed data adapter interface for the Vaults feature.
+ * Typed data adapter for the Vaults feature.
  *
- * The vault smart contracts and backend API are not yet available.
- * When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
- * implementation below is used. Swap in the real implementation by
- * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
+ * NEXT_PUBLIC_VAULTS=mock (the default) serves the in-module fixtures below.
+ * NEXT_PUBLIC_VAULTS=live calls the v1 REST contract through the BFF, which
+ * attaches the session bearer server-side (see src/lib/bff/allowlist.ts).
  *
- * Backend contract (for when the real API lands):
+ * Contract: docs/api/vaults-v1.openapi.yaml (frozen; additive changes only
+ * within v1, breaking changes go to /api/v2).
  *
- *   GET /api/v1/vaults
- *   → VaultSummary[]
+ *   GET  /api/v1/vaults                     → VaultSummary[]     (not paginated in v1)
+ *   GET  /api/v1/vaults/{id}                → VaultDetail | 404
+ *   POST /api/v1/vaults/{id}/deposit        { amount: Amount }   → { tx_id }
+ *   POST /api/v1/vaults/{id}/withdraw       { shares: Amount }   → { tx_id, queued }
  *
- *   GET /api/v1/vaults/{id}
- *   → VaultDetail
- *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
- *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ * Wire conventions: entity fields are camelCase; timestamps are ISO-8601;
+ * USD amounts and share counts are fixed-point decimal strings (e.g. "1042.5000000")
+ * and are converted to number only at the decode boundary for display.
+ * Errors are `{ error: { code, message } }`; see VaultErrorCode.
  */
+
+import { env } from "../../env";
+
+/** Fixed-point decimal string on the wire, e.g. "1042.5000000". */
+export type Amount = string;
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+export const VAULT_STRATEGIES: readonly VaultStrategy[] = ["covered_call", "cash_secured_put", "iron_condor", "wheel"];
+export const RISK_RATINGS: readonly RiskRating[] = ["low", "medium", "high"];
+export const EPOCH_PHASES: readonly EpochPhase[] = ["deposit", "active", "settlement"];
+
+/**
+ * Error codes in the v1 contract. `vault_paused` and `vault_at_capacity` are
+ * both HTTP 409; the UI distinguishes them so it can say "paused" vs "full".
+ * `malformed_response` is client-side only: the body failed decoding.
+ */
+export const VAULT_ERROR_CODES = [
+  "vault_not_found",
+  "vault_paused",
+  "vault_at_capacity",
+  "unauthorized",
+  "invalid_request",
+  "rate_limited",
+  "backend_unavailable",
+  "malformed_response",
+] as const;
+export type VaultErrorCode = (typeof VAULT_ERROR_CODES)[number];
+
+export class VaultApiError extends Error {
+  constructor(readonly status: number, readonly code: VaultErrorCode, message: string) {
+    super(message);
+    this.name = "VaultApiError";
+  }
+}
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -196,45 +230,188 @@ const MOCK_VAULTS: VaultDetail[] = [
 // Public adapter
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Live transport and decoding (v1 contract)
+// ---------------------------------------------------------------------------
+
+type Obj = Record<string, unknown>;
+
+const VAULTS_ROUTE = "/api/bff/api/v1/vaults";
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const FIXED_POINT = /^-?\d+(\.\d+)?$/;
+
+const isStr = (x: unknown): x is string => typeof x === "string";
+const isNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+const isDate = (x: unknown): x is string => isStr(x) && ISO_DATE.test(x);
+const isDateTime = (x: unknown): x is string => isStr(x) && ISO_DATETIME.test(x);
+const isAmount = (x: unknown): x is Amount => isStr(x) && FIXED_POINT.test(x);
+const isOneOf = <T extends string>(values: readonly T[]) => (x: unknown): x is T =>
+  isStr(x) && (values as readonly string[]).includes(x);
+const isObj = (x: unknown): x is Obj => typeof x === "object" && x !== null && !Array.isArray(x);
+
+function malformed(route: string, field: string): VaultApiError {
+  return new VaultApiError(200, "malformed_response", `Malformed vault response from ${route}: invalid "${field}"`);
+}
+
+function asObj(v: unknown, route: string): Obj {
+  if (!isObj(v)) throw malformed(route, "(root)");
+  return v;
+}
+
+function field<T>(o: Obj, key: string, route: string, ok: (x: unknown) => x is T): T {
+  const x = o[key];
+  if (!ok(x)) throw malformed(route, key);
+  return x;
+}
+
+/** Amount fields arrive as fixed-point strings; numbers are for display only. */
+const money = (o: Obj, key: string, route: string): number => Number(field(o, key, route, isAmount));
+
+function decodeSummary(o: Obj, route: string): VaultSummary {
+  return {
+    id: field(o, "id", route, isStr),
+    name: field(o, "name", route, isStr),
+    underlying: field(o, "underlying", route, isStr),
+    strategy: field(o, "strategy", route, isOneOf(VAULT_STRATEGIES)),
+    apy: field(o, "apy", route, isNum),
+    apyMethodology: field(o, "apyMethodology", route, isStr),
+    tvl: money(o, "tvl", route),
+    capacity: money(o, "capacity", route),
+    currentStrike: money(o, "currentStrike", route),
+    currentExpiry: field(o, "currentExpiry", route, isDate),
+    riskRating: field(o, "riskRating", route, isOneOf(RISK_RATINGS)),
+    description: field(o, "description", route, isStr),
+  };
+}
+
+function decodeEpoch(v: unknown, route: string): EpochRecord {
+  const o = asObj(v, route);
+  return {
+    epochNumber: field(o, "epochNumber", route, isNum),
+    depositStart: field(o, "depositStart", route, isDate),
+    activeStart: field(o, "activeStart", route, isDate),
+    settlementDate: field(o, "settlementDate", route, isDate),
+    strike: money(o, "strike", route),
+    expiryDays: field(o, "expiryDays", route, isNum),
+    premiumCollected: money(o, "premiumCollected", route),
+    outcome: field(o, "outcome", route, isOneOf(["expired_worthless", "exercised", "active"] as const)),
+    pnlPct: field(o, "pnlPct", route, isNum),
+  };
+}
+
+function decodePosition(v: unknown, route: string): UserVaultPosition | null {
+  if (v === null) return null;
+  const o = asObj(v, route);
+  return {
+    shares: money(o, "shares", route),
+    shareValue: money(o, "shareValue", route),
+    totalValue: money(o, "totalValue", route),
+    accruedPremium: money(o, "accruedPremium", route),
+    pendingWithdrawal: money(o, "pendingWithdrawal", route),
+  };
+}
+
+function decodeDetail(v: unknown, route: string): VaultDetail {
+  const o = asObj(v, route);
+  const fees = asObj(o.feeStructure, route);
+  if (!Array.isArray(o.historicalEpochs)) throw malformed(route, "historicalEpochs");
+  return {
+    ...decodeSummary(o, route),
+    currentEpoch: field(o, "currentEpoch", route, isNum),
+    currentPhase: field(o, "currentPhase", route, isOneOf(EPOCH_PHASES)),
+    phaseEndsAt: field(o, "phaseEndsAt", route, isDateTime),
+    sharePrice: money(o, "sharePrice", route),
+    totalShares: money(o, "totalShares", route),
+    feeStructure: { managementPct: field(fees, "managementPct", route, isNum), performancePct: field(fees, "performancePct", route, isNum) },
+    payoffExplanation: field(o, "payoffExplanation", route, isStr),
+    historicalEpochs: o.historicalEpochs.map(e => decodeEpoch(e, route)),
+    userPosition: decodePosition(o.userPosition, route),
+  };
+}
+
+/** Maps a non-2xx response to a VaultApiError, preferring the server's code when it is one we know. */
+function toApiError(status: number, body: unknown): VaultApiError {
+  const err = isObj(body) ? body.error : undefined;
+  const code = isObj(err) && isOneOf(VAULT_ERROR_CODES)(err.code) ? err.code : fallbackCode(status);
+  const message = isObj(err) && isStr(err.message) ? err.message : `Vaults API request failed (${status})`;
+  return new VaultApiError(status, code, message);
+}
+
+function fallbackCode(status: number): VaultErrorCode {
+  if (status === 401 || status === 403) return "unauthorized";
+  if (status === 404) return "vault_not_found";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "backend_unavailable";
+  return "invalid_request";
+}
+
+/** One request through the BFF. The session bearer is attached server-side; no token is sent from here. */
+async function vaultRequest(route: string, init?: { method: "POST"; body: Obj }): Promise<unknown> {
+  const url = `${VAULTS_ROUTE}${route}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: init?.method ?? "GET",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: init ? JSON.stringify(init.body) : undefined,
+      cache: "no-store",
+    });
+  } catch {
+    throw new VaultApiError(0, "backend_unavailable", "Vaults API is unreachable");
+  }
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) throw toApiError(res.status, body);
+  if (body === null) throw malformed(url, "(body)");
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Public adapter
+// ---------------------------------------------------------------------------
+
 export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
+  if (env.NEXT_PUBLIC_VAULTS === "live") {
+    const body = await vaultRequest("/api/v1/vaults");
+    if (!Array.isArray(body)) throw malformed("/api/v1/vaults", "(root)");
+    return body.map(v => decodeSummary(asObj(v, "/api/v1/vaults"), "/api/v1/vaults"));
   }
   return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
 }
 
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
+/** Resolves to null for an unknown id (live 404 or missing mock). */
+export async function fetchVaultDetail(id: string): Promise<VaultDetail | null> {
+  if (env.NEXT_PUBLIC_VAULTS === "live") {
+    const route = `/api/v1/vaults/${encodeURIComponent(id)}`;
+    try {
+      return decodeDetail(await vaultRequest(route), route);
+    } catch (e) {
+      if (e instanceof VaultApiError && e.code === "vault_not_found") return null;
+      throw e;
+    }
   }
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
 }
 
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
+/** `amount` is a fixed-point string in USD; the backend rejects anything else with invalid_request. */
+export async function depositToVault(id: string, amount: Amount): Promise<{ tx_id: string }> {
+  if (env.NEXT_PUBLIC_VAULTS === "live") {
+    const route = `/api/v1/vaults/${encodeURIComponent(id)}/deposit`;
+    const o = asObj(await vaultRequest(route, { method: "POST", body: { amount } }), route);
+    return { tx_id: field(o, "tx_id", route, isStr) };
   }
   // Mock: simulate a 600ms network round-trip
   await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
+  return { tx_id: `mock-tx-deposit-${id}-${amount}-${Date.now()}` };
 }
 
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
+/** `shares` is a fixed-point string of share units. */
+export async function withdrawFromVault(id: string, shares: Amount): Promise<{ tx_id: string; queued: boolean }> {
+  if (env.NEXT_PUBLIC_VAULTS === "live") {
+    const route = `/api/v1/vaults/${encodeURIComponent(id)}/withdraw`;
+    const o = asObj(await vaultRequest(route, { method: "POST", body: { shares } }), route);
+    return { tx_id: field(o, "tx_id", route, isStr), queued: field(o, "queued", route, (x): x is boolean => typeof x === "boolean") };
   }
   await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
+  return { tx_id: `mock-tx-withdraw-${id}-${shares}-${Date.now()}`, queued: true };
 }

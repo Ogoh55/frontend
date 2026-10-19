@@ -1,0 +1,248 @@
+openapi: 3.0.3
+info:
+  title: Zenith Vaults API
+  version: 1.0.0
+  description: |
+    Frozen v1 contract for the Vaults feature, consumed by src/lib/api/vaults.ts.
+    Changes within v1 are additive only: new optional response fields are
+    allowed. New error codes, enum values, or required request fields are
+    breaking for clients that switch on them, so they require /api/v2.
+
+    Browsers never call this API directly. They call /api/bff/api/v1/vaults,
+    and the BFF attaches the session bearer server-side (src/lib/bff/allowlist.ts).
+
+    Conventions:
+    - Entity fields are camelCase.
+    - Timestamps are ISO-8601. Dates are YYYY-MM-DD; instants are RFC 3339 date-times in UTC or with an offset.
+    - USD amounts, prices and share counts are fixed-point decimal strings
+      matching ^-?\d+(\.\d+)?$ (e.g. "1042.5000000"). Never JSON numbers.
+    - Ratios and percentages (apy, pnlPct, feeStructure.*Pct) are JSON numbers.
+    - Error bodies are { "error": { "code", "message" } }.
+servers:
+  - url: /api/v1
+paths:
+  /vaults:
+    get:
+      operationId: listVaults
+      summary: List vaults
+      description: Not paginated in v1. Returns every vault, possibly an empty array.
+      security: [{ bearerAuth: [] }, {}]
+      responses:
+        "200":
+          description: Vault summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/VaultSummary" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /vaults/{id}:
+    get:
+      operationId: getVault
+      summary: Get vault detail
+      security: [{ bearerAuth: [] }, {}]
+      parameters:
+        - { $ref: "#/components/parameters/VaultId" }
+      responses:
+        "200":
+          description: Vault detail. userPosition is null when the caller has no position or is anonymous.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VaultDetail" }
+        "404": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /vaults/{id}/deposit:
+    post:
+      operationId: depositToVault
+      summary: Deposit collateral
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/VaultId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DepositRequest" }
+      responses:
+        "200":
+          description: Deposit submitted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TxReceipt" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /vaults/{id}/withdraw:
+    post:
+      operationId: withdrawFromVault
+      summary: Withdraw shares
+      description: If the vault is in an active epoch, the withdrawal is queued for epoch end and queued is true.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/VaultId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WithdrawRequest" }
+      responses:
+        "200":
+          description: Withdrawal submitted or queued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WithdrawReceipt" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    VaultId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,128}$" }
+  responses:
+    Error:
+      description: Error. The code is one of the VaultErrorCode values.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+  schemas:
+    Amount:
+      type: string
+      pattern: "^-?\\d+(\\.\\d+)?$"
+      example: "1042.5000000"
+    Date:
+      type: string
+      format: date
+    DateTime:
+      type: string
+      format: date-time
+    VaultStrategy:
+      type: string
+      enum: [covered_call, cash_secured_put, iron_condor, wheel]
+    RiskRating:
+      type: string
+      enum: [low, medium, high]
+    EpochPhase:
+      type: string
+      enum: [deposit, active, settlement]
+    EpochOutcome:
+      type: string
+      enum: [expired_worthless, exercised, active]
+    VaultSummary:
+      type: object
+      required: [id, name, underlying, strategy, apy, apyMethodology, tvl, capacity, currentStrike, currentExpiry, riskRating, description]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        underlying: { type: string }
+        strategy: { $ref: "#/components/schemas/VaultStrategy" }
+        apy: { type: number, description: "Trailing 12-month APY as a ratio (0.18 = 18%)." }
+        apyMethodology: { type: string }
+        tvl: { $ref: "#/components/schemas/Amount", description: "Total value locked, USD." }
+        capacity: { $ref: "#/components/schemas/Amount", description: "Maximum TVL, USD." }
+        currentStrike: { $ref: "#/components/schemas/Amount" }
+        currentExpiry: { $ref: "#/components/schemas/Date" }
+        riskRating: { $ref: "#/components/schemas/RiskRating" }
+        description: { type: string }
+    EpochRecord:
+      type: object
+      required: [epochNumber, depositStart, activeStart, settlementDate, strike, expiryDays, premiumCollected, outcome, pnlPct]
+      properties:
+        epochNumber: { type: integer }
+        depositStart: { $ref: "#/components/schemas/Date" }
+        activeStart: { $ref: "#/components/schemas/Date" }
+        settlementDate: { $ref: "#/components/schemas/Date" }
+        strike: { $ref: "#/components/schemas/Amount" }
+        expiryDays: { type: integer }
+        premiumCollected: { $ref: "#/components/schemas/Amount", description: "Per share, USD." }
+        outcome: { $ref: "#/components/schemas/EpochOutcome" }
+        pnlPct: { type: number, description: "Epoch return as a ratio. Positive is profit for depositors." }
+    UserVaultPosition:
+      type: object
+      required: [shares, shareValue, totalValue, accruedPremium, pendingWithdrawal]
+      properties:
+        shares: { $ref: "#/components/schemas/Amount" }
+        shareValue: { $ref: "#/components/schemas/Amount", description: "USD per share." }
+        totalValue: { $ref: "#/components/schemas/Amount", description: "USD." }
+        accruedPremium: { $ref: "#/components/schemas/Amount", description: "USD." }
+        pendingWithdrawal: { $ref: "#/components/schemas/Amount", description: "Shares queued for withdrawal at epoch end." }
+    VaultDetail:
+      allOf:
+        - { $ref: "#/components/schemas/VaultSummary" }
+        - type: object
+          required: [currentEpoch, currentPhase, phaseEndsAt, sharePrice, totalShares, feeStructure, payoffExplanation, historicalEpochs, userPosition]
+          properties:
+            currentEpoch: { type: integer }
+            currentPhase: { $ref: "#/components/schemas/EpochPhase" }
+            phaseEndsAt: { $ref: "#/components/schemas/DateTime" }
+            sharePrice: { $ref: "#/components/schemas/Amount", description: "NAV per share, USD." }
+            totalShares: { $ref: "#/components/schemas/Amount" }
+            feeStructure:
+              type: object
+              required: [managementPct, performancePct]
+              properties:
+                managementPct: { type: number }
+                performancePct: { type: number }
+            payoffExplanation: { type: string }
+            historicalEpochs:
+              type: array
+              items: { $ref: "#/components/schemas/EpochRecord" }
+            userPosition:
+              nullable: true
+              allOf:
+                - { $ref: "#/components/schemas/UserVaultPosition" }
+    DepositRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount: { $ref: "#/components/schemas/Amount", description: "USD. Must be greater than zero." }
+    WithdrawRequest:
+      type: object
+      required: [shares]
+      properties:
+        shares: { $ref: "#/components/schemas/Amount", description: "Share units. Must be greater than zero." }
+    TxReceipt:
+      type: object
+      required: [tx_id]
+      properties:
+        tx_id: { type: string }
+    WithdrawReceipt:
+      type: object
+      required: [tx_id, queued]
+      properties:
+        tx_id: { type: string }
+        queued: { type: boolean }
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - vault_not_found        # 404
+                - vault_paused           # 409: deposits and withdrawals are halted
+                - vault_at_capacity      # 409: deposit would exceed capacity
+                - unauthorized           # 401
+                - invalid_request        # 400, including malformed amounts
+                - rate_limited           # 429
+                - backend_unavailable    # 5xx
+            message: { type: string }

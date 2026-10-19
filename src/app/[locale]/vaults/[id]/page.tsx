@@ -55,7 +55,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
 
   useEffect(() => {
-    fetchVaultDetail(id, token)
+    fetchVaultDetail(id)
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
   }, [id, token]);
@@ -67,7 +67,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     setTxStatus("pending");
     setTxMessage("");
     try {
-      const result = await depositToVault(vault.id, amount, token);
+      const result = await depositToVault(vault.id, depositAmount.trim());
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
@@ -84,7 +84,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     setTxStatus("pending");
     setTxMessage("");
     try {
-      const result = await withdrawFromVault(vault.id, shares, token);
+      const result = await withdrawFromVault(vault.id, withdrawShares.trim());
       setTxStatus("success");
       setTxMessage(
         result.queued
