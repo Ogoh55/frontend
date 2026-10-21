@@ -20,6 +20,10 @@ const parsed = parseEnv({
   NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET,
+  NEXT_PUBLIC_ANCHOR_TESTNET_URL: process.env.NEXT_PUBLIC_ANCHOR_TESTNET_URL,
+  NEXT_PUBLIC_ANCHOR_MAINNET_URL: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_URL,
+  NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS,
+  NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
 });
 
 export const env = {
@@ -94,3 +98,53 @@ export function contractEnvVarName(key: string): string {
   return `NEXT_PUBLIC_CONTRACT_${key.toUpperCase()}_${stellarNetworkSuffix}`;
 }
 
+/**
+ * Per-network anchor configuration for fiat on-ramp/off-ramp (issue #265).
+ *
+ * The anchor base URL is public (the interactive URL is minted server-side by
+ * the BFF proxy), but anchor credentials stay server-side. `assets` is a
+ * comma-separated list of asset codes the anchor supports for SEP-24; when
+ * empty the "Fund from bank" / "Cash out" entry points are hidden.
+ */
+const anchorConfigByNetwork = {
+  TESTNET: {
+    baseUrl: parsed.NEXT_PUBLIC_ANCHOR_TESTNET_URL,
+    assets: parsed.NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS,
+  },
+  MAINNET: {
+    baseUrl: parsed.NEXT_PUBLIC_ANCHOR_MAINNET_URL,
+    assets: parsed.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
+  },
+} as const;
+
+export interface AnchorConfig {
+  /** Anchor base URL, or undefined when no anchor is configured. */
+  baseUrl?: string;
+  /** Asset codes the anchor supports for SEP-24 deposit/withdraw. */
+  assets: string[];
+}
+
+function parseAnchorAssets(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((code) => code.trim().toUpperCase())
+    .filter((code) => code.length > 0);
+}
+
+const activeAnchor = anchorConfigByNetwork[stellarNetworkSuffix];
+
+/** Anchor config for the active network; `baseUrl` is undefined when unset. */
+export const anchorConfig: AnchorConfig = {
+  baseUrl: activeAnchor.baseUrl?.trim() || undefined,
+  assets: parseAnchorAssets(activeAnchor.assets),
+};
+
+/**
+ * Whether an anchor is configured for `assetCode` on the active network.
+ * Used to progressively enhance the deposit/redemption flows.
+ */
+export function isAnchorSupported(assetCode: string | undefined): boolean {
+  if (!anchorConfig.baseUrl || !assetCode) return false;
+  return anchorConfig.assets.includes(assetCode.trim().toUpperCase());
+}

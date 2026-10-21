@@ -16,6 +16,25 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ * Fiat on-ramp / off-ramp (SEP-24 interactive, SEP-6 non-interactive):
+ *
+ *   GET  /api/vaults/anchor/config?network=&asset=
+ *   → AnchorConfig | null   (null ⇒ no anchor configured ⇒ hide entry points)
+ *
+ *   POST /api/vaults/anchor/quote  { network, asset, direction, amount }
+ *   → AnchorQuote
+ *
+ *   POST /api/vaults/anchor/transaction  { network, asset, direction, amount, quoteId }
+ *   → AnchorTransaction   (interactiveUrl is minted server-side, never client-supplied)
+ *
+ *   GET  /api/vaults/anchor/transaction/{id}
+ *   → AnchorTransaction
+ *
+ * Anchor credentials stay server-side in the BFF proxy; the client only ever
+ * sees the normalized shapes below. Anchor transactions are modelled as a
+ * separate state machine from the vault deposit so a refund/expiry never
+ * leaves a half-applied vault position.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -75,6 +94,143 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Fiat on-ramp / off-ramp (anchor) types
+// ---------------------------------------------------------------------------
+
+export type AnchorDirection = "deposit" | "withdraw";
+
+/** SEP protocol the anchor exposes for a given network/asset. */
+export type AnchorProtocol = "sep24" | "sep6";
+
+/**
+ * Anchor availability for a network/asset pair. Returned by the BFF proxy.
+ * `null` from `fetchAnchorConfig` means no anchor is configured, in which
+ * case the "Fund from bank" / "Cash out" entry points must be hidden.
+ */
+export interface AnchorConfig {
+  anchorId: string;
+  anchorName: string;
+  network: string;
+  asset: string;
+  /** Protocols supported for this asset (SEP-24 interactive is required). */
+  protocols: AnchorProtocol[];
+  /** Minimum fiat amount the anchor will accept, in `fiatCurrency`. */
+  minAmount: number;
+  maxAmount: number;
+  fiatCurrency: string;
+}
+
+/**
+ * Normalized quote/preview shown before the user commits. Never route funds
+ * without surfacing this to the user first.
+ */
+export interface AnchorQuote {
+  quoteId: string;
+  direction: AnchorDirection;
+  /** Amount the user typed, in `fiatCurrency` for deposits or asset units for withdrawals. */
+  amount: number;
+  fiatCurrency: string;
+  asset: string;
+  /** Effective rate: fiat per 1 asset unit. */
+  rate: number;
+  /** Total fees in `fiatCurrency`. */
+  feeTotal: number;
+  /** Amount of `asset` the user will receive (deposit) or fiat they will receive (withdraw). */
+  receiveAmount: number;
+  /** Estimated arrival, ISO timestamp. */
+  estimatedArrival: string;
+  /** Quote expiry, ISO timestamp. After this the user must re-quote. */
+  expiresAt: string;
+}
+
+/**
+ * Normalized anchor transaction lifecycle. This is a separate state machine
+ * from the vault deposit: a refund/expiry here must never mutate vault state.
+ */
+export type AnchorTransactionStatus =
+  | "pending"
+  | "incomplete"
+  | "completed"
+  | "refunded"
+  | "expired"
+  | "error";
+
+export interface AnchorTransaction {
+  id: string;
+  direction: AnchorDirection;
+  status: AnchorTransactionStatus;
+  asset: string;
+  amount: number;
+  fiatCurrency: string;
+  /** SEP-24 interactive URL minted server-side; used to open/resume the flow. */
+  interactiveUrl: string | null;
+  /** Human-readable status/refund message (no PII). */
+  message: string | null;
+  /** Stellar tx hash once the anchor settles on-chain, if available. */
+  stellarTxHash: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Fetch anchor availability for a network/asset. Returns `null` when no
+ * anchor is configured — callers must treat this as "hide the entry point".
+ */
+export async function fetchAnchorConfig(
+  network: string,
+  asset: string,
+): Promise<AnchorConfig | null> {
+  const params = new URLSearchParams({ network, asset });
+  const res = await fetch(`/api/vaults/anchor/config?${params.toString()}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Failed to load anchor config (${res.status})`);
+  return (await res.json()) as AnchorConfig | null;
+}
+
+/** Request a quote/preview. Must be shown to the user before committing. */
+export async function fetchAnchorQuote(input: {
+  network: string;
+  asset: string;
+  direction: AnchorDirection;
+  amount: number;
+}): Promise<AnchorQuote> {
+  const res = await fetch("/api/vaults/anchor/quote", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Failed to fetch anchor quote (${res.status})`);
+  return (await res.json()) as AnchorQuote;
+}
+
+/**
+ * Start an anchor transaction. The interactive URL is minted by the BFF proxy
+ * from server-side credentials — never pass a client-supplied redirect URL.
+ */
+export async function startAnchorTransaction(input: {
+  network: string;
+  asset: string;
+  direction: AnchorDirection;
+  amount: number;
+  quoteId: string;
+}): Promise<AnchorTransaction> {
+  const res = await fetch("/api/vaults/anchor/transaction", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Failed to start anchor transaction (${res.status})`);
+  return (await res.json()) as AnchorTransaction;
+}
+
+/** Poll an anchor transaction's status (low-frequency; used to resume sessions). */
+export async function fetchAnchorTransaction(id: string): Promise<AnchorTransaction> {
+  const res = await fetch(`/api/vaults/anchor/transaction/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`Failed to load anchor transaction (${res.status})`);
+  return (await res.json()) as AnchorTransaction;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,82 +315,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
