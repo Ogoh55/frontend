@@ -78,6 +78,139 @@ export interface VaultDetail extends VaultSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Simulation / fee estimation / failure surfacing (issue #214)
+// ---------------------------------------------------------------------------
+
+/** Vault operation that can be simulated before signing. */
+export type VaultOperation = "deposit" | "withdraw";
+
+/**
+ * Contract error codes surfaced by the vault contracts. Mapped to
+ * human-readable copy in `messages/`; the raw code is always preserved so
+ * the UI can fall back to it with a support reference.
+ */
+export type VaultErrorCode =
+  | "EPOCH_CLOSED"
+  | "DEPOSITS_CLOSED"
+  | "VAULT_PAUSED"
+  | "CAPACITY_EXCEEDED"
+  | "INSUFFICIENT_BALANCE"
+  | "INSUFFICIENT_SHARES"
+  | "QUOTE_STALE"
+  | "AUTHORIZATION_FAILED";
+
+/** Resource + inclusion fee breakdown returned by `simulateTransaction`. */
+export interface VaultFeeEstimate {
+  /** Resource fee (CPU/mem/ledger-entry footprint) in stroops. */
+  resourceFee: number;
+  /** Inclusion fee (base fee × operations) in stroops. */
+  inclusionFee: number;
+  /** Total estimated cost in stroops (resourceFee + inclusionFee). */
+  totalFee: number;
+  /** Number of ledger entries in the footprint (grows on first-time entry). */
+  footprintEntries: number;
+  /** True when the simulation created a new ledger entry (first deposit costs more). */
+  createsEntry: boolean;
+}
+
+/** Result of simulating a vault deposit/withdraw before signing. */
+export interface VaultSimulationResult {
+  operation: VaultOperation;
+  vaultId: string;
+  /** Quoted shares (deposit) or assets (withdraw) at the quoted NAV. */
+  quotedShares: number;
+  quotedAssets: number;
+  /** NAV per share used for the quote. */
+  quotedNav: number;
+  /** Minimum acceptable shares/assets after slippage guard. */
+  minReceived: number;
+  /** Slippage tolerance applied (0–1). */
+  slippage: number;
+  /** ISO timestamp when the quote was produced. */
+  quotedAt: string;
+  /** Ledger sequence the quote was produced against. */
+  ledger: number;
+  fees: VaultFeeEstimate;
+  /** Base64 XDR of the prepared transaction, ready to sign. */
+  preparedXdr: string;
+}
+
+/** Failure surfaced from simulation or submission. */
+export interface VaultSimulationFailure {
+  operation: VaultOperation;
+  vaultId: string;
+  /** Mapped contract error code, or null when the failure is not a contract error. */
+  code: VaultErrorCode | null;
+  /** Raw error code/message from the contract or RPC, always preserved. */
+  rawCode: string;
+  /** Footprint size at the time of failure, for diagnostics. */
+  footprintEntries: number;
+}
+
+/** Bounded slippage guard range (0.1%–5%). */
+export const MIN_SLIPPAGE = 0.001;
+export const MAX_SLIPPAGE = 0.05;
+/** Quotes older than this window must be re-simulated before signing. */
+export const QUOTE_STALENESS_MS = 30_000;
+
+/** Clamp a user-supplied slippage into the bounded range. */
+export function clampSlippage(slippage: number): number {
+  if (!Number.isFinite(slippage)) return MIN_SLIPPAGE;
+  return Math.min(MAX_SLIPPAGE, Math.max(MIN_SLIPPAGE, slippage));
+}
+
+/** True when a quote is older than the configured staleness window. */
+export function isQuoteStale(quotedAt: string, now: number = Date.now()): boolean {
+  const ts = Date.parse(quotedAt);
+  if (Number.isNaN(ts)) return true;
+  return now - ts > QUOTE_STALENESS_MS;
+}
+
+/**
+ * Map a raw contract/RPC error to a known `VaultErrorCode`, or null when it
+ * is not a recognized contract error. Matching is case-insensitive and
+ * tolerant of the `Error(Contract, #N)` shape returned by Soroban RPC.
+ */
+export function mapVaultErrorCode(raw: string): VaultErrorCode | null {
+  const normalized = raw.toUpperCase();
+  const table: Array<[VaultErrorCode, RegExp]> = [
+    ["EPOCH_CLOSED", /EPOCH[_ ]?CLOSED/],
+    ["DEPOSITS_CLOSED", /DEPOSITS?[_ ]?CLOSED/],
+    ["VAULT_PAUSED", /VAULT[_ ]?PAUSED|PAUSED/],
+    ["CAPACITY_EXCEEDED", /CAPACITY[_ ]?EXCEEDED|VAULT[_ ]?FULL/],
+    ["INSUFFICIENT_BALANCE", /INSUFFICIENT[_ ]?BALANCE/],
+    ["INSUFFICIENT_SHARES", /INSUFFICIENT[_ ]?SHARES/],
+    ["QUOTE_STALE", /QUOTE[_ ]?STALE|STALE[_ ]?QUOTE|SLIPPAGE/],
+    ["AUTHORIZATION_FAILED", /AUTHORIZ|UNAUTHORIZED|NOT[_ ]?AUTHORIZED/],
+  ];
+  for (const [code, pattern] of table) {
+    if (pattern.test(normalized)) return code;
+  }
+  return null;
+}
+
+/**
+ * Build the final deposit/withdraw transaction via `simulateTransaction`,
+ * returning the fee breakdown, quoted shares/assets, and prepared XDR.
+ *
+ * The live path is gated behind NEXT_PUBLIC_VAULTS=live; until the contract
+ * client is wired in, this throws a typed error the UI can surface.
+ */
+export async function simulateVaultTransaction(params: {
+  vaultId: string;
+  operation: VaultOperation;
+  amount: number;
+  slippage: number;
+}): Promise<VaultSimulationResult> {
+  if (process.env.NEXT_PUBLIC_VAULTS !== "live") {
+    throw new Error("Vault simulation is not yet implemented");
+  }
+  // Live implementation: build the operation, call Soroban RPC
+  // `simulateTransaction`, and return the fee breakdown + prepared XDR.
+  throw new Error("Vault simulation is not yet implemented");
+}
+
+// ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
 
@@ -159,82 +292,38 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.014 },
     ],
     userPosition: null,
   },
 ];
 
 // ---------------------------------------------------------------------------
-// Public adapter
+// Adapter
 // ---------------------------------------------------------------------------
 
+function useMock(): boolean {
+  return process.env.NEXT_PUBLIC_VAULTS !== "live";
+}
+
+async function fetchVaultsLive(): Promise<VaultSummary[]> {
+  throw new Error("Live vaults API is not yet implemented");
+}
+
+async function fetchVaultDetailLive(_id: string): Promise<VaultDetail> {
+  throw new Error("Live vaults API is not yet implemented");
+}
+
 export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  if (useMock()) return MOCK_VAULTS;
+  return fetchVaultsLive();
 }
 
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
+export async function fetchVaultDetail(id: string): Promise<VaultDetail> {
+  if (useMock()) {
+    const vault = MOCK_VAULTS.find((v) => v.id === id);
+    if (!vault) throw new Error(`Vault not found: ${id}`);
+    return vault;
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
+  return fetchVaultDetailLive(id);
 }
