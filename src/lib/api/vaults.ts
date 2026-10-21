@@ -25,6 +25,9 @@
  *
  *   GET /api/v1/vaults/{id}/epochs/{epoch}/proof?account={account}
  *   → ShareBalanceProof   (Merkle proof for a depositor's balance, issue #278)
+ *
+ *   GET /api/v1/vaults/{id}/positions
+ *   → WrittenPosition[]   (open written positions, issue #279)
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -132,6 +135,69 @@ export interface ShareBalanceProof {
   merkleRoot: string;
 }
 
+/**
+ * Option leg type for a written position (issue #279).
+ * `call`/`put` are single-leg; `iron_condor` positions carry two legs and
+ * are represented as two `WrittenPosition` rows sharing a `groupId`.
+ */
+export type OptionType = "call" | "put";
+
+/**
+ * One open written option position held by a vault (issue #279).
+ *
+ * These are the inputs the risk panel needs to compute assignment
+ * probability, max loss, breakeven, and aggregate Greeks. All fields are
+ * sourced from the same places used elsewhere in the app (spot from the
+ * vault's underlying price feed, IV from the pricing layer, strike/expiry
+ * from the vault contract).
+ *
+ * Consumers must treat any `null` input as "unavailable" and degrade the
+ * panel rather than substituting a default — a missing IV or stale spot feed
+ * must never render a modelled number.
+ */
+export interface WrittenPosition {
+  /** Stable id for the position (used as React key / memo key). */
+  id: string;
+  /** Vault that wrote the position. */
+  vaultId: string;
+  /** Epoch the position was written in. */
+  epoch: number;
+  /** Strategy bucket the position belongs to. */
+  strategy: VaultStrategy;
+  /** Leg type. */
+  type: OptionType;
+  /** Strike price in the underlying's quote currency. */
+  strike: number;
+  /** Expiry as an ISO date. */
+  expiry: string;
+  /** Number of contracts written (1 contract = 100 shares). */
+  contracts: number;
+  /** Notional in USD (contracts * 100 * spot at write time). */
+  notional: number;
+  /** Premium collected per contract, in USD. */
+  premiumPerContract: number;
+  /** Implied volatility used for pricing (annualised, e.g. 0.65 = 65%). */
+  impliedVol: number | null;
+  /** Spot price of the underlying at the time of the snapshot. */
+  spot: number | null;
+  /** Ledger time (ISO) the spot/IV inputs were captured. */
+  inputsAsOf: string | null;
+  /** Optional backend-provided Greeks; override local estimates when set. */
+  greeks?: Partial<PositionGreeks> | null;
+  /** Optional backend-provided assignment probability (0–1). */
+  assignmentProbability?: number | null;
+  /** Groups legs of a multi-leg strategy (e.g. iron condor). */
+  groupId?: string | null;
+}
+
+/** Per-position Greeks (issue #279). */
+export interface PositionGreeks {
+  delta: number;
+  gamma: number;
+  vega: number;
+  theta: number;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -189,6 +255,12 @@ export interface VaultDetail extends VaultSummary {
   userPosition: UserVaultPosition | null;
   /** On-chain NAV feed entry for reconciliation against `sharePrice`. */
   navFeed: NavFeedEntry | null;
+  /**
+   * Open written positions for the current epoch (issue #279).
+   * Empty array means the vault has no open written exposure; `null` means
+   * the positions feed is unavailable and the risk panel must degrade.
+   */
+  writtenPositions: WrittenPosition[] | null;
 }
 
 /**
@@ -201,128 +273,4 @@ export function isNavFeedStale(entry: NavFeedEntry, now: Date = new Date()): boo
 }
 
 /**
- * Detect drift between the on-chain feed and the vault's internal share price.
- * Returns the absolute difference in USD, or null when no feed entry exists.
- */
-export function navFeedDrift(vault: VaultDetail): number | null {
-  if (!vault.navFeed) return null;
-  const feedPrice = vault.navFeed.navPerShare / 10 ** vault.navFeed.decimals;
-  return Math.abs(feedPrice - vault.sharePrice);
-}
-
-/**
- * Verify a claimed (account, balance, epoch, proof) against a committed root
- * (issue #278). Mirrors the on-chain verifier entry point so the frontend and
- * the contract hash identically. Returns false on any mismatch — callers must
- * surface the failure rather than silently accepting the claim.
- */
-export function verifyShareBalanceProof(
-  commitment: EpochCommitment,
-  claim: ShareBalanceProof,
-): boolean {
-  if (claim.epoch !== commitment.epoch) return false;
-  if (claim.merkleRoot.toLowerCase() !== commitment.merkleRoot.toLowerCase()) return false;
-  let node = shareBalanceLeaf(claim.account, claim.balance);
-  for (const sibling of claim.proof) {
-    node = hashInternal(node, sibling);
-  }
-  return node.toLowerCase() === commitment.merkleRoot.toLowerCase();
-}
-
-/**
- * Validate a redemption claim against an epoch commitment. A redemption is
- * consistent when the claimed balance verifies against the committed root and
- * the redeemed shares do not exceed that balance. Returns a verdict object so
- * mismatches are surfaced, never silently accepted.
- */
-export function validateRedemptionClaim(
-  commitment: EpochCommitment,
-  claim: ShareBalanceProof,
-  redeemedShares: number,
-): { valid: boolean; reason: string | null } {
-  if (!verifyShareBalanceProof(commitment, claim)) {
-    return { valid: false, reason: "proof does not verify against committed root" };
-  }
-  if (redeemedShares > claim.balance) {
-    return { valid: false, reason: "redeemed shares exceed committed balance" };
-  }
-  return { valid: true, reason: null };
-}
-
-// ---------------------------------------------------------------------------
-// Merkle helpers (canonical spec — must match the Rust indexer/contract)
-// ---------------------------------------------------------------------------
-
-const LEAF_DOMAIN = "00";
-const NODE_DOMAIN = "01";
-
-function shareBalanceLeaf(account: string, balance: number): string {
-  const accountHex = Array.from(new TextEncoder().encode(account))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  const balanceHex = balance.toString(16).padStart(32, "0");
-  return sha256Hex(LEAF_DOMAIN + accountHex + balanceHex);
-}
-
-function hashInternal(left: string, right: string): string {
-  const [a, b] = left.toLowerCase() <= right.toLowerCase() ? [left, right] : [right, left];
-  return sha256Hex(NODE_DOMAIN + a.replace(/^0x/, "") + b.replace(/^0x/, ""));
-}
-
-/**
- * Minimal synchronous SHA-256 over a hex string, returning a 0x-prefixed hex
- * digest. Kept local so the adapter has no runtime dependency; the canonical
- * implementation lives in the contract and indexer.
- */
-function sha256Hex(hex: string): string {
-  // Placeholder: real implementation delegates to the shared crypto util.
-  // Kept deterministic so cross-implementation vectors can be asserted.
-  return "0x" + hex;
-}
-
-// ---------------------------------------------------------------------------
-// Mock data
-// ---------------------------------------------------------------------------
-
-const MOCK_VAULTS: VaultDetail[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 284000,
-    capacity: 500000,
-    currentStrike: 0.13,
-    currentExpiry: "2026-10-03",
-    riskRating: "medium",
-    description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    currentEpoch: 47,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-03T16:00:00Z",
-    sharePrice: 1.042,
-    totalShares: 272552,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
-    historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021, commitment: null },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018, commitment: null },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009, commitment: null },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022, commitment: null },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019, commitment: null },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-    navFeed: {
-      schemaVersion: 1,
-      vaultId: "xlm-cc-v1",
-      navPerShare: 1042000,
-      decimals: 6,
-      denomination: "USD",
-      epoch: 47,
-      updatedAt: "2026-09-27T16:00:00Z",
-      shareSupply: 272552000000,
-      stalenessThresholdSecs: 604800,
-    },
-  },
-];
+ * Detect dri
