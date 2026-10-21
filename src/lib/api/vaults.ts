@@ -16,11 +16,57 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   GET /api/v1/vaults/{id}/nav-feed
+ *   → NavFeedEntry   (on-chain NAV-per-share feed, issue #277)
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * On-chain NAV / share-price feed entry (issue #277).
+ *
+ * The feed contract is a thin, append-only reader of committed values — the
+ * vault remains the single source of truth. Consumers should read this shape
+ * rather than deriving a price themselves.
+ *
+ * Consumer contract:
+ * - `navPerShare` is the committed NAV per share for `epoch`, denominated in
+ *   `denomination` (explicitly stated; multi-asset vaults report the quote
+ *   asset, e.g. "USD").
+ * - `decimals` is the number of decimals consumers must assume for
+ *   `navPerShare` (and `shareSupply`). Do not infer precision from the value.
+ * - `schemaVersion` lets consumers detect a breaking change to this shape.
+ * - `updatedAt` is the ledger time of the update. A value is STALE when
+ *   `now - updatedAt > stalenessThresholdSecs`; a stale value means the vault
+ *   skipped or delayed an epoch and the price must NOT be trusted as current.
+ *   Stale values are reported, never silently refreshed.
+ * - Rounding: `navPerShare` is truncated (not rounded up) to `decimals`; very
+ *   small share supplies may therefore lose precision — consumers must treat
+ *   the value as a lower bound, not an exact quote.
+ */
+export interface NavFeedEntry {
+  /** Feed schema version; bump on any breaking change to this shape. */
+  schemaVersion: number;
+  /** Vault the value belongs to. */
+  vaultId: string;
+  /** Committed NAV per share, scaled by 10^decimals. */
+  navPerShare: number;
+  /** Decimals consumers must assume for navPerShare / shareSupply. */
+  decimals: number;
+  /** Denomination of navPerShare (explicit for multi-asset vaults). */
+  denomination: string;
+  /** Epoch number the committed value came from. */
+  epoch: number;
+  /** Ledger time (ISO) the feed entry was last updated. */
+  updatedAt: string;
+  /** Total share supply at commit time, scaled by 10^decimals. */
+  shareSupply: number;
+  /** Age (seconds) beyond which the value is considered stale. */
+  stalenessThresholdSecs: number;
+}
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -75,6 +121,27 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** On-chain NAV feed entry for reconciliation against `sharePrice`. */
+  navFeed: NavFeedEntry | null;
+}
+
+/**
+ * Staleness verdict for a feed entry, callable by consumers.
+ * A vault that skips or delays an epoch goes stale — the feed never lies.
+ */
+export function isNavFeedStale(entry: NavFeedEntry, now: Date = new Date()): boolean {
+  const ageSecs = (now.getTime() - new Date(entry.updatedAt).getTime()) / 1000;
+  return ageSecs > entry.stalenessThresholdSecs;
+}
+
+/**
+ * Detect drift between the on-chain feed and the vault's internal share price.
+ * Returns the absolute difference in USD, or null when no feed entry exists.
+ */
+export function navFeedDrift(vault: VaultDetail): number | null {
+  if (!vault.navFeed) return null;
+  const feedPrice = vault.navFeed.navPerShare / 10 ** vault.navFeed.decimals;
+  return Math.abs(feedPrice - vault.sharePrice);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +177,17 @@ const MOCK_VAULTS: VaultDetail[] = [
       { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
     ],
     userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
+    navFeed: {
+      schemaVersion: 1,
+      vaultId: "xlm-cc-v1",
+      navPerShare: 1042000,
+      decimals: 6,
+      denomination: "USD",
+      epoch: 46,
+      updatedAt: "2026-09-27T16:00:00Z",
+      shareSupply: 272552000000,
+      stalenessThresholdSecs: 8 * 24 * 60 * 60,
+    },
   },
   {
     id: "btc-csp-v1",
@@ -137,6 +215,17 @@ const MOCK_VAULTS: VaultDetail[] = [
       { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
     ],
     userPosition: null,
+    navFeed: {
+      schemaVersion: 1,
+      vaultId: "btc-csp-v1",
+      navPerShare: 1088000,
+      decimals: 6,
+      denomination: "USD",
+      epoch: 17,
+      updatedAt: "2026-09-20T20:00:00Z",
+      shareSupply: 1700368000000,
+      stalenessThresholdSecs: 35 * 24 * 60 * 60,
+    },
   },
   {
     id: "eth-ic-v1",
@@ -159,82 +248,19 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
-    ],
-    userPosition: null,
+    navFeed: {
+      schemaVersion: 1,
+      vaultId: "eth-ic-v1",
+      navPerShare: 1021000,
+      decimals: 6,
+      denomination: "USD",
+      epoch: 10,
+      updatedAt: "2026-09-28T12:00:00Z",
+      shareSupply: 607247000000,
+      stalenessThresholdSecs: 35 * 24 * 60 * 60,
+    },
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
