@@ -31,6 +31,7 @@ npm test src/test/security/invariants.test.ts
 | **session** | `session` | Bearer token lifecycle: where tokens are stored, that logout clears them completely, and that tokens never appear in URLs. |
 | **isolation** | `isolation` | Per-wallet namespacing in `localStorage`. Alert rules, workspace layouts, and anti-phishing phrases must not bleed between wallet accounts. Hotkeys (non-sensitive) are explicitly documented as intentionally global. |
 | **headers** | `headers` | Structural HTTP and subresource security: `X-Frame-Options`, SRI hash format correctness, and the HTTPS-only policy for external resources. |
+| **corrections** | `corrections` | Admin correction / ledger adjustment write path (Issue #293). Append-only compensating entries, maker-checker (four-eyes) approval, expiry, magnitude-tiered approval, and post-application on-chain reconciliation. |
 
 ---
 
@@ -57,89 +58,40 @@ npm test src/test/security/invariants.test.ts
 | SEC-017 | isolation | Alert rules must be stored under a per-wallet key (`zenith.rules.<address>`) so that switching wallets does not expose another wallet's rules. | `src/test/security/invariants.test.ts` | `SEC-017: rules are stored per wallet address and cannot bleed across wallets` | CWE-359; data isolation |
 | SEC-018 | isolation | Workspace layouts must be stored under a per-wallet key (`zenith.layout.<address>`); a different wallet must see no layout data. | `src/test/security/invariants.test.ts` | `SEC-018: workspace layouts are keyed per wallet` | CWE-359; data isolation |
 | SEC-019 | isolation | Hotkeys configuration (`zenith.hotkeys.v1`) is intentionally global (non-sensitive preference) and is explicitly documented as such, not a violation. | `src/test/security/invariants.test.ts` | `SEC-019: hotkeys config is not wallet-specific (safe global preference)` | N/A — documented exception |
-| SEC-020 | isolation | Anti-phishing phrases must be stored under a per-wallet key (`zenith.antiphishing.phrase.<address>`) and must not be visible to a different wallet. | `src/test/security/invariants.test.ts` | `SEC-020: anti-phishing phrase is wallet-specific and survives wallet switch` | CWE-359; anti-phishing UX integrity |
-| SEC-021 | headers | The Next.js config must not disable `X-Frame-Options`; it must remain set to `DENY` or `SAMEORIGIN`. | `src/test/security/invariants.test.ts` | `SEC-021: next.config must not disable X-Frame-Options` | OWASP Clickjacking Defense; RFC 7034 |
-| SEC-022 | headers | Any SRI `integrity` attribute used in the app must match the format `sha(256\|384\|512)-<base64>` with at least 40 base64 characters. | `src/test/security/invariants.test.ts` | `SEC-022: SRI integrity attribute format is valid sha384 hash` | W3C SRI §4.2; OWASP ASVS V14.2.3 |
-| SEC-023 | headers | All external resource URLs (CDN scripts, fonts, etc.) must use `https://`, never `http://`. | `src/test/security/invariants.test.ts` | `SEC-023: external script URLs must use HTTPS not HTTP` | OWASP Transport Layer §1; HSTS |
+| SEC-020 | isolation | Anti-phishing phrases must be stored under a per-wallet key (`zenith.antiphishing.phrase.<address>`) and must not be visible to a different wallet. | `src/test/security/invariants.test.ts` | `SEC-020: anti-phishing phrase is wallet-scoped` | CWE-359; data isolation |
+| SEC-021 | headers | `X-Frame-Options` must be set to `DENY` (or `SAMEORIGIN`) on all responses to prevent clickjacking. | `src/test/security/invariants.test.ts` | `SEC-021: X-Frame-Options is DENY or SAMEORIGIN` | OWASP Secure Headers; clickjacking |
+| SEC-022 | headers | Every Subresource Integrity hash must be a valid `sha256-`/`sha384-`/`sha512-` base64 digest. | `src/test/security/invariants.test.ts` | `SEC-022: SRI hashes are well-formed` | W3C SRI; supply-chain integrity |
+| SEC-023 | headers | All external resources must be loaded over HTTPS only. | `src/test/security/invariants.test.ts` | `SEC-023: external resources are HTTPS-only` | OWASP Transport Layer; mixed-content |
+| SEC-024 | corrections | Every correction is append-only: applying a correction must never mutate or delete a prior ledger/NAV/queue record; it inserts a new record that references the superseded record by id. | `src/test/security/invariants.test.ts` | `SEC-024: correction is append-only and references superseded record` | Audit trail integrity; CWE-778 |
+| SEC-025 | corrections | Maker-checker is enforced server-side: a correction proposed by operator A must be rejected when approved by operator A (self-approval), regardless of UI state. | `src/test/security/invariants.test.ts` | `SEC-025: self-approval is rejected server-side` | Four-eyes principle; CWE-863 |
+| SEC-026 | corrections | A pending approval past its expiry window must be rejected and the correction must not transition to `applied`. | `src/test/security/invariants.test.ts` | `SEC-026: expired approval cannot be applied` | CWE-613; time-bound authorization |
+| SEC-027 | corrections | Corrections exceeding the magnitude threshold, or that change a published epoch's committed NAV, must require the higher approval tier; a single standard approver is insufficient. | `src/test/security/invariants.test.ts` | `SEC-027: high-magnitude / published-NAV corrections require higher approval tier` | Defense in depth; CWE-269 |
+| SEC-028 | corrections | Applying the same correction twice must be idempotent — the second application is a no-op and does not create a duplicate compensating entry. | `src/test/security/invariants.test.ts` | `SEC-028: repeated application of a correction is idempotent` | CWE-837; replay safety |
+| SEC-029 | corrections | A correction is applied atomically across the ledger, indexer, and read model; a failure mid-application must leave no partially applied state. | `src/test/security/invariants.test.ts` | `SEC-029: correction application is atomic (no partial state)` | CWE-362; transactional integrity |
+| SEC-030 | corrections | After application, the reconciliation job must fail loudly when corrected off-chain state diverges from on-chain balances. | `src/test/security/invariants.test.ts` | `SEC-030: reconciliation fails loudly on on-chain/off-chain divergence` | CWE-754; integrity monitoring |
 
 ---
 
-## Running the Suite
+## Admin Correction Catalog (Issue #293)
 
-Run all 23 invariant tests in isolation:
+Corrections are first-class domain objects with the state machine
+`proposed → approved → applied → reconciled` (with `rejected` and `expired`
+as terminal branches). They are emitted through the same event/outbox path
+as normal ledger writes so indexing and notifications stay consistent.
 
-```bash
-npm test src/test/security/invariants.test.ts
-```
+| Correction Type | Invariants | Blast Radius |
+|---|---|---|
+| **Compensating ledger entry** | Append-only; references superseded entry; idempotent by correction id. | Affects the affected account's balance and the epoch aggregate; does not alter historical entries. |
+| **NAV snapshot restatement** | Append-only; supersedes the prior snapshot; changing a published epoch's committed NAV requires the higher approval tier. | Affects NAV, share price, and all depositor valuations for the affected epoch; propagates to the read model behind `src/lib/api/vaults.ts`. |
+| **Queue-entry repair** | Append-only; references the stuck queue entry; must not reorder unrelated entries. | Affects the withdrawal queue ordering/state for the affected depositor; triggers reconciliation. |
+| **Fee reclassification** | Append-only; references the mis-booked fee entry. | Affects fee accounting and net NAV; does not delete the original fee record. |
+| **Indexer cursor rewind** | Append-only; records the prior cursor and the rewind target. | Affects indexer replay from the rewind point; must reconcile to on-chain state before completion. |
 
-Expected output (all passing):
+### Maker-Checker Rules
 
-```
- PASS  src/test/security/invariants.test.ts
-  [signing] challenge validation (SEC-001..005)
-    ✓ SEC-001: valid challenge parses and validates without error
-    ✓ SEC-002: challenge for wrong address is rejected (WRONG_ADDRESS)
-    ✓ SEC-003: expired challenge is rejected (EXPIRED)
-    ✓ SEC-004: challenge with mismatched domain is rejected (WRONG_DOMAIN)
-    ✓ SEC-005: malformed nonce is rejected (NONCE_MALFORMED)
-  [signing] origin binding (SEC-006..009)
-    ✓ SEC-006: challenge URI must be a valid HTTPS URL
-    ✓ SEC-007: challenge version other than '1' is rejected
-    ✓ SEC-008: challenge issued too far in the past is rejected (ISSUED_AT_TOO_OLD)
-    ✓ SEC-009: issued-at far in the future is rejected (ISSUED_AT_FUTURE)
-  [input] address poisoning detection (SEC-010..013)
-    ✓ SEC-010: exact address match is not flagged as poisoned
-    ✓ SEC-011: address matching first+last chars but differing in middle is flagged
-    ✓ SEC-012: completely different address is not flagged
-    ✓ SEC-013: empty input is not flagged
-  [session] token storage invariants (SEC-014..016)
-    ✓ SEC-014: after explicit logout, no wallet key remains in localStorage
-    ✓ SEC-015: bearer token must not appear as a URL query parameter
-    ✓ SEC-016: sessionStorage is empty after a fresh page load simulation
-  [isolation] cross-wallet data isolation (SEC-017..020)
-    ✓ SEC-017: rules are stored per wallet address and cannot bleed across wallets
-    ✓ SEC-018: workspace layouts are keyed per wallet
-    ✓ SEC-019: hotkeys config is not wallet-specific (safe global preference)
-    ✓ SEC-020: anti-phishing phrase is wallet-specific and survives wallet switch
-  [headers] SRI and structural security checks (SEC-021..023)
-    ✓ SEC-021: next.config must not disable X-Frame-Options
-    ✓ SEC-022: SRI integrity attribute format is valid sha384 hash
-    ✓ SEC-023: external script URLs must use HTTPS not HTTP
-
-Tests: 23 passed, 23 total
-```
-
-To run the full test suite (all unit tests):
-
-```bash
-npm test
-```
-
----
-
-## Adding New Invariants
-
-1. **Assign the next ID.** IDs are sequential and never reused. Find the highest existing `SEC-NNN` in the table above and increment.
-
-2. **Assign a domain.** Choose from `signing`, `input`, `session`, `isolation`, or `headers`. If the new invariant doesn't fit any existing domain, define a new one and add it to the [Domain Definitions](#domain-definitions) table above.
-
-3. **Write the test.** Add it to `src/test/security/invariants.test.ts` inside the appropriate `describe` block (or a new one for a new domain). The test description must begin with the invariant ID: `"SEC-NNN: ..."`.
-
-4. **Update this table.** Add a row with all six columns filled in. The `Security / WCAG Ref` column should cite at least one of: a CWE number, an OWASP guide section, a W3C spec reference, or a WCAG 2.2 Success Criterion.
-
-5. **Keep the suite self-contained.** Invariant tests must not require a running backend, a real Freighter extension, or any network call. If the invariant requires external state, mock it.
-
-6. **Verify CI is green.** Run `npm test src/test/security/invariants.test.ts` locally before opening the PR. The test file must stay at exactly one location so the CI `--grep SEC-` pattern continues to work.
-
-> **Do not delete or renumber existing IDs.** If an invariant becomes obsolete, mark it `RETIRED` in the table and add a comment in the test explaining why it was removed, then delete only the test body (keeping the `it.skip` stub with the ID).
-
----
-
-## Related Documents
-
-- [docs/security/sri-policy.md](sri-policy.md) — Subresource Integrity policy: which external resources require SRI hashes, how hashes are generated and pinned, and the CI check that enforces them (directly related to SEC-022 and SEC-023).
-- [docs/a11y/audit.md](../a11y/audit.md) — Accessibility audit results and remediation tracking. SEC-014 references WCAG 2.2 SC 3.3.8 (accessible authentication); that document tracks the broader WCAG compliance posture.
-
----
-
-*Last updated: 2026-09-29 · Issue [#130](https://github.com/Zenith-options/frontend/issues/130)*
+- A correction is proposed by one operator with a written reason and an evidence link.
+- A **different** operator must approve; self-approval is rejected server-side (SEC-025).
+- Approvals expire; an expired approval cannot be applied (SEC-026).
+- Magnitude thresholds and published-NAV changes route to the higher approval tier (SEC-027).
+- Application is idempotent (SEC-028) and atomic across ledger, indexer, and read model (SEC-029).
+- Post-application reconciliation must confirm corrected state matches on-chain balances and fail loudly otherwise (SEC-030).

@@ -16,6 +16,14 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   Admin corrections (issue #293) — four-eyes approval, append-only:
+ *   GET  /api/v1/vaults/{id}/corrections            → VaultCorrection[]
+ *   POST /api/v1/vaults/{id}/corrections            { type, reason, evidenceUrl, supersedes, payload } → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/approve  → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/reject   → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/apply    → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/preview  → CorrectionPreview
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -75,6 +83,115 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Admin corrections (issue #293)
+// ---------------------------------------------------------------------------
+
+/**
+ * Catalog of supported correction types. Each is an append-only compensating
+ * entry that references (never mutates) the record it supersedes.
+ *
+ * - compensating_ledger_entry: posts an offsetting ledger entry. Invariant:
+ *   sum of compensating entries nets to the intended delta; blast radius is
+ *   the affected epoch's ledger + read model.
+ * - nav_snapshot_restatement: supersedes a NAV snapshot with a corrected one.
+ *   Invariant: new snapshot references the superseded snapshot id; blast
+ *   radius includes published NAV feed + share price.
+ * - queue_entry_repair: repairs a stuck withdrawal-queue entry. Invariant:
+ *   total queued shares unchanged unless explicitly stated; blast radius is
+ *   the withdrawal queue only.
+ * - fee_reclassification: reclassifies a mis-booked fee. Invariant: total
+ *   fees conserved across management/performance buckets; blast radius is
+ *   fee accounting + NAV.
+ * - indexer_cursor_rewind: rewinds the indexer cursor to re-derive state.
+ *   Invariant: rewind target <= last reconciled block; blast radius is the
+ *   indexer + read model (no ledger mutation).
+ */
+export type CorrectionType =
+  | "compensating_ledger_entry"
+  | "nav_snapshot_restatement"
+  | "queue_entry_repair"
+  | "fee_reclassification"
+  | "indexer_cursor_rewind";
+
+/** State machine: proposed → approved → applied → reconciled, or rejected/expired. */
+export type CorrectionStatus =
+  | "proposed"
+  | "approved"
+  | "applied"
+  | "reconciled"
+  | "rejected"
+  | "expired";
+
+/** Approval tier; larger magnitudes / published-NAV changes need higher tiers. */
+export type ApprovalTier = "standard" | "elevated";
+
+/** A first-class correction domain object. */
+export interface VaultCorrection {
+  id: string;
+  vaultId: string;
+  type: CorrectionType;
+  status: CorrectionStatus;
+  /** Written reason supplied by the proposing operator. */
+  reason: string;
+  /** Evidence link (ticket, tx, dashboard) supplied by the proposer. */
+  evidenceUrl: string;
+  /** Id of the record this correction supersedes (append-only reference). */
+  supersedes: string;
+  /** Type-specific payload (e.g. corrected NAV, queue entry id). */
+  payload: Record<string, unknown>;
+  /** Operator who proposed. */
+  proposedBy: string;
+  proposedAt: string; // ISO
+  /** Operator who approved (must differ from proposedBy). */
+  approvedBy: string | null;
+  approvedAt: string | null; // ISO
+  /** When the approval expires and must be re-approved. */
+  approvalExpiresAt: string | null; // ISO
+  /** Required approval tier for this correction. */
+  requiredTier: ApprovalTier;
+  /** True when the correction changes a published epoch's committed NAV. */
+  affectsPublishedNav: boolean;
+  /** Idempotency key so repeated application is a no-op. */
+  idempotencyKey: string;
+  appliedAt: string | null; // ISO
+  reconciledAt: string | null; // ISO
+}
+
+/** Dry-run preview of a correction's effect before approval. */
+export interface CorrectionPreview {
+  correctionId: string;
+  resultingNav: number;
+  resultingSharePrice: number;
+  queueState: { queuedShares: number; repairedEntries: number };
+  affectedDepositors: number;
+  /** Whether the previewed state matches on-chain balances. */
+  reconcilesOnChain: boolean;
+}
+
+/**
+ * Server-side maker-checker guard. Rejects self-approval and expired approvals.
+ * The UI must not be the only enforcement point.
+ */
+export function assertApprovalAllowed(
+  correction: VaultCorrection,
+  approver: string,
+  now: Date = new Date(),
+): void {
+  if (correction.status !== "proposed") {
+    throw new Error(`Correction ${correction.id} is not awaiting approval`);
+  }
+  if (approver === correction.proposedBy) {
+    throw new Error("Self-approval is not permitted");
+  }
+  if (
+    correction.approvalExpiresAt &&
+    new Date(correction.approvalExpiresAt).getTime() <= now.getTime()
+  ) {
+    throw new Error(`Approval for correction ${correction.id} has expired`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,82 +276,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
