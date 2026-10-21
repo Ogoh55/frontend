@@ -237,13 +237,17 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
 export async function depositToVault(
   id: string,
   amount: number,
-  _token: string
+  _token: string,
+  /** Optional referral code to attribute this deposit (first-touch; ignored if already attributed). */
+  referralCode?: string,
 ): Promise<{ tx_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
+    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount, referral_code: referralCode }, token);
     throw new Error("Live vaults API not yet implemented");
   }
   // Mock: simulate a 600ms network round-trip
+  // referralCode is forwarded to the backend as `referral_code` in the real path.
+  void referralCode; // consumed by the live path above
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
 }
