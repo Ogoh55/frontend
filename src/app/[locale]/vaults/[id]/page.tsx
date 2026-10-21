@@ -20,6 +20,8 @@ import {
 } from "../../../../components/VaultEligibilityGate";
 import { checkVaultEligibility } from "../../../../lib/api/vaultEligibility";
 import { VaultReferralPanel } from "../../../../components/VaultReferralPanel";
+import { VaultCommitmentsPanel } from "../../../../components/VaultCommitmentsPanel";
+import { VaultOperatorCallPanel } from "../../../../components/VaultOperatorCallPanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -338,6 +340,24 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   token={token}
                   vaultId={id}
                   vaultName={vault.name}
+                />
+
+                {/* LP institutional commitment & capital calls */}
+                <VaultCommitmentsPanel
+                  walletAddress={address}
+                  token={token}
+                  vaultId={id}
+                  sharePrice={vault.sharePrice}
+                  currentEpoch={vault.currentEpoch}
+                />
+
+                {/* Operator commitment management (operator-only; always rendered, gates internally) */}
+                <VaultOperatorCallPanel
+                  operatorAddress={address}
+                  token={token}
+                  vaultId={id}
+                  vaultCapacity={vault.capacity}
+                  currentTvl={vault.tvl}
                 />
 
                 {/* Fee disclosure */}
