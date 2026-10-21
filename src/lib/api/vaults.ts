@@ -22,6 +22,67 @@ export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" 
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
+/** Instrument used to hedge a vault's directional exposure. */
+export type HedgeInstrument = "underlying" | "perp" | "futures";
+
+/**
+ * Per-vault delta-hedging policy (issue #297).
+ *
+ * The policy is enforced on-chain; the keeper service only proposes hedge
+ * trades. A disabled policy or an engaged kill switch must result in zero
+ * hedge trades. `maxHedgeNotional` is a hard cap in USD that the contract
+ * clamps against so an off-chain bug cannot overshoot.
+ */
+export interface HedgePolicy {
+  /** Master enable flag. When false, no hedge trades are ever executed. */
+  enabled: boolean;
+  /** Hard kill switch — overrides `enabled` and halts all hedging. */
+  killSwitch: boolean;
+  /** Target portfolio delta (e.g. 0 = delta-neutral). */
+  targetDelta: number;
+  /** Allowed drift around the target before a rehedge is triggered. */
+  deltaTolerance: number;
+  /** Instrument used to execute hedge trades. */
+  hedgeInstrument: HedgeInstrument;
+  /** Maximum absolute hedge notional in USD, enforced in-contract. */
+  maxHedgeNotional: number;
+  /** Minimum seconds between rehedges to rate-limit hedge churn. */
+  rehedgeIntervalSecs: number;
+}
+
+/** Current hedge status surfaced for a vault. */
+export interface HedgeStatus {
+  policy: HedgePolicy;
+  /** Aggregate portfolio delta of open written positions. */
+  portfolioDelta: number;
+  /** Aggregate portfolio gamma (informational). */
+  portfolioGamma: number;
+  /** Aggregate portfolio vega (informational). */
+  portfolioVega: number;
+  /** Current hedge position notional in USD (signed). */
+  hedgeNotional: number;
+  /** Whether the current delta is outside the configured band. */
+  outsideBand: boolean;
+  /** Timestamp of the last executed hedge trade, if any. */
+  lastHedgeAt: string | null;
+  /** True when the price feed is stale and hedging is failing safe. */
+  staleOracle: boolean;
+}
+
+/** A single hedge trade recorded in the epoch ledger. */
+export interface HedgeTrade {
+  epochNumber: number;
+  timestamp: string; // ISO
+  instrument: HedgeInstrument;
+  /** Signed notional in USD (positive = long hedge, negative = short). */
+  notional: number;
+  /** Realized hedge P&L in USD, attributed separately from option premium. */
+  hedgePnl: number;
+  /** Portfolio delta before and after the hedge. */
+  deltaBefore: number;
+  deltaAfter: number;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -53,6 +114,8 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: "expired_worthless" | "exercised" | "active";
   pnlPct: number; // epoch return, positive = profit for depositors
+  /** Hedge P&L for the epoch, attributed separately from option premium. */
+  hedgePnl?: number;
 }
 
 /** The user's position in a vault. */
@@ -75,6 +138,10 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** Delta-hedging policy and live status, when configured. */
+  hedgeStatus?: HedgeStatus;
+  /** Hedge trades recorded in the current epoch ledger. */
+  hedgeTrades?: HedgeTrade[];
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +177,27 @@ const MOCK_VAULTS: VaultDetail[] = [
       { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
     ],
     userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
+    hedgeStatus: {
+      policy: {
+        enabled: true,
+        killSwitch: false,
+        targetDelta: 0,
+        deltaTolerance: 0.1,
+        hedgeInstrument: "perp",
+        maxHedgeNotional: 50000,
+        rehedgeIntervalSecs: 3600,
+      },
+      portfolioDelta: 0.34,
+      portfolioGamma: -0.02,
+      portfolioVega: -12.4,
+      hedgeNotional: -32000,
+      outsideBand: true,
+      lastHedgeAt: "2026-09-27T15:00:00Z",
+      staleOracle: false,
+    },
+    hedgeTrades: [
+      { epochNumber: 47, timestamp: "2026-09-27T15:00:00Z", instrument: "perp", notional: -32000, hedgePnl: -84.2, deltaBefore: 0.41, deltaAfter: 0.34 },
+    ],
   },
   {
     id: "btc-csp-v1",
@@ -137,6 +225,25 @@ const MOCK_VAULTS: VaultDetail[] = [
       { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
     ],
     userPosition: null,
+    hedgeStatus: {
+      policy: {
+        enabled: false,
+        killSwitch: false,
+        targetDelta: 0,
+        deltaTolerance: 0.15,
+        hedgeInstrument: "futures",
+        maxHedgeNotional: 250000,
+        rehedgeIntervalSecs: 86400,
+      },
+      portfolioDelta: -0.28,
+      portfolioGamma: -0.01,
+      portfolioVega: -40.1,
+      hedgeNotional: 0,
+      outsideBand: true,
+      lastHedgeAt: null,
+      staleOracle: false,
+    },
+    hedgeTrades: [],
   },
   {
     id: "eth-ic-v1",
@@ -159,82 +266,27 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
     ],
     userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
-    ],
-    userPosition: null,
+    hedgeStatus: {
+      policy: {
+        enabled: true,
+        killSwitch: false,
+        targetDelta: 0,
+        deltaTolerance: 0.05,
+        hedgeInstrument: "underlying",
+        maxHedgeNotional: 100000,
+        rehedgeIntervalSecs: 7200,
+      },
+      portfolioDelta: 0.02,
+      portfolioGamma: -0.03,
+      portfolioVega: -18.7,
+      hedgeNotional: 0,
+      outsideBand: false,
+      lastHedgeAt: null,
+      staleOracle: false,
+    },
+    hedgeTrades: [],
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
