@@ -70,6 +70,214 @@ export interface SizingDecision {
   remainingHeadroom: number;
 }
 
+/**
+ * Transfer policy for vault LP shares.
+ *
+ * - `OPEN`        — shares are freely transferable (current default).
+ * - `ALLOWLISTED` — transfers are permitted only when the recipient is on
+ *                   the vault's allowlist (and not on the denylist).
+ * - `BLOCKED`     — all share transfers are disabled. Mint (deposit) and
+ *                   burn (redeem / forced burn) remain permitted so a
+ *                   restriction can never trap a depositor's principal.
+ */
+export type TransferPolicy = "OPEN" | "ALLOWLISTED" | "BLOCKED";
+
+/**
+ * A single allowlist entry with explicit provenance so an entry's origin is
+ * auditable. Entries are versioned; the vault's `allowlistVersion` is bumped
+ * on every mutation and recorded alongside the operator that made it.
+ */
+export interface AllowlistEntry {
+  address: string;
+  /** Monotonic version at which this entry was added. */
+  version: number;
+  /** Operator/backend identity that added the entry. */
+  addedBy: string;
+  /** ISO timestamp of the addition. */
+  addedAt: string;
+  /** Optional jurisdiction tag driving eligibility gating. */
+  jurisdiction?: string;
+}
+
+/**
+ * Audited record of a policy or allowlist mutation. Surfaced in the
+ * depositor-facing disclosure and transparency surfaces.
+ */
+export interface ComplianceAuditRecord {
+  id: string;
+  kind: "policy_change" | "allowlist_add" | "allowlist_remove";
+  /** Resulting allowlist version after the mutation. */
+  version: number;
+  address?: string;
+  /** Previous policy, for `policy_change` records. */
+  previousPolicy?: TransferPolicy;
+  /** New policy, for `policy_change` records. */
+  policy?: TransferPolicy;
+  actor: string;
+  /** ISO timestamp at which the change takes effect (timelock). */
+  effectiveAt: string;
+  createdAt: string;
+}
+
+/**
+ * Compliance hook surface for the backend compliance service. The contract
+ * never reaches out to an oracle itself; instead the backend supplies a
+ * pre-transfer advisory and consumes a post-settlement reconciliation feed.
+ */
+export interface ComplianceHooks {
+  /**
+   * Pre-transfer advisory. Returns `true` to allow, `false` to deny. The
+   * contract treats a missing hook as allow (policy still applies).
+   */
+  preTransferCheck?: (from: string, to: string, amount: number) => boolean;
+  /**
+   * Post-settlement reconciliation feed. Invoked after a transfer settles so
+   * the backend can reconcile screening decisions.
+   */
+  onSettled?: (event: TransferSettlementEvent) => void;
+}
+
+/** Emitted to the reconciliation feed after a transfer settles. */
+export interface TransferSettlementEvent {
+  vaultId: string;
+  from: string;
+  to: string;
+  amount: number;
+  policy: TransferPolicy;
+  allowlistVersion: number;
+  /** ISO timestamp of settlement. */
+  settledAt: string;
+}
+
+/**
+ * Distinct, documented error code for a transfer rejected by the allowlist.
+ * Part of the error taxonomy; surfaced verbatim to callers.
+ */
+export const ERR_TRANSFER_NOT_ALLOWLISTED = "VAULT_TRANSFER_NOT_ALLOWLISTED";
+/** Distinct error code for a transfer rejected by the denylist. */
+export const ERR_TRANSFER_DENYLISTED = "VAULT_TRANSFER_DENYLISTED";
+/** Distinct error code for a transfer rejected because the policy is BLOCKED. */
+export const ERR_TRANSFER_BLOCKED = "VAULT_TRANSFER_BLOCKED";
+
+/** Result of a `can_transfer` evaluation. */
+export interface TransferDecision {
+  allowed: boolean;
+  /** Error code when `allowed` is false, else null. */
+  code: string | null;
+}
+
+/**
+ * Transfer-restriction configuration for a vault's LP shares.
+ */
+export interface TransferRestrictions {
+  policy: TransferPolicy;
+  /** Monotonic version, bumped on every policy/allowlist mutation. */
+  allowlistVersion: number;
+  allowlist: AllowlistEntry[];
+  /** Denylist addresses. An address on both lists is denied (deny wins). */
+  denylist: string[];
+  /** Addresses exempt from restrictions (contract, redemption queue). */
+  exempt: string[];
+}
+
+/**
+ * Single source of truth for whether a share transfer is permitted. Every
+ * transfer path (including future batch paths) must route through this.
+ *
+ * Exempt addresses (the contract itself and the redemption queue) bypass the
+ * policy so redemptions and forced burns always succeed. An address present
+ * on both the allowlist and denylist is denied deterministically.
+ */
+export function can_transfer(
+  restrictions: TransferRestrictions,
+  from: string,
+  to: string,
+  hooks?: ComplianceHooks,
+): TransferDecision {
+  // Exempt endpoints (contract, redemption queue) always pass.
+  if (restrictions.exempt.includes(from) || restrictions.exempt.includes(to)) {
+    return { allowed: true, code: null };
+  }
+
+  if (restrictions.policy === "BLOCKED") {
+    return { allowed: false, code: ERR_TRANSFER_BLOCKED };
+  }
+
+  if (restrictions.policy === "ALLOWLISTED") {
+    // Deny wins: an address on both lists is denied.
+    if (restrictions.denylist.includes(to)) {
+      return { allowed: false, code: ERR_TRANSFER_DENYLISTED };
+    }
+    const allowed = restrictions.allowlist.some((e) => e.address === to);
+    if (!allowed) {
+      return { allowed: false, code: ERR_TRANSFER_NOT_ALLOWLISTED };
+    }
+  }
+
+  // Pre-transfer advisory from the backend compliance service.
+  if (hooks?.preTransferCheck && !hooks.preTransferCheck(from, to, 0)) {
+    return { allowed: false, code: ERR_TRANSFER_DENYLISTED };
+  }
+
+  return { allowed: true, code: null };
+}
+
+/**
+ * Apply an allowlist addition, returning the updated restrictions and an
+ * audited record. The version is bumped so provenance is auditable.
+ */
+export function addAllowlistEntry(
+  restrictions: TransferRestrictions,
+  entry: Omit<AllowlistEntry, "version">,
+  actor: string,
+  now: string = new Date().toISOString(),
+): { restrictions: TransferRestrictions; audit: ComplianceAuditRecord } {
+  const version = restrictions.allowlistVersion + 1;
+  const next: TransferRestrictions = {
+    ...restrictions,
+    allowlistVersion: version,
+    allowlist: [...restrictions.allowlist, { ...entry, version }],
+  };
+  const audit: ComplianceAuditRecord = {
+    id: `allowlist_add:${entry.address}:${version}`,
+    kind: "allowlist_add",
+    version,
+    address: entry.address,
+    actor,
+    effectiveAt: now,
+    createdAt: now,
+  };
+  return { restrictions: next, audit };
+}
+
+/**
+ * Apply an allowlist removal, returning the updated restrictions and an
+ * audited record. The version is bumped so provenance is auditable.
+ */
+export function removeAllowlistEntry(
+  restrictions: TransferRestrictions,
+  address: string,
+  actor: string,
+  now: string = new Date().toISOString(),
+): { restrictions: TransferRestrictions; audit: ComplianceAuditRecord } {
+  const version = restrictions.allowlistVersion + 1;
+  const next: TransferRestrictions = {
+    ...restrictions,
+    allowlistVersion: version,
+    allowlist: restrictions.allowlist.filter((e) => e.address !== address),
+  };
+  const audit: ComplianceAuditRecord = {
+    id: `allowlist_remove:${address}:${version}`,
+    kind: "allowlist_remove",
+    version,
+    address,
+    actor,
+    effectiveAt: now,
+    createdAt: now,
+  };
+  return { restrictions: next, audit };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -127,6 +335,8 @@ export interface VaultDetail extends VaultSummary {
   exposureLimits: ExposureLimits;
   /** Current written exposure used by the sizing step. */
   exposure: ExposureState;
+  /** Transfer-restriction configuration for LP shares. */
+  transferRestrictions: TransferRestrictions;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,85 +432,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
     historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-    exposureLimits: { perUnderlying: 0.5, perStrikeBucket: 0.35, perExpiry: 0.4 },
-    exposure: {
-      nav: 284000,
-      byUnderlying: { XLM: 142000 },
-      byStrikeBucket: { otm: 142000 },
-      byExpiry: { "2026-10-03": 142000 },
-    },
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-    exposureLimits: { perUnderlying: 0.6, perStrikeBucket: 0.4, perExpiry: 0.5 },
-    exposure: {
-      nav: 1850000,
-      byUnderlying: { BTC: 925000 },
-      byStrikeBucket: { otm: 925000 },
-      byExpiry: { "2026-10-17": 925000 },
-    },
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
-    ],
-    userPosition: null,
-    exposureLimits: { perUnderlying: 0.4, perStrikeBucket: 0.25, perExpiry: 0.3 },
-    exposure: {
-      nav: 620000,
-      byUnderlying: { ETH: 186000 },
-      byStrikeBucket: { otm: 124000, atm: 62000 },
-      byExpiry: { "2026-10-10": 186000 },
-    },
-  },
-];
+      { epochNumber: 46, deposi
+
+/* … truncated 4940 chars — edit only what you need near the top … */
