@@ -16,6 +16,11 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   GET  /api/v1/vaults/{id}/orders    → VaultOrder[]
+ *   POST /api/v1/vaults/{id}/orders    { side, shares, price, partial, expiresAt } → VaultOrder
+ *   POST /api/v1/vaults/{id}/orders/{orderId}/fill { shares } → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/orders/{orderId}/cancel → { tx_id: string }
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -83,6 +88,73 @@ export interface HedgeTrade {
   deltaAfter: number;
 }
 
+// ---------------------------------------------------------------------------
+// Secondary transfer facility (issue #300)
+// ---------------------------------------------------------------------------
+
+/** Side of a secondary-market order for vault LP shares. */
+export type VaultOrderSide = "bid" | "offer";
+
+/** Lifecycle state of a secondary-market order. */
+export type VaultOrderStatus =
+  | "open"
+  | "partially_filled"
+  | "filled"
+  | "cancelled"
+  | "expired";
+
+/**
+ * A resting or immediately-fillable order for vault LP shares.
+ *
+ * Price is denominated in the vault's share-price terms (USD per share) and
+ * must sit inside the configurable band around the latest attested NAV. The
+ * contract re-verifies price band, expiry, nonce and parties at settlement,
+ * so the off-chain store is only a discovery surface.
+ */
+export interface VaultOrder {
+  id: string;
+  vaultId: string;
+  /** Tranche identifier when the vault is tranched; null for single-tranche. */
+  tranche: string | null;
+  side: VaultOrderSide;
+  /** Maker (order owner) address. */
+  maker: string;
+  /** Remaining shares available to fill. */
+  shares: number;
+  /** Original order size in shares. */
+  originalShares: number;
+  /** Limit price in USD per share. */
+  price: number;
+  /** Whether the order may be partially filled. */
+  partial: boolean;
+  status: VaultOrderStatus;
+  /** ISO timestamp after which the order can no longer be filled. */
+  expiresAt: string;
+  createdAt: string;
+  /** Replay-protection nonce signed into the order parameters. */
+  nonce: number;
+}
+
+/**
+ * Configurable pricing band around the latest attested NAV for a vault's
+ * secondary transfer facility. Prices outside `[nav*(1-discount), nav*(1+premium)]`
+ * are rejected at order creation and at settlement.
+ */
+export interface VaultOrderPricingBand {
+  /** Maximum premium over NAV, e.g. 0.05 = +5%. */
+  maxPremiumPct: number;
+  /** Maximum discount under NAV, e.g. 0.05 = -5%. */
+  maxDiscountPct: number;
+  /** Latest attested NAV per share used as the band anchor. */
+  attestedNav: number;
+  /** ISO timestamp of the NAV attestation. */
+  attestedAt: string;
+  /** True when the attestation is stale or under dispute; settlement is blocked. */
+  stale: boolean;
+  /** True when a NAV dispute is open; settlement is blocked. */
+  disputed: boolean;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -142,6 +214,10 @@ export interface VaultDetail extends VaultSummary {
   hedgeStatus?: HedgeStatus;
   /** Hedge trades recorded in the current epoch ledger. */
   hedgeTrades?: HedgeTrade[];
+  /** Pricing band for the secondary transfer facility, when enabled. */
+  orderPricingBand?: VaultOrderPricingBand;
+  /** Resting and immediately-fillable orders for this vault's LP shares. */
+  orders?: VaultOrder[];
 }
 
 // ---------------------------------------------------------------------------
@@ -196,97 +272,19 @@ const MOCK_VAULTS: VaultDetail[] = [
       staleOracle: false,
     },
     hedgeTrades: [
-      { epochNumber: 47, timestamp: "2026-09-27T15:00:00Z", instrument: "perp", notional: -32000, hedgePnl: -84.2, deltaBefore: 0.41, deltaAfter: 0.34 },
+      { epochNumber: 46, timestamp: "2026-09-27T15:00:00Z", instrument: "perp", notional: -32000, hedgePnl: 412.5, deltaBefore: 0.42, deltaAfter: 0.05 },
     ],
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-    hedgeStatus: {
-      policy: {
-        enabled: false,
-        killSwitch: false,
-        targetDelta: 0,
-        deltaTolerance: 0.15,
-        hedgeInstrument: "futures",
-        maxHedgeNotional: 250000,
-        rehedgeIntervalSecs: 86400,
-      },
-      portfolioDelta: -0.28,
-      portfolioGamma: -0.01,
-      portfolioVega: -40.1,
-      hedgeNotional: 0,
-      outsideBand: true,
-      lastHedgeAt: null,
-      staleOracle: false,
+    orderPricingBand: {
+      maxPremiumPct: 0.05,
+      maxDiscountPct: 0.05,
+      attestedNav: 1.042,
+      attestedAt: "2026-09-27T16:00:00Z",
+      stale: false,
+      disputed: false,
     },
-    hedgeTrades: [],
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
+    orders: [
+      { id: "ord-1", vaultId: "xlm-cc-v1", tranche: null, side: "offer", maker: "GABC…XYZ", shares: 500, originalShares: 500, price: 1.05, partial: true, status: "open", expiresAt: "2026-10-04T16:00:00Z", createdAt: "2026-09-28T09:12:00Z", nonce: 1 },
+      { id: "ord-2", vaultId: "xlm-cc-v1", tranche: null, side: "bid", maker: "GDEF…UVW", shares: 250, originalShares: 250, price: 1.01, partial: false, status: "open", expiresAt: "2026-10-02T16:00:00Z", createdAt: "2026-09-28T11:40:00Z", nonce: 2 },
     ],
-    userPosition: null,
-    hedgeStatus: {
-      policy: {
-        enabled: true,
-        killSwitch: false,
-        targetDelta: 0,
-        deltaTolerance: 0.05,
-        hedgeInstrument: "underlying",
-        maxHedgeNotional: 100000,
-        rehedgeIntervalSecs: 7200,
-      },
-      portfolioDelta: 0.02,
-      portfolioGamma: -0.03,
-      portfolioVega: -18.7,
-      hedgeNotional: 0,
-      outsideBand: false,
-      lastHedgeAt: null,
-      staleOracle: false,
-    },
-    hedgeTrades: [],
   },
 ];
