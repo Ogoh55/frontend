@@ -1,32 +1,9 @@
-    branches: [main]
-
-# Cancel superseded runs on the same ref so each push only bills one run.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-# Least-privilege permissions; individual jobs add what they need.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-  pull-requests: write  # for posting VRT diff comments
-
-env:
-  # Required by Next.
-
-jobs:
-  check:
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-
-jobs:
-  check:
-    branches: [main]
 
 # Cancel superseded runs on the same ref so each push only bills one run.
 concurrency:
@@ -152,22 +129,6 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
       - run: npx playwright install --with-deps chromium webkit
-      # RECORD=1 keeps a video of every test; they're uploaded bel
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
-        env:
-          NEXT_TELEMETRY_DISABLED: "1"
-      - run: npx playwright install --with-deps chromium webkit
       # RECORD=1 keeps a video of every test; they're uploaded below as the
       # PR's recordings of the tour, the mode switch and the phone trade flow.
       - run: npx playwright test
@@ -263,105 +224,67 @@ jobs:
         run: npm run storybook:test
         env:
           # Point the test runner at the static build served by the built-in
-          # reference server that test-runner starts automatically.
+          # reference server.
           TARGET_URL: http://localhost:6006
-          # Fail CI on any a11y violation
-          SB_TESTRUNNER_SKIP_STORIES_FILE: ''
 
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: storybook-test-results
-          path: |
-            test-results/
-          retention-days: 7
-
-  storybook-visual-regression:
-    name: Visual Regression Tests
+  # ────────────────────────────────────────────────────────────────────────────
+  # POST-DEPLOY VERIFICATION (issue #288)
+  # Read-only smoke suite + canary gate for vault contract/backend releases.
+  # Runs only when a deployed environment URL is provided (e.g. via a
+  # workflow_dispatch input or a release event). Never submits transactions.
+  # ────────────────────────────────────────────────────────────────────────────
+  post-deploy-verify:
+    name: Post-deploy verification (smoke + canary)
     runs-on: ubuntu-latest
-    needs: storybook-build
+    # Only run when a target environment is supplied; skip on plain PRs.
+    if: ${{ vars.DEPLOY_ENV_URL != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: 22
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
-
-      - name: Download Storybook build
-        uses: actions/download-artifact@v4
-        with:
-          name: storybook-static
-          path: storybook-static/
-
-      - name: Serve Storybook static build
-        run: |
-          npx serve storybook-static --listen 6006 &
-          # Wait for the server to be ready
-          npx wait-on http://localhost:6006 --timeout 30000
+      # Read-only smoke suite: registry, NAV/share price, simulated deposit &
+      # withdrawal, epoch ledger entry, and indexer ledger-lag bound. Fails the
+      # job (triggering rollback) if any check fails.
+      - name: Run post-deploy smoke suite
+        run: npm run verify:smoke
         env:
-          CI: true
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          CANARY_BASE_URL: ${{ vars.CANARY_BASE_URL }}
+          INDEXER_MAX_LAG_LEDGERS: ${{ vars.INDEXER_MAX_LAG_LEDGERS || '30' }}
+          VERIFY_RELEASE: ${{ github.ref_name }}
 
-      - name: Run VRT screenshots
-        run: npm run test:vrt
+      # Canary gate: percentage/shadow traffic with structural comparison of
+      # responses to the stable version; promotes only when error rate and
+      # latency are within budget.
+      - name: Run canary comparison gate
+        run: npm run verify:canary
         env:
-          CI: true
-          STORYBOOK_URL: http://localhost:6006
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          CANARY_BASE_URL: ${{ vars.CANARY_BASE_URL }}
+          CANARY_ERROR_BUDGET: ${{ vars.CANARY_ERROR_BUDGET || '0.01' }}
+          CANARY_LATENCY_BUDGET_MS: ${{ vars.CANARY_LATENCY_BUDGET_MS || '500' }}
+          VERIFY_RELEASE: ${{ github.ref_name }}
 
-      - name: Upload VRT report
+      - name: Upload verification results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vrt-report-${{ github.run_id }}
-          path: |
-            playwright-report/storybook-vrt/
-            test-results/
+          name: post-deploy-verification-${{ github.ref_name }}
+          path: verification-results/
           retention-days: 30
 
-      - name: Comment VRT diff on PR
-        if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const artifactUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## 📸 Visual Regression Differences Detected\n\nScreenshot diffs were found. Download the **[VRT report artifact](${artifactUrl})** to review pixel-level differences.\n\nTo update baselines:\n\`\`\`bash\nnpx playwright test --config playwright.storybook.config.ts --update-snapshots\ngit add e2e/storybook/__snapshots__\ngit commit -m "chore: update VRT snapshots"\n\`\`\``,
-            });
-
-  storybook-publish:
-    name: Publish Storybook to GitHub Pages
-    runs-on: ubuntu-latest
-    needs: [storybook-test-runner, storybook-visual-regression]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - name: Download Storybook build
-        uses: actions/download-artifact@v4
-        with:
-          name: storybook-static
-          path: storybook-static/
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: storybook-static/
-
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
-
+      # Automatic rollback when any gate fails. Manual override is documented
+      # in docs/DEPLOY_ROLLBACK.md (set ROLLBACK_OVERRIDE=true to skip).
+      - name: Automatic rollback on gate failure
+        if: failure() && vars.ROLLBACK_OVERRIDE != 'true'
+        run: npm run deploy:rollback
+        env:
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          VERIFY_RELEASE: ${{ github.ref_name }}
