@@ -20,6 +20,17 @@ const parsed = parseEnv({
   NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET,
+  // Non-secret signer configuration (issue #269). These select *which* KMS/HSM
+  // key a role uses and where the signing service lives — never key material.
+  SIGNER_SERVICE_URL: process.env.SIGNER_SERVICE_URL,
+  SIGNER_KMS_PROVIDER: process.env.SIGNER_KMS_PROVIDER,
+  SIGNER_KMS_REGION: process.env.SIGNER_KMS_REGION,
+  SIGNER_KEY_ADMIN: process.env.SIGNER_KEY_ADMIN,
+  SIGNER_KEY_PARAMETER: process.env.SIGNER_KEY_PARAMETER,
+  SIGNER_KEY_ORACLE: process.env.SIGNER_KEY_ORACLE,
+  SIGNER_KEY_PAUSE: process.env.SIGNER_KEY_PAUSE,
+  SIGNER_KEY_TREASURY: process.env.SIGNER_KEY_TREASURY,
+  SIGNER_LOCAL_SOFTWARE_KEY: process.env.SIGNER_LOCAL_SOFTWARE_KEY,
 });
 
 export const env = {
@@ -94,3 +105,58 @@ export function contractEnvVarName(key: string): string {
   return `NEXT_PUBLIC_CONTRACT_${key.toUpperCase()}_${stellarNetworkSuffix}`;
 }
 
+/**
+ * Privileged signing roles (issue #269). Each role maps to a distinct KMS/HSM
+ * key so it can be rotated or revoked independently of the others.
+ */
+export type SignerRole = "admin" | "parameter" | "oracle" | "pause" | "treasury";
+
+/**
+ * Non-secret signer configuration for the KMS/HSM-backed signing service.
+ *
+ * Only key *identifiers* and service endpoints live here — never key material.
+ * Privileged secrets must never be readable by application code, present in the
+ * repository, CI variables, or container images. The signing service resolves
+ * each role's key reference inside the managed KMS/HSM.
+ */
+export const signerConfig = {
+  /** Base URL of the constrained signing service (BFF). */
+  serviceUrl: parsed.SIGNER_SERVICE_URL ?? "http://localhost:8082",
+  /** Managed key store backing the signer: "aws-kms" | "gcp-kms" | "hsm" | "local". */
+  kmsProvider: parsed.SIGNER_KMS_PROVIDER ?? "local",
+  /** Region of the primary key store, used for disaster-recovery routing. */
+  kmsRegion: parsed.SIGNER_KMS_REGION,
+  /**
+   * Per-role key references. These are opaque identifiers (e.g. a KMS key ARN
+   * or alias), not secrets. A role with no configured key cannot sign.
+   */
+  keyRefs: {
+    admin: parsed.SIGNER_KEY_ADMIN,
+    parameter: parsed.SIGNER_KEY_PARAMETER,
+    oracle: parsed.SIGNER_KEY_ORACLE,
+    pause: parsed.SIGNER_KEY_PAUSE,
+    treasury: parsed.SIGNER_KEY_TREASURY,
+  } as Record<SignerRole, string | undefined>,
+  /**
+   * Local development only: opt into the clearly-labeled software key path so
+   * contributors are not blocked. Never enable outside local development.
+   */
+  localSoftwareKey: parsed.SIGNER_LOCAL_SOFTWARE_KEY === "true",
+} as const;
+
+/**
+ * Whether the signer is running on the local software key path. Guarded so the
+ * software path can never be selected in production.
+ */
+export const signerUsesLocalSoftwareKey =
+  signerConfig.kmsProvider === "local" &&
+  signerConfig.localSoftwareKey &&
+  env.NODE_ENV !== "production";
+
+/**
+ * Resolve the non-secret key reference for a signing role, or `undefined` when
+ * the role is unconfigured (and therefore cannot sign).
+ */
+export function signerKeyRefForRole(role: SignerRole): string | undefined {
+  return signerConfig.keyRefs[role];
+}

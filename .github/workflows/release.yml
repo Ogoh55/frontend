@@ -34,3 +34,75 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # Vault admin key custody guard (issue #269).
+  # Privileged vault signing keys live in a managed KMS/HSM and are never
+  # exposed to CI. This job fails the release if any privileged secret
+  # material is present in the workflow environment or repository, and
+  # verifies the signer is configured to use a KMS/HSM backend rather than
+  # a plaintext software key.
+  key-custody-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Assert no privileged secret material in CI environment
+        env:
+          # Only non-secret signer configuration is allowed here. Any of the
+          # following being set indicates a leaked plaintext key path.
+          VAULT_ADMIN_SECRET_KEY: ${{ secrets.VAULT_ADMIN_SECRET_KEY }}
+          VAULT_OPERATOR_SECRET_KEY: ${{ secrets.VAULT_OPERATOR_SECRET_KEY }}
+          VAULT_ORACLE_SECRET_KEY: ${{ secrets.VAULT_ORACLE_SECRET_KEY }}
+          VAULT_PAUSE_SECRET_KEY: ${{ secrets.VAULT_PAUSE_SECRET_KEY }}
+          VAULT_TREASURY_SECRET_KEY: ${{ secrets.VAULT_TREASURY_SECRET_KEY }}
+        run: |
+          set -eu
+          leaked=0
+          for name in VAULT_ADMIN_SECRET_KEY VAULT_OPERATOR_SECRET_KEY VAULT_ORACLE_SECRET_KEY VAULT_PAUSE_SECRET_KEY VAULT_TREASURY_SECRET_KEY; do
+            eval "value=\${$name:-}"
+            if [ -n "$value" ]; then
+              echo "::error::Privileged secret $name must not be present in CI; vault signing keys must live in KMS/HSM."
+              leaked=1
+            fi
+          done
+          if [ "$leaked" -ne 0 ]; then
+            exit 1
+          fi
+          echo "No privileged secret material detected in CI environment."
+      - name: Assert signer backend is KMS/HSM
+        env:
+          VAULT_SIGNER_BACKEND: ${{ vars.VAULT_SIGNER_BACKEND }}
+        run: |
+          set -eu
+          backend="${VAULT_SIGNER_BACKEND:-kms}"
+          case "$backend" in
+            kms|hsm) echo "Signer backend '$backend' is KMS/HSM-backed." ;;
+            software)
+              echo "::error::Software signer backend is for local development only and must not be used in release."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unknown signer backend '$backend'; expected kms or hsm."
+              exit 1
+              ;;
+          esac
+      - name: Scan repository for committed privileged key material
+        run: |
+          set -eu
+          # Fail if any tracked file contains a raw Stellar secret seed (S...)
+          # or a PEM private key block. These must never be committed.
+          if git grep -nE 'S[A-Z2-7]{55}' -- ':!*.md' ':!*.lock' ':!package-lock.json' ':!yarn.lock' ':!pnpm-lock.yaml' >/tmp/seed_hits 2>/dev/null; then
+            echo "::error::Possible Stellar secret seed committed to the repository:"
+            cat /tmp/seed_hits
+            exit 1
+          fi
+          if git grep -nE -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' >/tmp/pem_hits 2>/dev/null; then
+            echo "::error::Private key material committed to the repository:"
+            cat /tmp/pem_hits
+            exit 1
+          fi
+          echo "No committed privileged key material detected."
