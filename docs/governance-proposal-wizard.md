@@ -104,6 +104,45 @@ import it. The route reads the signer from `ProposalSignerProvider`
 
 Wrap the app (or this route) in that provider once the wallet store is restored.
 
+## Voting weight reads TWAB (Issue #272)
+
+Governance voting weight is read from the vault share token's time-weighted average
+balance (TWAB) accumulator rather than an instantaneous share balance, closing the
+last-block deposit/withdraw gaming vector. The wizard itself does not compute weight —
+it only surfaces the proposer's threshold progress — but the `thresholdState` passed into
+`ProposalWizard` is expected to be derived from TWAB-weighted stake.
+
+### TWAB contract surface
+
+The SEP-41 share token maintains a checkpointed cumulative-balance accumulator with
+binary-searchable checkpoints and exposes:
+
+- `balance_at(account, timestamp)` — the account's share balance at a ledger timestamp.
+- `twab(account, start, end)` — the time-weighted average balance over `[start, end)`.
+
+Checkpoints are written **only** on share mint, burn, and transfer, inside the same
+authorization scope as the share mutation so a new entry point cannot bypass the
+accumulator. Timestamps are ledger close times (never wall-clock) and are monotonic.
+
+### Rounding and edge cases
+
+- `twab` returns `0` for a zero-length window (`start >= end`) and for windows that
+  precede the account's first checkpoint — no division by zero.
+- A single checkpoint yields the balance held at that checkpoint across the window.
+- First-deposit edge cases: the accumulator seeds at the deposit timestamp, so the
+  pre-deposit interval contributes zero weight.
+- Integer division truncates toward zero; TWAB is only ever used to *weight* value, never
+  to mint it.
+
+### Checkpoint retention / compaction policy
+
+Checkpoint history is bounded to avoid unbounded Soroban storage rent and entry-size
+growth. The retention window is coordinated with the storage-TTL work: checkpoints older
+than the retention horizon are compacted into a single baseline checkpoint, and the
+binary search operates over the retained, sorted checkpoint array with no unbounded
+loops. Overflow bounds on the cumulative accumulator are documented alongside the
+contract.
+
 ## Tests
 
 ```

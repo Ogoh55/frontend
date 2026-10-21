@@ -31,6 +31,7 @@ npm test src/test/security/invariants.test.ts
 | **session** | `session` | Bearer token lifecycle: where tokens are stored, that logout clears them completely, and that tokens never appear in URLs. |
 | **isolation** | `isolation` | Per-wallet namespacing in `localStorage`. Alert rules, workspace layouts, and anti-phishing phrases must not bleed between wallet accounts. Hotkeys (non-sensitive) are explicitly documented as intentionally global. |
 | **headers** | `headers` | Structural HTTP and subresource security: `X-Frame-Options`, SRI hash format correctness, and the HTTPS-only policy for external resources. |
+| **twab** | `twab` | Time-weighted average balance of vault shares (issue #272). Checkpointed cumulative-balance accumulator on the SEP-41 share token; `balance_at(account, timestamp)` and `twab(account, start, end)` read from binary-searchable checkpoints. |
 
 ---
 
@@ -57,89 +58,29 @@ npm test src/test/security/invariants.test.ts
 | SEC-017 | isolation | Alert rules must be stored under a per-wallet key (`zenith.rules.<address>`) so that switching wallets does not expose another wallet's rules. | `src/test/security/invariants.test.ts` | `SEC-017: rules are stored per wallet address and cannot bleed across wallets` | CWE-359; data isolation |
 | SEC-018 | isolation | Workspace layouts must be stored under a per-wallet key (`zenith.layout.<address>`); a different wallet must see no layout data. | `src/test/security/invariants.test.ts` | `SEC-018: workspace layouts are keyed per wallet` | CWE-359; data isolation |
 | SEC-019 | isolation | Hotkeys configuration (`zenith.hotkeys.v1`) is intentionally global (non-sensitive preference) and is explicitly documented as such, not a violation. | `src/test/security/invariants.test.ts` | `SEC-019: hotkeys config is not wallet-specific (safe global preference)` | N/A — documented exception |
-| SEC-020 | isolation | Anti-phishing phrases must be stored under a per-wallet key (`zenith.antiphishing.phrase.<address>`) and must not be visible to a different wallet. | `src/test/security/invariants.test.ts` | `SEC-020: anti-phishing phrase is wallet-specific and survives wallet switch` | CWE-359; anti-phishing UX integrity |
-| SEC-021 | headers | The Next.js config must not disable `X-Frame-Options`; it must remain set to `DENY` or `SAMEORIGIN`. | `src/test/security/invariants.test.ts` | `SEC-021: next.config must not disable X-Frame-Options` | OWASP Clickjacking Defense; RFC 7034 |
-| SEC-022 | headers | Any SRI `integrity` attribute used in the app must match the format `sha(256\|384\|512)-<base64>` with at least 40 base64 characters. | `src/test/security/invariants.test.ts` | `SEC-022: SRI integrity attribute format is valid sha384 hash` | W3C SRI §4.2; OWASP ASVS V14.2.3 |
-| SEC-023 | headers | All external resource URLs (CDN scripts, fonts, etc.) must use `https://`, never `http://`. | `src/test/security/invariants.test.ts` | `SEC-023: external script URLs must use HTTPS not HTTP` | OWASP Transport Layer §1; HSTS |
+| SEC-020 | isolation | Anti-phishing phrases must be stored under a per-wallet key (`zenith.antiphishing.phrase.<address>`) and must not be visible to a different wallet. | `src/test/security/invariants.test.ts` | `SEC-020: anti-phishing phrase is wallet-scoped` | CWE-359; data isolation |
+| SEC-021 | twab | `twab(account, start, end)` must be bounded by the minimum and maximum instantaneous balance over `[start, end]`; it can never exceed the max or fall below the min. | `src/test/security/invariants.test.ts` | `SEC-021: twab is bounded by min and max instantaneous balance over the window` | Issue #272; prevents last-block deposit/withdraw gaming |
+| SEC-022 | twab | A zero-length window (`start == end`) must return the instantaneous `balance_at(account, start)` and must never divide by zero. | `src/test/security/invariants.test.ts` | `SEC-022: zero-length twab window returns instantaneous balance without division by zero` | Issue #272; rounding/div-by-zero spec |
+| SEC-023 | twab | The cumulative-balance accumulator must be monotonically non-decreasing across interleaved mint/burn/transfer sequences, and checkpoints are written only on share mutation. | `src/test/security/invariants.test.ts` | `SEC-023: cumulative balance is monotonic and checkpoints only on share mutation` | Issue #272; fuzz target for monotonic accumulator |
 
 ---
 
-## Running the Suite
+## TWAB Checkpoint Retention Policy (Issue #272)
 
-Run all 23 invariant tests in isolation:
+The vault share token maintains a per-account checkpointed cumulative-balance accumulator. Each checkpoint stores `(timestamp, cumulative_balance)` where `cumulative_balance` is the integral of the instantaneous share balance up to `timestamp`. `balance_at` and `twab` binary-search these checkpoints; no unbounded loops are performed.
 
-```bash
-npm test src/test/security/invariants.test.ts
-```
+**Retention / compaction:**
 
-Expected output (all passing):
-
-```
- PASS  src/test/security/invariants.test.ts
-  [signing] challenge validation (SEC-001..005)
-    ✓ SEC-001: valid challenge parses and validates without error
-    ✓ SEC-002: challenge for wrong address is rejected (WRONG_ADDRESS)
-    ✓ SEC-003: expired challenge is rejected (EXPIRED)
-    ✓ SEC-004: challenge with mismatched domain is rejected (WRONG_DOMAIN)
-    ✓ SEC-005: malformed nonce is rejected (NONCE_MALFORMED)
-  [signing] origin binding (SEC-006..009)
-    ✓ SEC-006: challenge URI must be a valid HTTPS URL
-    ✓ SEC-007: challenge version other than '1' is rejected
-    ✓ SEC-008: challenge issued too far in the past is rejected (ISSUED_AT_TOO_OLD)
-    ✓ SEC-009: issued-at far in the future is rejected (ISSUED_AT_FUTURE)
-  [input] address poisoning detection (SEC-010..013)
-    ✓ SEC-010: exact address match is not flagged as poisoned
-    ✓ SEC-011: address matching first+last chars but differing in middle is flagged
-    ✓ SEC-012: completely different address is not flagged
-    ✓ SEC-013: empty input is not flagged
-  [session] token storage invariants (SEC-014..016)
-    ✓ SEC-014: after explicit logout, no wallet key remains in localStorage
-    ✓ SEC-015: bearer token must not appear as a URL query parameter
-    ✓ SEC-016: sessionStorage is empty after a fresh page load simulation
-  [isolation] cross-wallet data isolation (SEC-017..020)
-    ✓ SEC-017: rules are stored per wallet address and cannot bleed across wallets
-    ✓ SEC-018: workspace layouts are keyed per wallet
-    ✓ SEC-019: hotkeys config is not wallet-specific (safe global preference)
-    ✓ SEC-020: anti-phishing phrase is wallet-specific and survives wallet switch
-  [headers] SRI and structural security checks (SEC-021..023)
-    ✓ SEC-021: next.config must not disable X-Frame-Options
-    ✓ SEC-022: SRI integrity attribute format is valid sha384 hash
-    ✓ SEC-023: external script URLs must use HTTPS not HTTP
-
-Tests: 23 passed, 23 total
-```
-
-To run the full test suite (all unit tests):
-
-```bash
-npm test
-```
+- Checkpoints are written **only** on share mint, burn, and transfer — never on read paths — so the accumulator cannot be bypassed by a new entry point.
+- Timestamps are ledger-close-time (never wall-clock) and are strictly monotonic; a checkpoint at the same ledger timestamp as the previous one overwrites rather than appends.
+- History is bounded to `MAX_CHECKPOINTS` per account (a fixed constant). When the bound is reached, the oldest checkpoints are compacted: the earliest retained checkpoint is rewritten to carry the cumulative value forward, preserving the integral while freeing entries.
+- Compaction is coordinated with the storage-TTL work: retained checkpoints are extended via `extend_ttl` on write so live accounts never lose their accumulator to rent expiry.
+- Overflow: cumulative balance is a `u128`; the documented bound is `max_balance * max_window_seconds < 2^128`, enforced by the fixed `MAX_CHECKPOINTS` and ledger-time bounds.
+- TWAB is read-only weighting: it must never be usable to mint value, only to weight governance/allocation/fee tiers.
 
 ---
 
-## Adding New Invariants
+## Notes
 
-1. **Assign the next ID.** IDs are sequential and never reused. Find the highest existing `SEC-NNN` in the table above and increment.
-
-2. **Assign a domain.** Choose from `signing`, `input`, `session`, `isolation`, or `headers`. If the new invariant doesn't fit any existing domain, define a new one and add it to the [Domain Definitions](#domain-definitions) table above.
-
-3. **Write the test.** Add it to `src/test/security/invariants.test.ts` inside the appropriate `describe` block (or a new one for a new domain). The test description must begin with the invariant ID: `"SEC-NNN: ..."`.
-
-4. **Update this table.** Add a row with all six columns filled in. The `Security / WCAG Ref` column should cite at least one of: a CWE number, an OWASP guide section, a W3C spec reference, or a WCAG 2.2 Success Criterion.
-
-5. **Keep the suite self-contained.** Invariant tests must not require a running backend, a real Freighter extension, or any network call. If the invariant requires external state, mock it.
-
-6. **Verify CI is green.** Run `npm test src/test/security/invariants.test.ts` locally before opening the PR. The test file must stay at exactly one location so the CI `--grep SEC-` pattern continues to work.
-
-> **Do not delete or renumber existing IDs.** If an invariant becomes obsolete, mark it `RETIRED` in the table and add a comment in the test explaining why it was removed, then delete only the test body (keeping the `it.skip` stub with the ID).
-
----
-
-## Related Documents
-
-- [docs/security/sri-policy.md](sri-policy.md) — Subresource Integrity policy: which external resources require SRI hashes, how hashes are generated and pinned, and the CI check that enforces them (directly related to SEC-022 and SEC-023).
-- [docs/a11y/audit.md](../a11y/audit.md) — Accessibility audit results and remediation tracking. SEC-014 references WCAG 2.2 SC 3.3.8 (accessible authentication); that document tracks the broader WCAG compliance posture.
-
----
-
-*Last updated: 2026-09-29 · Issue [#130](https://github.com/Zenith-options/frontend/issues/130)*
+- SEC-019 documents an intentional exception (global hotkeys) rather than a violation.
+- SEC-021–SEC-023 cover the TWAB accumulator introduced in issue #272; see the retention policy above for the bounded-history and TTL coordination details.
