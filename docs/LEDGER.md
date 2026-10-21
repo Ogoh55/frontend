@@ -126,3 +126,73 @@ correction references the record it supersedes (`supersedesId`).
 Routine parameter changes (timelocked parameter workflow) and the read-only
 support console diagnostics are handled elsewhere and are not part of this
 correction path.
+
+## Idle Collateral Yield (Lending Integration)
+
+Vault strategies may earn incremental yield on collateral that sits idle
+between option sales — most notably USDC held in cash-secured-put and
+iron-condor vaults. Idle collateral is swept into an existing Soroban lending
+market and unwound before it is needed. The option-selling strategy itself is
+unchanged.
+
+### Collateral-Deployment Policy (per strategy)
+
+Each strategy declares a deployment policy:
+
+| Field | Meaning |
+| --- | --- |
+| `targetUtilizationBps` | Max share of *idle* collateral that may be lent (e.g. `8000` = 80%). |
+| `minLiquidBufferBps` | Minimum share of total collateral that must stay liquid (e.g. `2000` = 20%). |
+| `reservedForOpenPositions` | Hard rule: collateral backing open written positions is **never** deployed. |
+
+Deployable amount is computed as:
+
+```
+deployable = min(idleCollateral * targetUtilizationBps / 10_000,
+                 totalCollateral - totalCollateral * minLiquidBufferBps / 10_000)
+```
+
+where `idleCollateral = totalCollateral - reservedForOpenPositions`. If
+`deployable <= 0` nothing is swept.
+
+### Epoch Lifecycle Hooks
+
+- **Sweep** after option-sale execution: deposit `deployable` into the lending
+  market.
+- **Unwind** before settlement/assignment processing and before any epoch close
+  that requires collateral: withdraw the full lent principal plus accrued
+  interest.
+- All external calls go through the existing reentrancy guard and
+  failure-containment patterns.
+
+### Adapter & Degraded Path
+
+The lending integration sits behind a narrow adapter trait/interface
+(`deposit`, `withdraw`, `isPaused`). If the market is paused, reverts, or
+returns less than requested, the adapter degrades to **no external yield** and
+the epoch still completes — a failing venue never blocks epoch transitions.
+After every call the vault reconciles against on-chain balances so it never
+believes it holds more liquid collateral than it does.
+
+### Epoch Ledger Attribution
+
+Lent principal and accrued interest are tracked **separately** from strategy
+P&L in the epoch ledger, so yield attribution stays auditable and feeds the
+historical epoch ledger and performance analytics surfaces (surfaced via the
+collateral-yield breakdown in `src/lib/api/vaults.ts`).
+
+### Operator Guidance
+
+- Start conservative: `targetUtilizationBps` ≤ `8000` and
+  `minLiquidBufferBps` ≥ `2000` until the venue's withdrawal latency is
+  characterized.
+- Never set `minLiquidBufferBps` below the largest single-epoch settlement
+  obligation.
+- Monitor the degraded-path counter; sustained degradation means the venue is
+  paused or withdrawal-locked and utilization should be lowered.
+
+### Out of Scope
+
+Lending-protocol selection/build (an existing Soroban lending market is
+assumed), leveraged or recursive lending, and lending of option-premium
+proceeds.

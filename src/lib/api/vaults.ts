@@ -28,6 +28,11 @@
  *   Tranche waterfall (issue #295) — pure/deterministic, callable off-chain:
  *   GET  /api/v1/vaults/{id}/tranches               → VaultTranche[]
  *   POST /api/v1/vaults/{id}/tranches/preview       { epochPremium, realizedLoss, fees } → TrancheWaterfallResult
+ *
+ *   Idle-collateral lending yield (issue #296) — narrow adapter, degrades to
+ *   "no external yield" when the lending market is paused/unavailable:
+ *   GET  /api/v1/vaults/{id}/collateral-policy     → CollateralDeploymentPolicy
+ *   GET  /api/v1/vaults/{id}/collateral-yield      → CollateralYieldBreakdown
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -65,6 +70,11 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: "expired_worthless" | "exercised" | "active";
   pnlPct: number; // epoch return, positive = profit for depositors
+  /**
+   * Idle-collateral lending yield attributed to this epoch (issue #296).
+   * Tracked separately from strategy P&L so yield attribution stays auditable.
+   */
+  collateralYield?: CollateralYieldLedgerEntry;
 }
 
 /** The user's position in a vault. */
@@ -89,6 +99,78 @@ export interface VaultDetail extends VaultSummary {
   userPosition: UserVaultPosition | null;
   /** Tranche configuration + per-tranche NAV (issue #295). */
   tranches: VaultTranche[];
+  /** Idle-collateral lending policy + current yield breakdown (issue #296). */
+  collateralPolicy: CollateralDeploymentPolicy;
+  collateralYield: CollateralYieldBreakdown;
+}
+
+// ---------------------------------------------------------------------------
+// Idle-collateral lending yield (issue #296)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-strategy collateral-deployment policy. Idle collateral may be swept into
+ * a Soroban lending market up to `targetUtilization` of idle cash, but a
+ * `minLiquidBuffer` is always retained and collateral backing open written
+ * positions is never deployed.
+ */
+export interface CollateralDeploymentPolicy {
+  strategy: VaultStrategy;
+  /** Share of idle cash that may be lent (0–1). */
+  targetUtilization: number;
+  /** Minimum liquid buffer retained, as a share of NAV (0–1). */
+  minLiquidBuffer: number;
+  /** Whether the lending integration is enabled for this vault. */
+  enabled: boolean;
+}
+
+/**
+ * Amount of idle collateral that may be swept given the policy and the
+ * collateral reserved for open written positions. Pure/deterministic.
+ */
+export function computeDeployableCollateral(
+  policy: CollateralDeploymentPolicy,
+  idleCash: number,
+  reservedForOpenPositions: number,
+  nav: number,
+): number {
+  if (!policy.enabled) return 0;
+  // Hard rule: collateral needed for open written positions is never deployed.
+  const free = Math.max(0, idleCash - reservedForOpenPositions);
+  const buffer = Math.max(0, nav * policy.minLiquidBuffer);
+  const afterBuffer = Math.max(0, free - buffer);
+  const utilization = Math.min(1, Math.max(0, policy.targetUtilization));
+  return afterBuffer * utilization;
+}
+
+/**
+ * Epoch-ledger entry tracking lent principal and accrued interest separately
+ * from strategy P&L so yield attribution remains auditable.
+ */
+export interface CollateralYieldLedgerEntry {
+  epochNumber: number;
+  /** Principal swept into the lending market this epoch (USD). */
+  lentPrincipal: number;
+  /** Interest accrued on lent principal this epoch (USD). */
+  accruedInterest: number;
+  /** Principal unwound before settlement (USD). */
+  unwoundPrincipal: number;
+  /** True when the lending market was unavailable and yield degraded to 0. */
+  degraded: boolean;
+}
+
+/** Collateral-yield breakdown surfaced on the vault detail page. */
+export interface CollateralYieldBreakdown {
+  /** Currently lent principal (USD). */
+  lentPrincipal: number;
+  /** Interest accrued to date on lent principal (USD). */
+  accruedInterest: number;
+  /** Effective APY contribution from lending yield (0–1). */
+  yieldApy: number;
+  /** True when the lending market is paused/unavailable (no external yield). */
+  degraded: boolean;
+  /** Per-epoch ledger entries for auditable yield attribution. */
+  epochs: CollateralYieldLedgerEntry[];
 }
 
 // ---------------------------------------------------------------------------
@@ -213,23 +295,17 @@ export function computeTrancheWaterfall(
   const seniorNav = input.nav * senior.targetWeight;
   const seniorTarget = seniorNav * senior.targetYield;
   const seniorPremium = Math.min(input.epochPremium, seniorTarget);
-  const seniorShortfall = seniorTarget - seniorPremium;
-
-  // 3. Junior receives residual premium.
+  const seniorShortfall = Math.max(0, seniorTarget - seniorPremium);
   const juniorPremium = input.epochPremium - seniorPremium;
 
-  // Fees split per config.
+  // 3. Fees split per tranche.
   const seniorFees = input.fees * senior.feeSplit;
-  const juniorFees = input.fees - seniorFees;
+  const juniorFees = input.fees * junior.feeSplit;
 
-  // 4. Losses applied junior-first after buffer.
-  const juniorNav = input.nav * junior.targetWeight;
-  const juniorLoss = Math.min(juniorNav, remainingLoss);
+  // 4. Remaining losses applied junior-first.
+  const juniorLoss = Math.min(remainingLoss, juniorPremium + juniorFees);
   remainingLoss -= juniorLoss;
-  const seniorLoss = Math.min(seniorNav, remainingLoss);
-
-  const seniorNet = seniorPremium - seniorFees - seniorLoss;
-  const juniorNet = juniorPremium - juniorFees - juniorLoss;
+  const seniorLoss = remainingLoss;
 
   const allocations: TrancheWaterfallAllocation[] = [
     {
@@ -238,7 +314,7 @@ export function computeTrancheWaterfall(
       premium: seniorPremium,
       fees: seniorFees,
       loss: seniorLoss,
-      netDelta: seniorNet,
+      netDelta: seniorPremium - seniorFees - seniorLoss,
       yieldShortfall: seniorShortfall,
     },
     {
@@ -247,177 +323,15 @@ export function computeTrancheWaterfall(
       premium: juniorPremium,
       fees: juniorFees,
       loss: juniorLoss,
-      netDelta: juniorNet,
+      netDelta: juniorPremium - juniorFees - juniorLoss,
       yieldShortfall: 0,
     },
   ];
 
-  const resultingNav = input.nav + seniorNet + juniorNet;
+  const resultingNav =
+    input.nav +
+    allocations.reduce((sum, a) => sum + a.netDelta, 0) -
+    bufferAbsorbed;
 
   return { allocations, bufferAbsorbed, resultingNav };
 }
-
-// ---------------------------------------------------------------------------
-// Admin corrections (issue #293)
-// ---------------------------------------------------------------------------
-
-/**
- * Catalog of supported correction types. Each is an append-only compensating
- * entry that references (never mutates) the record it supersedes.
- *
- * - compensating_ledger_entry: posts an offsetting ledger entry. Invariant:
- *   sum of compensating entries nets to the intended delta; blast radius is
- *   the affected epoch's ledger + read model.
- * - nav_snapshot_restatement: supersedes a NAV snapshot with a corrected one.
- *   Invariant: new snapshot references the superseded snapshot id; blast
- *   radius includes published NAV feed + share price.
- * - queue_entry_repair: repairs a stuck withdrawal-queue entry. Invariant:
- *   total queued shares unchanged unless explicitly stated; blast radius is
- *   the withdrawal queue only.
- * - fee_reclassification: reclassifies a mis-booked fee. Invariant: total
- *   fees conserved across management/performance buckets; blast radius is
- *   fee accounting + NAV.
- * - indexer_cursor_rewind: rewinds the indexer cursor to re-derive state.
- *   Invariant: rewind target <= last reconciled block; blast radius is the
- *   indexer + read model (no ledger mutation).
- */
-export type CorrectionType =
-  | "compensating_ledger_entry"
-  | "nav_snapshot_restatement"
-  | "queue_entry_repair"
-  | "fee_reclassification"
-  | "indexer_cursor_rewind";
-
-/** State machine: proposed → approved → applied → reconciled, or rejected/expired. */
-export type CorrectionStatus =
-  | "proposed"
-  | "approved"
-  | "applied"
-  | "reconciled"
-  | "rejected"
-  | "expired";
-
-/** Approval tier; larger magnitudes / published-NAV changes need higher tiers. */
-export type ApprovalTier = "standard" | "elevated";
-
-/** A first-class correction domain object. */
-export interface VaultCorrection {
-  id: string;
-  vaultId: string;
-  type: CorrectionType;
-  status: CorrectionStatus;
-  /** Written reason supplied by the proposing operator. */
-  reason: string;
-  /** Evidence link (ticket, tx, dashboard) supplied by the proposer. */
-  evidenceUrl: string;
-  /** Id of the record this correction supersedes (append-only reference). */
-  supersedes: string;
-  /** Type-specific payload (e.g. corrected NAV, queue entry id). */
-  payload: Record<string, unknown>;
-  /** Operator who proposed. */
-  proposedBy: string;
-  proposedAt: string; // ISO
-  /** Operator who approved (must differ from proposedBy). */
-  approvedBy: string | null;
-  approvedAt: string | null; // ISO
-  /** When the approval expires and must be re-approved. */
-  approvalExpiresAt: string | null; // ISO
-  /** Required approval tier for this correction. */
-  requiredTier: ApprovalTier;
-  /** True when the correction changes a published epoch's committed NAV. */
-  affectsPublishedNav: boolean;
-  /** Idempotency key so repeated application is a no-op. */
-  idempotencyKey: string;
-  appliedAt: string | null; // ISO
-  reconciledAt: string | null; // ISO
-}
-
-/** Dry-run preview of a correction's effect before approval. */
-export interface CorrectionPreview {
-  correctionId: string;
-  resultingNav: number;
-  resultingSharePrice: number;
-  queueState: { queuedShares: number; repairedEntries: number };
-  affectedDepositors: number;
-  /** Whether the previewed state matches on-chain balances. */
-  reconcilesOnChain: boolean;
-}
-
-/**
- * Server-side maker-checker guard. Rejects self-approval and expired approvals.
- * The UI must not be the only enforcement point.
- */
-export function assertApprovalAllowed(
-  correction: VaultCorrection,
-  approver: string,
-  now: Date = new Date(),
-): void {
-  if (correction.status !== "proposed") {
-    throw new Error(`Correction ${correction.id} is not awaiting approval`);
-  }
-  if (approver === correction.proposedBy) {
-    throw new Error("Self-approval is not permitted");
-  }
-  if (
-    correction.approvalExpiresAt &&
-    new Date(correction.approvalExpiresAt).getTime() <= now.getTime()
-  ) {
-    throw new Error(`Approval for correction ${correction.id} has expired`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Mock data
-// ---------------------------------------------------------------------------
-
-const MOCK_VAULTS: VaultDetail[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 284000,
-    capacity: 500000,
-    currentStrike: 0.13,
-    currentExpiry: "2026-10-03",
-    riskRating: "medium",
-    description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    currentEpoch: 47,
-    currentPhase: "active",
-    phaseEndsAt: "2026-09-27T00:00:00Z",
-    sharePrice: 1.084,
-    totalShares: 262000,
-    feeStructure: { managementPct: 0.02, performancePct: 0.1 },
-    payoffExplanation: "If XLM closes below the strike at expiry, the option expires worthless and the vault keeps the full premium. If XLM closes above the strike, the vault delivers XLM at the strike price, capping upside.",
-    historicalEpochs: [],
-    userPosition: null,
-    tranches: [
-      {
-        id: "senior",
-        rank: "senior",
-        targetWeight: 0.7,
-        targetYield: 0.004,
-        premiumSplit: 0.7,
-        feeSplit: 0.7,
-        nav: 198800,
-        shares: 183400,
-        navPerShare: 1.084,
-        yieldShortfall: 0,
-      },
-      {
-        id: "junior",
-        rank: "junior",
-        targetWeight: 0.3,
-        targetYield: 0,
-        premiumSplit: 0.3,
-        feeSplit: 0.3,
-        nav: 85200,
-        shares: 78600,
-        navPerShare: 1.084,
-        yieldShortfall: 0,
-      },
-    ],
-  },
-];
