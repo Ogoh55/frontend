@@ -4,6 +4,11 @@
  * Receipts are keyed by the client-generated idempotency key so an optimistic
  * UI row and a later backend row collapse into a single record. Amounts are
  * carried as decimal strings (never floats) to preserve precision.
+ *
+ * This module also exposes the read-only diagnostics client used by the
+ * internal depositor support console. The diagnostics client is issued a
+ * read-scoped token and only ever calls GET endpoints, so a UI regression
+ * cannot escalate into a state-changing call.
  */
 import { useWalletStore } from '@/lib/store/wallet';
 
@@ -123,5 +128,124 @@ export async function fetchVaultHistory(
     return { receipts: Array.from(merged.values()), degraded: false };
   } catch {
     return { receipts: local, degraded: true };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only diagnostics client (internal depositor support console)
+// ---------------------------------------------------------------------------
+
+/**
+ * The only lookup keys the diagnostics console accepts. Each maps to a single
+ * consolidated diagnostic view returned by the read-only backend endpoint.
+ */
+export type DiagnosticsLookup =
+  | { kind: 'vault'; vaultId: string }
+  | { kind: 'account'; account: string }
+  | { kind: 'tx'; txHash: string }
+  | { kind: 'receipt'; idempotencyKey: string };
+
+/** A single field's on-chain vs backend value, with drift made explicit. */
+export interface DiagnosticField {
+  label: string;
+  onChain: string | null;
+  backend: string | null;
+  /** True when onChain and backend disagree (or one side is missing). */
+  drift: boolean;
+}
+
+export interface DiagnosticDrift {
+  /** Human-readable description of the discrepancy. */
+  detail: string;
+  /** ISO timestamp of the reconciliation job that reported the drift. */
+  reportedAt: string;
+}
+
+export interface DiagnosticsView {
+  lookup: DiagnosticsLookup;
+  vaultId: string | null;
+  account: string | null;
+  /** Side-by-side on-chain vs backend state, drift flagged per field. */
+  fields: DiagnosticField[];
+  /** Drift reported by reconciliation jobs, surfaced rather than hidden. */
+  drift: DiagnosticDrift[];
+  /** Queue position for pending withdrawals, if applicable. */
+  queuePosition: number | null;
+  /** Receipt status summary, if applicable. */
+  receiptStatus: VaultTxStatus | null;
+  /** NAV provenance (source + timestamp) as a decimal string, if known. */
+  navProvenance: string | null;
+  /** Halt reason when the vault is halted, otherwise null. */
+  haltReason: string | null;
+  /** ISO timestamp of the last reconciled on-chain state. */
+  lastReconciledAt: string | null;
+  /** True when the backend could not be reached and data is degraded. */
+  degraded: boolean;
+}
+
+export interface DiagnosticsPage {
+  views: DiagnosticsView[];
+  /** Opaque cursor for the next page of a large account history. */
+  nextCursor: string | null;
+  degraded: boolean;
+}
+
+/**
+ * Read-scoped token issued to the diagnostics client. It is intentionally
+ * separate from the operator token so the API surface — not UI hiding —
+ * enforces that diagnostics can never mutate state.
+ */
+export interface DiagnosticsAuth {
+  /** Read-scoped bearer token; the backend rejects any write with it. */
+  readToken: string;
+  /** Authenticated internal user the lookup is attributed to. */
+  actor: string;
+}
+
+function lookupParams(lookup: DiagnosticsLookup): URLSearchParams {
+  const params = new URLSearchParams();
+  switch (lookup.kind) {
+    case 'vault':
+      params.set('vaultId', lookup.vaultId);
+      break;
+    case 'account':
+      params.set('account', lookup.account);
+      break;
+    case 'tx':
+      params.set('txHash', lookup.txHash);
+      break;
+    case 'receipt':
+      params.set('idempotencyKey', lookup.idempotencyKey);
+      break;
+  }
+  return params;
+}
+
+/**
+ * Perform a single consolidated read-only diagnostic lookup. Only issues a GET
+ * with the read-scoped token; the backend records the lookup in the immutable
+ * audit log attributed to the authenticated internal user.
+ */
+export async function fetchDiagnostics(
+  lookup: DiagnosticsLookup,
+  auth: DiagnosticsAuth,
+  cursor?: string,
+): Promise<DiagnosticsPage> {
+  const params = lookupParams(lookup);
+  if (cursor) params.set('cursor', cursor);
+
+  try {
+    const res = await fetch(`/api/internal/diagnostics?${params.toString()}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${auth.readToken}`,
+        'X-Internal-Actor': auth.actor,
+      },
+    });
+    if (!res.ok) throw new Error(`diagnostics ${res.status}`);
+    const body = (await res.json()) as Omit<DiagnosticsPage, 'degraded'>;
+    return { ...body, degraded: false };
+  } catch {
+    return { views: [], nextCursor: null, degraded: true };
   }
 }
