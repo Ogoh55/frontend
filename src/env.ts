@@ -20,6 +20,9 @@ const parsed = parseEnv({
   NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET,
+  // Shared realtime feed endpoint (issue #271). The spot/vol feed and the vault
+  // NAV/epoch/queue topics are published on this single WebSocket connection.
+  NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL,
   // Non-secret signer configuration (issue #269). These select *which* KMS/HSM
   // key a role uses and where the signing service lives — never key material.
   SIGNER_SERVICE_URL: process.env.SIGNER_SERVICE_URL,
@@ -40,6 +43,16 @@ export const env = {
   NEXT_PUBLIC_APP_VERSION: parsed.NEXT_PUBLIC_APP_VERSION ?? "0.1.0",
   NEXT_PUBLIC_BUILD_SHA: parsed.NEXT_PUBLIC_BUILD_SHA ?? "local",
 };
+
+/**
+ * WebSocket URL for the shared realtime feed (issue #271).
+ *
+ * Defaults to the API host with the `ws`/`wss` scheme so the spot/vol feed and
+ * vault topics share one connection without extra configuration.
+ */
+export const wsUrl: string =
+  parsed.NEXT_PUBLIC_WS_URL ??
+  env.NEXT_PUBLIC_API_URL.replace(/^http/, "ws");
 
 export const stellarNetworkConfig = {
   testnet: {

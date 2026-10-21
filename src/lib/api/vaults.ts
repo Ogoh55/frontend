@@ -17,11 +17,46 @@
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
  *   POST /api/v1/vaults/{id}/emergency-redeem  { shares: number }  → { tx_id: string; penalty_bps: number }
+ *
+ * Realtime (shared spot/vol WebSocket, see SpotFeedContext):
+ *
+ *   subscribe: { op: "subscribe", topic: "vault:<id>", schema: VAULT_TICK_SCHEMA_VERSION }
+ *   message:   { topic: "vault:<id>", schema: VAULT_TICK_SCHEMA_VERSION, data: VaultTick }
+ *
+ * The envelope mirrors the existing spot/vol feed (topic + schema version +
+ * data) so vaults reuse the same connection and versioning scheme rather than
+ * introducing a second realtime contract.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * Version of the vault realtime tick envelope. Bump alongside the vault event
+ * schema versioning work; clients ignore ticks whose schema they don't know.
+ */
+export const VAULT_TICK_SCHEMA_VERSION = 1;
+
+/**
+ * Live vault state pushed over the shared spot/vol WebSocket, keyed by vault id.
+ * Epoch countdown is derived locally from `epochEndsAt` + `serverTime` so the
+ * client never trusts per-second server pushes and tolerates clock skew.
+ */
+export interface VaultTick {
+  /** NAV per share in USD. */
+  navPerShare: number;
+  /** Current epoch number. */
+  epochNumber: number;
+  /** ISO timestamp when the current epoch closes (authoritative). */
+  epochEndsAt: string;
+  /** Shares queued for redemption at epoch settlement. */
+  queueDepth: number;
+  /** ISO timestamp of the last authoritative update from the backend. */
+  updatedAt: string;
+  /** Server clock at publish time (ISO), used to correct client skew. */
+  serverTime: string;
+}
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -123,6 +158,51 @@ export function computeEmergencyRedemption(
   return { grossValue, penalty, netValue: grossValue - penalty };
 }
 
+/**
+ * Derive seconds remaining until epoch close from an authoritative tick.
+ * Corrects for client/server clock skew using the tick's `serverTime` and
+ * clamps at zero so a stale tick never renders a negative countdown.
+ */
+export function secondsToEpochClose(
+  tick: Pick<VaultTick, "epochEndsAt" | "serverTime">,
+  now: number = Date.now(),
+): number {
+  const skew = now - Date.parse(tick.serverTime);
+  const remainingMs = Date.parse(tick.epochEndsAt) - (now - skew);
+  return Math.max(0, Math.floor(remainingMs / 1000));
+}
+
+/**
+ * Build the subscribe frame for a vault topic on the shared feed connection.
+ * Subscriptions are lazy (issued on mount) and released on unmount by the
+ * context owner; this helper only shapes the outbound message.
+ */
+export function vaultSubscriptionFrame(vaultId: string): {
+  op: "subscribe";
+  topic: string;
+  schema: number;
+} {
+  return { op: "subscribe", topic: `vault:${vaultId}`, schema: VAULT_TICK_SCHEMA_VERSION };
+}
+
+/**
+ * Type guard for an inbound vault tick message on the shared connection.
+ * Rejects unknown schema versions so a backend bump can't crash the client.
+ */
+export function isVaultTickMessage(
+  msg: unknown,
+): msg is { topic: string; schema: number; data: VaultTick } {
+  if (!msg || typeof msg !== "object") return false;
+  const m = msg as Record<string, unknown>;
+  return (
+    typeof m.topic === "string" &&
+    m.topic.startsWith("vault:") &&
+    m.schema === VAULT_TICK_SCHEMA_VERSION &&
+    typeof m.data === "object" &&
+    m.data !== null
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
@@ -183,51 +263,26 @@ const MOCK_VAULTS: VaultDetail[] = [
     sharePrice: 1.088,
     totalShares: 1700368,
     feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
+    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, the put expires worthless and depositors keep the premium. If BTC falls below the strike, the vault is assigned BTC at the strike and depositors hold BTC at that cost basis.",
     historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-    emergencyExit: {
-      conditionsMet: true,
-      activeTriggers: ["nav_stale"],
-      penaltyBps: 200,
-      snapshotNavPerShare: 1.081,
-      remainingCapacityShares: 85018,
-    },
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
+      { epochNumber: 17, depositStart: "2026-08-17", activeStart: "2026-08-18", settlementDate: "2026-09-17", strike: 58000, expiryDays: 30, premiumCollected: 0.012, outcome: "expired_worthless", pnlPct: 0.011 },
+      { epochNumber: 16, depositStart: "2026-07-17", activeStart: "2026-07-18", settlementDate: "2026-08-17", strike: 55000, expiryDays: 30, premiumCollected: 0.014, outcome: "expired_worthless", pnlPct: 0.013 },
     ],
     userPosition: null,
     emergencyExit: {
       conditionsMet: false,
       activeTriggers: [],
-      penaltyBps: 100,
-      snapshotNavPerShare: 1.021,
-      remainingCapacityShares: 60724,
+      penaltyBps: 200,
+      snapshotNavPerShare: 1.088,
+      remainingCapacityShares: 170036,
     },
   },
 ];
+
+export async function fetchVaults(): Promise<VaultSummary[]> {
+  return MOCK_VAULTS.map(({ historicalEpochs: _h, userPosition: _u, emergencyExit: _e, ...summary }) => summary);
+}
+
+export async function fetchVaultDetail(id: string): Promise<VaultDetail | null> {
+  return MOCK_VAULTS.find((v) => v.id === id) ?? null;
+}
