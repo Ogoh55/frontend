@@ -103,6 +103,106 @@ export interface VaultDetail extends VaultSummary {
   userPosition: UserVaultPosition | null;
   /** SEP-41 share-token identity for this vault's LP shares. */
   shareToken: VaultShareToken;
+  /** On-chain fee policy + last crystallization (issue #216). */
+  feePolicy: VaultFeePolicy;
+}
+
+// ---------------------------------------------------------------------------
+// Fee policy / high-water mark / crystallization (issue #216)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard upper bound on any configured fee rate, in basis points (30%).
+ * Enforced at configuration time on-chain (governance/timelock path) and
+ * mirrored here so the UI can validate before submitting a change.
+ */
+export const MAX_FEE_BPS = 3_000;
+
+/**
+ * Per-vault fee policy. Rates are in basis points (1 bps = 0.01%).
+ *
+ * - `managementFeeBps` is charged per epoch on NAV.
+ * - `performanceFeeBps` is charged only on new profits above the
+ *   persistent high-water mark (never on recovered drawdowns).
+ * - `feeRecipient` is the Stellar address that receives crystallized fees.
+ *
+ * Changes are only possible through the vault governance/timelock path.
+ */
+export interface VaultFeePolicy {
+  managementFeeBps: number;
+  performanceFeeBps: number;
+  /** Stellar address (G.../C...) receiving crystallized fees. */
+  feeRecipient: string;
+  /**
+   * Persistent high-water mark: the highest NAV-per-share at which a
+   * performance fee has been crystallized. Stored in contract storage with
+   * an explicit TTL policy (not derived from NAV history).
+   */
+  highWaterMark: number;
+  /** Last epoch at which fees were crystallized, or null if never. */
+  lastCrystallization: FeeCrystallization | null;
+}
+
+/**
+ * Result of crystallizing fees at epoch close. Fees are computed and
+ * settled inside the same transaction as epoch close, before the epoch NAV
+ * is finalized, so the published NAV already reflects fees.
+ */
+export interface FeeCrystallization {
+  epochNumber: number;
+  /** NAV per share before fees were deducted. */
+  navBeforeFees: number;
+  /** NAV per share after fees were deducted (the published NAV). */
+  navAfterFees: number;
+  /** High-water mark in effect before this crystallization. */
+  highWaterMarkBefore: number;
+  /** High-water mark after this crystallization (raised only on new highs). */
+  highWaterMarkAfter: number;
+  managementFee: number;
+  performanceFee: number;
+  totalFee: number;
+  /** Recipient the fees were transferred to. */
+  feeRecipient: string;
+  /** Transaction hash of the on-chain settlement transfer. */
+  settlementTxHash: string;
+  /** ISO timestamp of crystallization. */
+  crystallizedAt: string;
+}
+
+/** True when a fee rate is within the hard maximum bound. */
+export function isValidFeeBps(bps: number): boolean {
+  return Number.isInteger(bps) && bps >= 0 && bps <= MAX_FEE_BPS;
+}
+
+/**
+ * Compute the fees that would crystallize for an epoch, given the NAV per
+ * share before fees and the current high-water mark.
+ *
+ * Semantics:
+ * - Management fee = `navBeforeFees * managementFeeBps / 10_000`.
+ * - Performance fee is charged only on the portion of NAV above the
+ *   high-water mark: `max(0, navBeforeFees - highWaterMark) * performanceFeeBps / 10_000`.
+ *   On loss or zero-profit epochs (NAV <= HWM) no performance fee is charged.
+ * - The high-water mark is raised to `navBeforeFees` only when a new high
+ *   is reached; it is never lowered on loss epochs.
+ * - Dust policy: fees are floored to the smallest representable unit; a
+ *   sub-unit fee rounds to zero rather than accruing forever.
+ */
+export function computeEpochFees(
+  navBeforeFees: number,
+  policy: Pick<VaultFeePolicy, "managementFeeBps" | "performanceFeeBps" | "highWaterMark">,
+): { managementFee: number; performanceFee: number; totalFee: number; highWaterMarkAfter: number } {
+  const nav = Math.max(0, navBeforeFees);
+  const managementFee = Math.floor((nav * policy.managementFeeBps) / 10_000);
+  const gains = Math.max(0, nav - policy.highWaterMark);
+  const performanceFee = Math.floor((gains * policy.performanceFeeBps) / 10_000);
+  const highWaterMarkAfter = nav > policy.highWaterMark ? nav : policy.highWaterMark;
+  return {
+    managementFee,
+    performanceFee,
+    totalFee: managementFee + performanceFee,
+    highWaterMarkAfter,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +226,8 @@ export type VaultErrorCode =
   | "INSUFFICIENT_SHARES"
   | "QUOTE_STALE"
   | "AUTHORIZATION_FAILED"
-  | "TRANSFERS_DISABLED";
+  | "TRANSFERS_DISABLED"
+  | "FEE_BPS_OUT_OF_BOUNDS";
 
 /** Resource + inclusion fee breakdown returned by `simulateTransaction`. */
 export interface VaultFeeEstimate {
@@ -211,6 +312,7 @@ export function mapVaultErrorCode(raw: string): VaultErrorCode | null {
     ["INSUFFICIENT_SHARES", /INSUFFICIENT[_ ]?SHARES/],
     ["QUOTE_STALE", /QUOTE[_ ]?STALE|STALE[_ ]?QUOTE|SLIPPAGE/],
     ["TRANSFERS_DISABLED", /TRANSFERS?[_ ]?DISABLED|NOT[_ ]?TRANSFERABLE/],
+    ["FEE_BPS_OUT_OF_BOUNDS", /FEE[_ ]?BPS|BPS[_ ]?OUT[_ ]?OF[_ ]?BOUNDS|FEE[_ ]?TOO[_ ]?HIGH/],
     ["AUTHORIZATION_FAILED", /AUTHORIZ|UNAUTHORIZED|NOT[_ ]?AUTHORIZED/],
   ];
   for (const [code, pattern] of table) {
@@ -218,39 +320,3 @@ export function mapVaultErrorCode(raw: string): VaultErrorCode | null {
   }
   return null;
 }
-
-/**
- * Build the final deposit/withdraw transaction via `simulateTransaction`,
- * returning the fee breakdown, quoted shares/assets, and prepared XDR.
- *
- * The live path is gated behind NEXT_PUBLIC_VAULTS=live; until the contract
- * client is wired in, this throws a typed error the UI can surface.
- */
-export async function simulateVaultTransaction(params: {
-  vaultId: string;
-  operation: VaultOperation;
-  amount: number;
-  slippage: number;
-}): Promise<VaultSimulationResult> {
-  if (process.env.NEXT_PUBLIC_VAULTS !== "live") {
-    throw new Error("Vault simulation is not yet implemented");
-  }
-  // Live implementation: build the operation, call Soroban RPC
-  // `simulateTransaction`, and return the fee breakdown + prepared XDR.
-  throw new Error("Vault simulation is not yet implemented");
-}
-
-// ---------------------------------------------------------------------------
-// Mock data
-// ---------------------------------------------------------------------------
-
-const MOCK_VAULTS: VaultDetail[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-
-
-/* … truncated 6054 chars — edit only what you need near the top … */
