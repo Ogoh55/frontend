@@ -685,3 +685,8 @@ a `ContractError` (with per-field paths) on drift: shown in a dev overlay, sent
 to `NEXT_PUBLIC_MONITOR_URL` in production. Extra backend fields are stripped;
 numeric strings are coerced. `npm run api:check` validates the fixtures in
 `contracts/fixtures/` (named after schema exports) and flags key drift.
+
+## Handsoff notes
+
+<!-- handsoff-issue-280 -->
+- #280: Implement a Shared NAV/Share-Price Math Library With Differential Conformance Tests
