@@ -1,3 +1,5 @@
+import { computeVaultHealthScore, type VaultHealthScore } from "../vaultHealth";
+
 /**
  * Typed data adapter interface for the Vaults feature.
  *
@@ -40,6 +42,8 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  /** Computed health score for depositor decision support. */
+  healthScore: VaultHealthScore;
 }
 
 /** One historical epoch record. */
@@ -75,13 +79,17 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** Computed health score and grade for depositor decision support. */
+  healthScore: VaultHealthScore;
 }
 
 // ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
 
-const MOCK_VAULTS: VaultDetail[] = [
+// Mock vault entries intentionally omit `healthScore`; it is computed
+// dynamically in fetchVaultDetail so the score always reflects the stored epoch data.
+const MOCK_VAULTS: Omit<VaultDetail, "healthScore">[] = [
   {
     id: "xlm-cc-v1",
     name: "XLM Covered Call",
@@ -201,7 +209,15 @@ export async function fetchVaults(): Promise<VaultSummary[]> {
     // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  return Promise.resolve(
+    MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => ({
+      ...summary,
+      healthScore: computeVaultHealthScore(
+        { strategy: summary.strategy, tvl: summary.tvl, capacity: summary.capacity },
+        historicalEpochs,
+      ),
+    }))
+  );
 }
 
 export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
@@ -209,7 +225,13 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+  const raw = MOCK_VAULTS.find(v => v.id === id) ?? null;
+  if (!raw) return null;
+  const healthScore = computeVaultHealthScore(
+    { strategy: raw.strategy, tvl: raw.tvl, capacity: raw.capacity },
+    raw.historicalEpochs,
+  );
+  return Promise.resolve({ ...raw, healthScore });
 }
 
 export async function depositToVault(

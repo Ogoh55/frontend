@@ -5,6 +5,7 @@ import Link from "next/link";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
 import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import { VaultHealthBadge } from "../../../components/VaultHealthBadge";
 
 const STRATEGY_LABELS: Record<VaultStrategy, string> = {
   covered_call:      "Covered Call",
@@ -147,8 +148,8 @@ export default function VaultsPage() {
                         </div>
                       </div>
                       <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.5 }}>{vault.description}</div>
-                      {/* Risk rating */}
-                      <div style={{ marginTop: 10 }}>
+                      {/* Risk rating + health badge */}
+                      <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                         <span style={{
                           fontSize: 10, padding: "2px 8px", textTransform: "uppercase", letterSpacing: "0.06em",
                           background: RISK_BG[vault.riskRating], color: RISK_COLORS[vault.riskRating],
@@ -156,6 +157,7 @@ export default function VaultsPage() {
                         }}>
                           {vault.riskRating} risk
                         </span>
+                        <VaultHealthBadge healthScore={vault.healthScore} />
                       </div>
                     </div>
 

@@ -13,6 +13,7 @@ import {
   type VaultDetail,
   type EpochPhase,
 } from "../../../../lib/api/vaults";
+import { VaultHealthPanel } from "../../../../components/VaultHealthPanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -290,6 +291,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     ))}
                   </div>
                 )}
+
+                {/* Vault health score */}
+                <VaultHealthPanel healthScore={vault.healthScore} />
 
                 {/* Fee disclosure */}
                 <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 14 }}>
