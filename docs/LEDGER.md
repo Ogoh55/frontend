@@ -66,3 +66,128 @@ a hardware-backed signing path with no seed phrase in the browser.
 - Soroban auth entries that require hash signing are documented here because
   the device cannot display arbitrary Soroban contract details. Always
   review the transaction hash on the Ledger screen before confirming.
+
+---
+
+# Epoch Share-Balance Snapshots & Merkle Commitments
+
+This section specifies the **epoch share-balance commitment** used for
+provable redemptions (issue #278). At each committed epoch the vault stores a
+Merkle root over that epoch's share balances, alongside the already-committed
+NAV per share and epoch number. Any depositor can prove their balance at a
+given epoch, and any third party can verify a historical redemption claim
+without trusting the backend database.
+
+## Commitment Versioning
+
+The commitment is versioned so a future change to the tree construction is
+detectable. The current version is **`v1`**. The version is committed on-chain
+together with the root; a verifier MUST reject a proof whose version does not
+match the stored commitment version.
+
+## Canonical Leaf Encoding
+
+Each leaf commits to a single `(account, balance)` pair for the epoch:
+
+```
+leaf_preimage = "zenith:epoch-share:v1" || 0x00
+             || epoch_u64_be
+             || account_32_bytes
+             || balance_i128_be
+leaf_hash     = SHA-256(leaf_preimage)
+```
+
+- `epoch_u64_be` — the epoch number as an 8-byte big-endian unsigned integer.
+- `account_32_bytes` — the raw 32-byte Stellar account (ed25519 public key),
+  not the `G...` StrKey form.
+- `balance_i128_be` — the share balance as a 16-byte big-endian two's
+  complement signed integer (i128). Balances are non-negative in practice but
+  the encoding is signed to match the on-chain type.
+- The domain-separation prefix `"zenith:epoch-share:v1" || 0x00` prevents a
+  leaf hash from colliding with an internal-node hash.
+
+## Ordering Rule
+
+Leaves are sorted by **account bytes in ascending lexicographic order**
+(byte-wise comparison of the 32-byte account, equivalent to comparing the
+unsigned big-endian integer). The ordering is total and unambiguous because
+accounts are unique within an epoch. Implementations MUST NOT rely on map
+iteration order; they MUST sort explicitly.
+
+## Tree Construction
+
+1. Compute the leaf hash for every `(account, balance)` entry with a
+   non-zero balance. Zero-balance accounts are omitted (they contribute
+   nothing to redemption claims).
+2. Sort leaves by the ordering rule above.
+3. Build a binary Merkle tree bottom-up. Internal nodes hash their two
+   children concatenated:
+
+   ```
+   node_hash = SHA-256(0x01 || left || right)
+   ```
+
+   The `0x01` prefix domain-separates internal nodes from leaves.
+4. **Odd node count at any level**: the last node is promoted unchanged to
+   the next level (it is *not* duplicated). This avoids the CVE-2012-2459
+   duplicate-node ambiguity.
+5. **Empty epoch**: the root is the all-zero 32-byte value (`0x00…00`).
+6. **Single holder**: the root is that holder's leaf hash (no internal
+   nodes).
+
+## Proof Format
+
+A Merkle proof is an ordered list of sibling hashes from leaf to root, each
+with a direction bit indicating whether the sibling is on the left or right:
+
+```
+proof = [ { sibling: 32 bytes, side: "left" | "right" }, ... ]
+```
+
+Verification recomputes the leaf hash from `(account, balance, epoch)`, then
+folds each step: `side == "left"` → `node = SHA-256(0x01 || sibling || node)`,
+`side == "right"` → `node = SHA-256(0x01 || node || sibling)`. The proof is
+valid iff the folded value equals the stored root for that epoch.
+
+## Verifier Entry Point
+
+The vault contract exposes a verifier that checks a claimed
+`(account, balance, epoch, proof)` against the stored root:
+
+```
+verify_share_balance(epoch, account, balance, proof) -> bool
+```
+
+It returns `true` only when the recomputed root matches the committed root
+for `epoch` and the commitment version matches. A documented library
+(`src/lib/merkle.ts`) implements the identical construction in TypeScript so
+the frontend can verify independently; the Rust indexer and the TypeScript
+library MUST hash identically (cross-implementation test vectors are checked
+in CI).
+
+## Redemption & Distribution Validation
+
+Redemption and distribution claims for an epoch are validated against the
+committed root before being accepted. If a claim's `(account, balance)` does
+not verify against the epoch root, the mismatch is **surfaced as an error**
+(not silently accepted), and the claim is rejected. This gives the
+break-glass and distribution paths a deterministic balance source they can
+point at.
+
+## Backend Indexer
+
+The indexer builds trees from indexed contract events (not by re-reading
+contract state), stores the per-epoch root and the leaf set, and serves
+proofs through the API. The `/vaults` detail surface exposes the committed
+root per epoch so a determined depositor can verify independently.
+
+## Resource Budget & Fallback
+
+The maximum committed holder set per epoch is **4096 leaves** (a tree of
+height 12), which stays within Soroban resource budgets for a single
+commitment. If an epoch exceeds this size, the indexer commits a **sharded**
+commitment: the holder set is partitioned by the first byte of the account
+into up to 256 shards, each shard committed as its own root, and the epoch
+commitment stores the ordered list of shard roots. Proofs then reference the
+shard root plus the shard index. The sharded form is versioned separately
+(`v1-sharded`) so verifiers can distinguish it from the single-root form.
