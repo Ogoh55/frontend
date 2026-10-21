@@ -24,6 +24,10 @@
  *   POST /api/v1/vaults/{id}/corrections/{cid}/reject   → VaultCorrection
  *   POST /api/v1/vaults/{id}/corrections/{cid}/apply    → VaultCorrection
  *   POST /api/v1/vaults/{id}/corrections/{cid}/preview  → CorrectionPreview
+ *
+ *   Tranche waterfall (issue #295) — pure/deterministic, callable off-chain:
+ *   GET  /api/v1/vaults/{id}/tranches               → VaultTranche[]
+ *   POST /api/v1/vaults/{id}/tranches/preview       { epochPremium, realizedLoss, fees } → TrancheWaterfallResult
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -83,6 +87,174 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** Tranche configuration + per-tranche NAV (issue #295). */
+  tranches: VaultTranche[];
+}
+
+// ---------------------------------------------------------------------------
+// Tranche waterfall (issue #295)
+// ---------------------------------------------------------------------------
+
+/** Seniority rank; lower rank = more senior (paid first, loss-absorbed last). */
+export type TrancheRank = "senior" | "junior";
+
+/**
+ * Per-tranche configuration. Weights are the target share of NAV and must sum
+ * to 1 across all tranches (validated by `validateTrancheConfig`).
+ */
+export interface VaultTrancheConfig {
+  id: string;
+  rank: TrancheRank;
+  /** Target share of aggregate NAV (0–1). All tranches must sum to 1. */
+  targetWeight: number;
+  /** Senior target yield per epoch (0–1). Ignored for junior tranches. */
+  targetYield: number;
+  /** Share of epoch premium routed to this tranche (0–1). */
+  premiumSplit: number;
+  /** Share of fees charged against this tranche (0–1). */
+  feeSplit: number;
+}
+
+/** Live tranche state: config plus tranche-scoped share accounting. */
+export interface VaultTranche extends VaultTrancheConfig {
+  /** Tranche-scoped NAV in USD. */
+  nav: number;
+  /** Tranche-scoped shares outstanding. */
+  shares: number;
+  /** Tranche NAV per share in USD (distinct per tranche). */
+  navPerShare: number;
+  /** Senior target yield not met this epoch, carried forward (USD). */
+  yieldShortfall: number;
+}
+
+/** Inputs to the deterministic waterfall for a single epoch close. */
+export interface TrancheWaterfallInput {
+  /** Aggregate NAV at epoch start (USD). */
+  nav: number;
+  /** Premium collected this epoch (USD). */
+  epochPremium: number;
+  /** Realized assignment loss this epoch (USD, >= 0). */
+  realizedLoss: number;
+  /** Fees charged this epoch (USD). */
+  fees: number;
+  /** Loss buffer absorbing losses before tranches (USD). */
+  lossBuffer: number;
+  tranches: VaultTrancheConfig[];
+}
+
+/** Per-tranche allocation produced by the waterfall. */
+export interface TrancheWaterfallAllocation {
+  id: string;
+  rank: TrancheRank;
+  /** Premium allocated to this tranche (USD). */
+  premium: number;
+  /** Fees charged against this tranche (USD). */
+  fees: number;
+  /** Loss absorbed by this tranche (USD). */
+  loss: number;
+  /** Net change to tranche NAV (premium - fees - loss). */
+  netDelta: number;
+  /** Senior target yield not met, carried forward (USD). */
+  yieldShortfall: number;
+}
+
+/** Result of the waterfall; allocations conserve total value. */
+export interface TrancheWaterfallResult {
+  allocations: TrancheWaterfallAllocation[];
+  /** Loss absorbed by the buffer before tranches. */
+  bufferAbsorbed: number;
+  /** Aggregate NAV after the waterfall. */
+  resultingNav: number;
+}
+
+/**
+ * Validate tranche configuration: weights must sum to 1 (within rounding
+ * tolerance) and there must be exactly one senior and one junior tranche.
+ */
+export function validateTrancheConfig(tranches: VaultTrancheConfig[]): void {
+  if (tranches.length !== 2) {
+    throw new Error("Exactly one senior and one junior tranche are required");
+  }
+  const senior = tranches.filter((t) => t.rank === "senior");
+  const junior = tranches.filter((t) => t.rank === "junior");
+  if (senior.length !== 1 || junior.length !== 1) {
+    throw new Error("Exactly one senior and one junior tranche are required");
+  }
+  const total = tranches.reduce((sum, t) => sum + t.targetWeight, 0);
+  if (Math.abs(total - 1) > 1e-9) {
+    throw new Error(`Tranche target weights must sum to 1 (got ${total})`);
+  }
+}
+
+/**
+ * Pure/deterministic waterfall applied at each epoch close. Order:
+ *   1. Loss buffer absorbs realized losses first.
+ *   2. Senior coupon/target yield is paid from premium.
+ *   3. Junior receives residual premium.
+ *   4. Remaining losses are applied junior-first.
+ *
+ * Integer rounding is applied per-tranche and any residual is assigned to the
+ * junior tranche so total value is conserved (never created or destroyed).
+ * Callable off-chain for pre-deposit tranche NAV preview.
+ */
+export function computeTrancheWaterfall(
+  input: TrancheWaterfallInput,
+): TrancheWaterfallResult {
+  validateTrancheConfig(input.tranches);
+
+  const senior = input.tranches.find((t) => t.rank === "senior")!;
+  const junior = input.tranches.find((t) => t.rank === "junior")!;
+
+  // 1. Loss buffer absorbs losses first.
+  const bufferAbsorbed = Math.min(input.lossBuffer, input.realizedLoss);
+  let remainingLoss = input.realizedLoss - bufferAbsorbed;
+
+  // 2. Senior coupon/target yield from premium.
+  const seniorNav = input.nav * senior.targetWeight;
+  const seniorTarget = seniorNav * senior.targetYield;
+  const seniorPremium = Math.min(input.epochPremium, seniorTarget);
+  const seniorShortfall = seniorTarget - seniorPremium;
+
+  // 3. Junior receives residual premium.
+  const juniorPremium = input.epochPremium - seniorPremium;
+
+  // Fees split per config.
+  const seniorFees = input.fees * senior.feeSplit;
+  const juniorFees = input.fees - seniorFees;
+
+  // 4. Losses applied junior-first after buffer.
+  const juniorNav = input.nav * junior.targetWeight;
+  const juniorLoss = Math.min(juniorNav, remainingLoss);
+  remainingLoss -= juniorLoss;
+  const seniorLoss = Math.min(seniorNav, remainingLoss);
+
+  const seniorNet = seniorPremium - seniorFees - seniorLoss;
+  const juniorNet = juniorPremium - juniorFees - juniorLoss;
+
+  const allocations: TrancheWaterfallAllocation[] = [
+    {
+      id: senior.id,
+      rank: "senior",
+      premium: seniorPremium,
+      fees: seniorFees,
+      loss: seniorLoss,
+      netDelta: seniorNet,
+      yieldShortfall: seniorShortfall,
+    },
+    {
+      id: junior.id,
+      rank: "junior",
+      premium: juniorPremium,
+      fees: juniorFees,
+      loss: juniorLoss,
+      netDelta: juniorNet,
+      yieldShortfall: 0,
+    },
+  ];
+
+  const resultingNav = input.nav + seniorNet + juniorNet;
+
+  return { allocations, bufferAbsorbed, resultingNav };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,70 +386,38 @@ const MOCK_VAULTS: VaultDetail[] = [
     description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
     currentEpoch: 47,
     currentPhase: "active",
-    phaseEndsAt: "2026-10-03T16:00:00Z",
-    sharePrice: 1.042,
-    totalShares: 272552,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
-    historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
+    phaseEndsAt: "2026-09-27T00:00:00Z",
+    sharePrice: 1.084,
+    totalShares: 262000,
+    feeStructure: { managementPct: 0.02, performancePct: 0.1 },
+    payoffExplanation: "If XLM closes below the strike at expiry, the option expires worthless and the vault keeps the full premium. If XLM closes above the strike, the vault delivers XLM at the strike price, capping upside.",
+    historicalEpochs: [],
     userPosition: null,
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
+    tranches: [
+      {
+        id: "senior",
+        rank: "senior",
+        targetWeight: 0.7,
+        targetYield: 0.004,
+        premiumSplit: 0.7,
+        feeSplit: 0.7,
+        nav: 198800,
+        shares: 183400,
+        navPerShare: 1.084,
+        yieldShortfall: 0,
+      },
+      {
+        id: "junior",
+        rank: "junior",
+        targetWeight: 0.3,
+        targetYield: 0,
+        premiumSplit: 0.3,
+        feeSplit: 0.3,
+        nav: 85200,
+        shares: 78600,
+        navPerShare: 1.084,
+        yieldShortfall: 0,
+      },
     ],
-    userPosition: null,
   },
 ];
