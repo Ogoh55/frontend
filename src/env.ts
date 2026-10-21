@@ -24,6 +24,8 @@ const parsed = parseEnv({
   NEXT_PUBLIC_ANCHOR_MAINNET_URL: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_URL,
   NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS,
   NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
+  NEXT_PUBLIC_STATUS_PAGE_URL: process.env.NEXT_PUBLIC_STATUS_PAGE_URL,
+  NEXT_PUBLIC_INCIDENT_FEED_URL: process.env.NEXT_PUBLIC_INCIDENT_FEED_URL,
 });
 
 export const env = {
@@ -147,4 +149,29 @@ export const anchorConfig: AnchorConfig = {
 export function isAnchorSupported(assetCode: string | undefined): boolean {
   if (!anchorConfig.baseUrl || !assetCode) return false;
   return anchorConfig.assets.includes(assetCode.trim().toUpperCase());
+}
+
+/**
+ * Public status page + incident feed configuration (issue #268).
+ *
+ * The status page is hosted separately from the trading app so a bad frontend
+ * deploy cannot take down the page that reports the outage. The incident feed
+ * is a public, read-only JSON endpoint consumed by the in-app banner; both are
+ * optional so the app degrades gracefully when they are not configured.
+ */
+export interface StatusPageConfig {
+  /** Public status page URL, or undefined when not configured. */
+  statusPageUrl?: string;
+  /** Public incident feed URL, or undefined when not configured. */
+  incidentFeedUrl?: string;
+}
+
+export const statusPageConfig: StatusPageConfig = {
+  statusPageUrl: parsed.NEXT_PUBLIC_STATUS_PAGE_URL?.trim() || undefined,
+  incidentFeedUrl: parsed.NEXT_PUBLIC_INCIDENT_FEED_URL?.trim() || undefined,
+};
+
+/** Whether a public status page is configured for the active deployment. */
+export function isStatusPageConfigured(): boolean {
+  return Boolean(statusPageConfig.statusPageUrl);
 }
