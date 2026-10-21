@@ -22,6 +22,29 @@ export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" 
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
+/**
+ * Per-vault premium disposition policy for an epoch.
+ *
+ * - `COMPOUND`: collected premiums are added to vault assets before the NAV
+ *   snapshot is committed, raising NAV-per-share for all holders.
+ * - `DISTRIBUTE`: collected premiums are moved to a distribution claim account
+ *   and every snapshot share holder can claim their pro-rata amount on demand.
+ *
+ * The mode is fixed at epoch open and immutable for that epoch, so it cannot
+ * be chosen after the epoch outcome is known.
+ */
+export type PremiumPolicy = "COMPOUND" | "DISTRIBUTE";
+
+/**
+ * Documented handling of unclaimed DISTRIBUTE premiums after the claim deadline.
+ *
+ * - `roll_to_next_epoch`: unclaimed amounts are carried into the next epoch's
+ *   distribution pool (default).
+ * - `return_to_treasury`: unclaimed amounts are swept to the protocol treasury
+ *   once the deadline passes.
+ */
+export type UnclaimedPolicy = "roll_to_next_epoch" | "return_to_treasury";
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -40,6 +63,10 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  /** Premium disposition policy fixed for the current epoch. */
+  premiumPolicy: PremiumPolicy;
+  /** How unclaimed DISTRIBUTE premiums are handled after the deadline. */
+  unclaimedPolicy: UnclaimedPolicy;
 }
 
 /** One historical epoch record. */
@@ -53,6 +80,27 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: "expired_worthless" | "exercised" | "active";
   pnlPct: number; // epoch return, positive = profit for depositors
+  /** Policy that was fixed at this epoch's open. */
+  premiumPolicy: PremiumPolicy;
+}
+
+/**
+ * A DISTRIBUTE-mode epoch the user can claim from.
+ *
+ * Claims are index-based: the contract tracks a cumulative
+ * `premiumPerShare` accumulator and each holder's `claimedPerShare`
+ * checkpoint, so cost does not scale with holder count.
+ */
+export interface DistributionClaim {
+  epochNumber: number;
+  /** Cumulative premium-per-share accumulator at the epoch snapshot. */
+  premiumPerShare: number;
+  /** Amount the connected user can still claim, in USD. */
+  claimable: number;
+  /** ISO deadline after which unclaimed funds follow `unclaimedPolicy`. */
+  deadline: string;
+  /** Whether the user has already claimed this epoch. */
+  claimed: boolean;
 }
 
 /** The user's position in a vault. */
@@ -62,6 +110,8 @@ export interface UserVaultPosition {
   totalValue: number;
   accruedPremium: number;
   pendingWithdrawal: number; // shares queued for withdrawal at epoch end
+  /** DISTRIBUTE-mode epochs with outstanding or historical claims. */
+  distributions: DistributionClaim[];
 }
 
 /** Full detail for a single vault. */
@@ -95,6 +145,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "medium",
     description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
+    premiumPolicy: "COMPOUND",
+    unclaimedPolicy: "roll_to_next_epoch",
     currentEpoch: 47,
     currentPhase: "active",
     phaseEndsAt: "2026-10-03T16:00:00Z",
@@ -103,13 +155,13 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
     historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
+      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021, premiumPolicy: "COMPOUND" },
+      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018, premiumPolicy: "COMPOUND" },
+      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009, premiumPolicy: "COMPOUND" },
+      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022, premiumPolicy: "COMPOUND" },
+      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019, premiumPolicy: "COMPOUND" },
     ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
+    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0, distributions: [] },
   },
   {
     id: "btc-csp-v1",
@@ -124,6 +176,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-17",
     riskRating: "high",
     description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
+    premiumPolicy: "DISTRIBUTE",
+    unclaimedPolicy: "return_to_treasury",
     currentEpoch: 18,
     currentPhase: "active",
     phaseEndsAt: "2026-10-17T20:00:00Z",
@@ -132,9 +186,9 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0.5, performancePct: 15 },
     payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
     historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
+      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013, premiumPolicy: "DISTRIBUTE" },
+      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011, premiumPolicy: "DISTRIBUTE" },
+      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014, premiumPolicy: "DISTRIBUTE" },
     ],
     userPosition: null,
   },
@@ -151,6 +205,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-10",
     riskRating: "low",
     description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
+    premiumPolicy: "COMPOUND",
+    unclaimedPolicy: "roll_to_next_epoch",
     currentEpoch: 11,
     currentPhase: "deposit",
     phaseEndsAt: "2026-09-28T12:00:00Z",
@@ -159,82 +215,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016, premiumPolicy: "COMPOUND" },
     ],
     userPosition: null,
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
