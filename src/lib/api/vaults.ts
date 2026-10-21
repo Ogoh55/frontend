@@ -50,6 +50,17 @@
  * calls the exact same deposit service as the interactive flow, and is
  * idempotent per (schedule_id, scheduled_slot) so a retry cannot
  * double-deposit.
+ *
+ * Vault-written options supply (issue #267):
+ *
+ *   GET /api/v1/vaults/supply?underlying=&expiry=
+ *   → VaultSupplySummary   (one aggregated summary keyed by strike; never
+ *                           per-row lookups, so long expiries don't N+1)
+ *
+ * The summary is joined client-side into the options chain / vol surface.
+ * When the endpoint is unavailable (404/5xx/network) or the vault flag is
+ * off, callers must render the chain exactly as before — no placeholder
+ * zeros presented as real supply data.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -109,6 +120,85 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Vault-written options supply (issue #267)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-contract vault supply for one strike within an expiry. `vaultOi` is the
+ * open interest written by vault strategies; `totalOi` is the full book OI
+ * (exchange + vault). `shareOfOi` is `vaultOi / totalOi` in [0, 1].
+ */
+export interface VaultStrikeSupply {
+  strike: number;
+  /** "call" | "put" — vault strategies write both. */
+  optionType: "call" | "put";
+  vaultOi: number;
+  totalOi: number;
+  /** Fraction of total OI supplied by vaults (0–1). */
+  shareOfOi: number;
+}
+
+/**
+ * Aggregated vault supply summary for one (underlying, expiry). Returned by
+ * the backend in a single request so the chain can join it client-side
+ * without a per-row N+1 fetch.
+ */
+export interface VaultSupplySummary {
+  underlying: string;
+  expiry: string; // ISO date
+  /** Per-strike breakdown; may be empty when no vault supply exists. */
+  strikes: VaultStrikeSupply[];
+  /** Total vault OI across all strikes for this expiry. */
+  totalVaultOi: number;
+  /** Total book OI across all strikes for this expiry. */
+  totalOi: number;
+  /** Fraction of the displayed book that is vault-supplied (0–1). */
+  shareOfOi: number;
+  /** ISO timestamp the summary was computed at. */
+  asOf: string;
+}
+
+/**
+ * Fetch the aggregated vault supply summary for an (underlying, expiry).
+ *
+ * Returns `null` when the supply source is unavailable (404/5xx/network
+ * error) so callers can degrade gracefully and render the chain exactly as
+ * before — never fabricate zeros. A successful response with an empty
+ * `strikes` array means "no vault supply", which is distinct from `null`.
+ */
+export async function fetchVaultSupplySummary(
+  underlying: string,
+  expiry: string,
+): Promise<VaultSupplySummary | null> {
+  const params = new URLSearchParams({ underlying, expiry });
+  try {
+    const res = await fetch(`/api/v1/vaults/supply?${params.toString()}`);
+    if (!res.ok) return null;
+    return (await res.json()) as VaultSupplySummary;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Join a supply summary into a chain row keyed by (strike, optionType).
+ * Tolerant of missing rows: returns `null` when the summary is absent or the
+ * contract has no vault supply, so callers never render placeholder zeros.
+ */
+export function joinVaultSupply(
+  summary: VaultSupplySummary | null,
+  strike: number,
+  optionType: "call" | "put",
+): VaultStrikeSupply | null {
+  if (!summary) return null;
+  const match = summary.strikes.find(
+    (s) => s.strike === strike && s.optionType === optionType,
+  );
+  if (!match || match.vaultOi <= 0) return null;
+  return match;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,236 +309,4 @@ export async function fetchAnchorQuote(input: {
   });
   if (!res.ok) throw new Error(`Failed to fetch anchor quote (${res.status})`);
   return (await res.json()) as AnchorQuote;
-}
-
-/**
- * Start an anchor transaction. The interactive URL is minted by the BFF proxy
- * from server-side credentials — never pass a client-supplied redirect URL.
- */
-export async function startAnchorTransaction(input: {
-  network: string;
-  asset: string;
-  direction: AnchorDirection;
-  amount: number;
-  quoteId: string;
-}): Promise<AnchorTransaction> {
-  const res = await fetch("/api/vaults/anchor/transaction", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw new Error(`Failed to start anchor transaction (${res.status})`);
-  return (await res.json()) as AnchorTransaction;
-}
-
-/** Poll an anchor transaction's status (low-frequency; used to resume sessions). */
-export async function fetchAnchorTransaction(id: string): Promise<AnchorTransaction> {
-  const res = await fetch(`/api/vaults/anchor/transaction/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(`Failed to fetch anchor transaction (${res.status})`);
-  return (await res.json()) as AnchorTransaction;
-}
-
-// ---------------------------------------------------------------------------
-// Recurring auto-deposit (DCA) schedule types
-// ---------------------------------------------------------------------------
-
-/** Cadence for a recurring deposit. Boundaries are computed in UTC. */
-export type AutoDepositCadence = "daily" | "weekly" | "biweekly" | "monthly";
-
-export type AutoDepositScheduleStatus = "active" | "paused" | "cancelled";
-
-/**
- * Pre-authorization the depositor grants so executions don't require a
- * signature each run. Scope and expiry must be shown in plain language
- * before the user grants it.
- */
-export interface AutoDepositAuthorization {
-  /** Asset the allowance/trustline covers (e.g. "USDC"). */
-  asset: string;
-  /** Maximum total the allowance permits across all executions. */
-  allowanceCap: number;
-  /** Amount already consumed by prior executions. */
-  allowanceUsed: number;
-  /** ISO timestamp after which the allowance is no longer valid. */
-  expiresAt: string;
-  /** Whether the required trustline is established. */
-  trustlineReady: boolean;
-}
-
-/** Why a scheduled execution did not land. Surfaced non-silently in the UI. */
-export type AutoDepositFailureReason =
-  | "epoch_closed"
-  | "deposit_cap_reached"
-  | "insufficient_balance"
-  | "allowance_expired";
-
-/** A single execution attempt (successful or failed) for a schedule. */
-export interface AutoDepositExecution {
-  /** Idempotency key: `${scheduleId}:${scheduledSlot}`. */
-  idempotencyKey: string;
-  /** ISO timestamp of the slot this execution was scheduled for. */
-  scheduledSlot: string;
-  status: "succeeded" | "failed" | "retrying";
-  /** Vault deposit tx id when status === "succeeded". */
-  txId: string | null;
-  /** Failure reason when status !== "succeeded". */
-  failureReason: AutoDepositFailureReason | null;
-  /** Human-readable remediation hint shown next to the failure. */
-  remediation: string | null;
-  /** Number of retries already attempted for this slot. */
-  attempts: number;
-  executedAt: string | null;
-}
-
-/** A persisted recurring deposit plan for a vault. */
-export interface AutoDepositSchedule {
-  id: string;
-  vaultId: string;
-  /** Amount of `asset` deposited per execution. */
-  amount: number;
-  asset: string;
-  cadence: AutoDepositCadence;
-  status: AutoDepositScheduleStatus;
-  /** ISO timestamp of the next scheduled execution. */
-  nextRunAt: string;
-  /** Optional ISO end date after which no further executions occur. */
-  endDate: string | null;
-  /** Optional maximum cumulative amount deposited across all executions. */
-  maxTotal: number | null;
-  /** Cumulative amount deposited so far. */
-  totalDeposited: number;
-  authorization: AutoDepositAuthorization;
-  /** Most recent execution attempts, newest first. */
-  recentExecutions: AutoDepositExecution[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-/** Input for creating a schedule. */
-export interface CreateAutoDepositScheduleInput {
-  amount: number;
-  asset: string;
-  cadence: AutoDepositCadence;
-  endDate?: string | null;
-  maxTotal?: number | null;
-  /** ISO timestamp the pre-authorization expires at. */
-  authorizationExpiresAt: string;
-}
-
-/** Patch for editing a schedule. Only mutable fields are accepted. */
-export type UpdateAutoDepositScheduleInput = Partial<
-  Pick<CreateAutoDepositScheduleInput, "amount" | "cadence" | "endDate" | "maxTotal">
->;
-
-/**
- * Compute the next run timestamp for a cadence, anchored to `from` in UTC.
- * Monthly cadence clamps to the last day of shorter months so a schedule
- * created on the 31st does not skip February.
- */
-export function computeNextRunAt(from: Date, cadence: AutoDepositCadence): Date {
-  const next = new Date(from.getTime());
-  switch (cadence) {
-    case "daily":
-      next.setUTCDate(next.getUTCDate() + 1);
-      break;
-    case "weekly":
-      next.setUTCDate(next.getUTCDate() + 7);
-      break;
-    case "biweekly":
-      next.setUTCDate(next.getUTCDate() + 14);
-      break;
-    case "monthly": {
-      const day = next.getUTCDate();
-      next.setUTCDate(1);
-      next.setUTCMonth(next.getUTCMonth() + 1);
-      const lastDay = new Date(
-        Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0),
-      ).getUTCDate();
-      next.setUTCDate(Math.min(day, lastDay));
-      break;
-    }
-  }
-  return next;
-}
-
-/** Build the idempotency key for a (schedule, slot) pair. */
-export function autoDepositIdempotencyKey(scheduleId: string, scheduledSlot: string): string {
-  return `${scheduleId}:${scheduledSlot}`;
-}
-
-/** List schedules for a vault, persisted server-side against the account. */
-export async function fetchAutoDepositSchedules(vaultId: string): Promise<AutoDepositSchedule[]> {
-  const res = await fetch(`/api/vaults/${encodeURIComponent(vaultId)}/schedules`);
-  if (!res.ok) throw new Error(`Failed to load schedules (${res.status})`);
-  return (await res.json()) as AutoDepositSchedule[];
-}
-
-/** Create a recurring deposit schedule. */
-export async function createAutoDepositSchedule(
-  vaultId: string,
-  input: CreateAutoDepositScheduleInput,
-): Promise<AutoDepositSchedule> {
-  const res = await fetch(`/api/vaults/${encodeURIComponent(vaultId)}/schedules`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw new Error(`Failed to create schedule (${res.status})`);
-  return (await res.json()) as AutoDepositSchedule;
-}
-
-/** Edit a schedule's mutable fields. */
-export async function updateAutoDepositSchedule(
-  vaultId: string,
-  scheduleId: string,
-  input: UpdateAutoDepositScheduleInput,
-): Promise<AutoDepositSchedule> {
-  const res = await fetch(
-    `/api/vaults/${encodeURIComponent(vaultId)}/schedules/${encodeURIComponent(scheduleId)}`,
-    {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
-    },
-  );
-  if (!res.ok) throw new Error(`Failed to update schedule (${res.status})`);
-  return (await res.json()) as AutoDepositSchedule;
-}
-
-/** Pause a schedule so no further executions occur until resumed. */
-export async function pauseAutoDepositSchedule(
-  vaultId: string,
-  scheduleId: string,
-): Promise<AutoDepositSchedule> {
-  const res = await fetch(
-    `/api/vaults/${encodeURIComponent(vaultId)}/schedules/${encodeURIComponent(scheduleId)}/pause`,
-    { method: "POST" },
-  );
-  if (!res.ok) throw new Error(`Failed to pause schedule (${res.status})`);
-  return (await res.json()) as AutoDepositSchedule;
-}
-
-/** Resume a paused schedule. */
-export async function resumeAutoDepositSchedule(
-  vaultId: string,
-  scheduleId: string,
-): Promise<AutoDepositSchedule> {
-  const res = await fetch(
-    `/api/vaults/${encodeURIComponent(vaultId)}/schedules/${encodeURIComponent(scheduleId)}/resume`,
-    { method: "POST" },
-  );
-  if (!res.ok) throw new Error(`Failed to resume schedule (${res.status})`);
-  return (await res.json()) as AutoDepositSchedule;
-}
-
-/** Cancel (delete) a schedule permanently. */
-export async function cancelAutoDepositSchedule(
-  vaultId: string,
-  scheduleId: string,
-): Promise<void> {
-  const res = await fetch(
-    `/api/vaults/${encodeURIComponent(vaultId)}/schedules/${encodeURIComponent(scheduleId)}`,
-    { method: "DELETE" },
-  );
-  if (!res.ok) throw new Error(`Failed to cancel schedule (${res.status})`);
 }
