@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
@@ -14,6 +14,11 @@ import {
   type EpochPhase,
 } from "../../../../lib/api/vaults";
 import { VaultHealthPanel } from "../../../../components/VaultHealthPanel";
+import {
+  VaultEligibilityGate,
+  type EligibilityStatus,
+} from "../../../../components/VaultEligibilityGate";
+import { checkVaultEligibility } from "../../../../lib/api/vaultEligibility";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -43,6 +48,7 @@ function fmtDateShort(iso: string) {
 
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
+  const address = useWalletStore(s => s.address);
   const token = useWalletStore(s => s.session);
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
@@ -55,11 +61,35 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [txMessage, setTxMessage] = useState("");
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
 
+  // Eligibility check state
+  const [eligibilityStatus, setEligibilityStatus] = useState<EligibilityStatus>({ state: "idle" });
+
   useEffect(() => {
     fetchVaultDetail(id, token)
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
   }, [id, token]);
+
+  // Run eligibility check whenever the wallet or vault changes
+  const runEligibilityCheck = useCallback(() => {
+    if (!address) {
+      setEligibilityStatus({ state: "idle" });
+      return;
+    }
+    setEligibilityStatus({ state: "loading" });
+    checkVaultEligibility(address, id, token)
+      .then(result => setEligibilityStatus({ state: "done", result }))
+      .catch(err =>
+        setEligibilityStatus({
+          state: "error",
+          message: err instanceof Error ? err.message : "Unknown error",
+        }),
+      );
+  }, [address, id, token]);
+
+  useEffect(() => {
+    runEligibilityCheck();
+  }, [runEligibilityCheck]);
 
   const handleDeposit = async () => {
     if (!vault || !token) return;
@@ -294,6 +324,12 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
 
                 {/* Vault health score */}
                 <VaultHealthPanel healthScore={vault.healthScore} />
+
+                {/* Incentive eligibility — anti-sybil & farming detection */}
+                <VaultEligibilityGate
+                  status={eligibilityStatus}
+                  walletConnected={!!token}
+                />
 
                 {/* Fee disclosure */}
                 <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 14 }}>
