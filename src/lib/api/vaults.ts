@@ -55,6 +55,32 @@ import { apiGet, apiPost } from "./client";
  *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
  *     requests but still processes queued ones.
  *
+ * NAV / share-price source of truth (issue #290):
+ *
+ *   Share issuance is priced from the vault's internal book value
+ *   (`bookValue`), NOT from the raw token balance held at the vault
+ *   contract address. Direct token transfers to the contract are
+ *   classified as `ignored` — they do not move NAV and cannot be used
+ *   to inflate the share price. This classification is identical across
+ *   the contract, the backend indexer/registry, and this adapter.
+ *
+ *   Inflation / donation-attack mitigations are per-vault config
+ *   (`inflationDefense`) and are changeable only through the timelocked
+ *   operator path. The adapter surfaces them so the UI can enforce the
+ *   same `minSharesOut` bound the contract enforces on deposit.
+ *
+ * Shadow mode (issue #292):
+ *
+ *   A strategy may run in `shadow` mode — the identical strategy module
+ *   and keeper path execute against live oracle/engine data, but no
+ *   option orders are submitted and no depositor collateral is
+ *   committed. Shadow state lives in its own namespace (`shadow` on the
+ *   detail payload) with its own hypothetical NAV-per-share series and
+ *   epoch record stream. It is NEVER merged into `bookValue`,
+ *   `sharePrice`, `tvl`, or `historicalEpochs`, and shadow runs are
+ *   labeled `mode: "shadow"` everywhere they surface so paper results
+ *   cannot be mistaken for realized performance.
+ *
  * Depositor privacy (issue #231):
  *
  *   GET  /api/v1/vaults/privacy/export?wallet={address}
@@ -349,6 +375,47 @@ export function removeAllowlistEntry(
 }
 
 /**
+ * Execution mode of a vault strategy.
+ *
+ * - `live`: real capital is committed and real option orders are submitted.
+ * - `shadow`: paper trading — the same decision path runs, but no orders
+ *   are submitted and no depositor collateral is committed. Shadow state
+ *   is tracked in a separate namespace and must never be conflated with
+ *   live balances.
+ */
+export type VaultMode = "live" | "shadow";
+
+/**
+ * How a direct token transfer to the vault contract address is treated.
+ * Must match the contract and backend indexer/registry exactly.
+ *
+ * - `ignored`: transfer does not affect NAV (default; donation-resistant).
+ * - `swept`: transfer is moved to a defined sink address.
+ * - `windfall`: transfer is absorbed into book value (opt-in only).
+ */
+export type DirectTransferPolicy = "ignored" | "swept" | "windfall";
+
+/**
+ * Per-vault inflation / donation-attack defense parameters.
+ * Stored with the rest of the vault parameters and mutable only via the
+ * timelocked operator path — never hardcoded constants.
+ */
+export interface InflationDefenseConfig {
+  /** Virtual shares added to total supply in the pricing formula. */
+  virtualShares: number;
+  /** Virtual assets added to book value in the pricing formula. */
+  virtualAssets: number;
+  /** Minimum assets required for the first (genesis) deposit. */
+  minFirstDeposit: number;
+  /** Shares minted to the dead/locked address on the first deposit. */
+  deadShares: number;
+  /** Max fractional NAV-per-share move between issuance events in one ledger (0–1). */
+  navJumpGuardPct: number;
+  /** Classification of direct token transfers to the contract. */
+  directTransferPolicy: DirectTransferPolicy;
+}
+
+/**
  * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
  * on one vault has no implicit authority over any other vault.
  *
@@ -443,6 +510,8 @@ export interface VaultSummary {
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  /** Execution mode; `shadow` results are paper trading, not realized. */
+  mode: VaultMode;
   status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
@@ -709,146 +778,61 @@ export interface ProcessingPoint {
   liquidityUsd: number;
 }
 
-/** Full detail for a single vault. */
-export interface VaultDetail extends VaultSummary {
-  currentEpoch: number;
-  currentPhase: EpochPhase;
-  phaseEndsAt: string; // ISO — when the current phase ends
-  sharePrice: number; // current NAV per share in USD
-  totalShares: number;
-  payoffExplanation: string;
-  historicalEpochs: EpochRecord[];
-  userPosition: UserVaultPosition | null;
-  /** Declarative concentration limits (fractions of NAV). */
-  exposureLimits: ExposureLimits;
-  /** Current written exposure used by the sizing step. */
-  exposure: ExposureState;
-  /** Transfer-restriction configuration for LP shares. */
-  transferRestrictions: TransferRestrictions;
-  /** Role assignments scoped to this vault only. */
-  roles: VaultRoleGrant[];
-}
-
-// ---------------------------------------------------------------------------
-// Shared exposure evaluation
-// ---------------------------------------------------------------------------
-
 /**
- * Evaluate the tightest applicable remaining limit for an intent and clamp
- * the requested notional to it. Both the sizing step and the contract
- * enforcement boundary call this so they can never drift.
- *
- * A vault already over a (newly-tightened) limit yields zero headroom on
- * that dimension, so new writes are blocked while existing positions roll
- * off — no revert of unrelated operations.
+ * One point in a hypothetical NAV-per-share series produced by a shadow
+ * run. Kept in its own namespace so it can never be read as live NAV.
  */
-export function evaluateExposure(
-  limits: ExposureLimits,
-  state: ExposureState,
-  intent: StrategyIntent,
-): SizingDecision {
-  const nav = state.nav;
-  const headroom = (limit: number, used: number): number =>
-    Math.max(0, limit * nav - used);
-
-  const candidates: Array<{
-    reason: NonNullable<SizingDecision["reason"]>;
-    remaining: number;
-  }> = [
-    {
-      reason: "perUnderlying",
-      remaining: headroom(limits.perUnderlying, state.byUnderlying[intent.underlying] ?? 0),
-    },
-    {
-      reason: "perStrikeBucket",
-      remaining: headroom(limits.perStrikeBucket, state.byStrikeBucket[intent.strikeBucket] ?? 0),
-    },
-    {
-      reason: "perExpiry",
-      remaining: headroom(limits.perExpiry, state.byExpiry[intent.expiry] ?? 0),
-    },
-  ];
-
-  const tightest = candidates.reduce((a, b) => (b.remaining < a.remaining ? b : a));
-  const approvedNotional = Math.max(0, Math.min(intent.requestedNotional, tightest.remaining));
-  const clamped = approvedNotional < intent.requestedNotional;
-
-  return {
-    approvedNotional,
-    clamped,
-    reason: clamped ? tightest.reason : null,
-    remainingHeadroom: tightest.remaining,
-  };
+export interface ShadowNavPoint {
+  epochNumber: number;
+  /** Hypothetical NAV per share in USD (paper trading only). */
+  navPerShare: number;
+  /** NAV per share the strategy model expected for this epoch. */
+  expectedNavPerShare: number;
+  /** ISO timestamp the shadow epoch settled. */
+  recordedAt: string;
 }
 
 /**
- * Validate that a limit set is not jointly unsatisfiable (each dimension must
- * be a positive fraction of NAV). Called on config write.
+ * Side-by-side comparison of a shadow run against live and expected
+ * performance. All shadow figures are paper trading and must be labeled
+ * as such in the UI.
  */
-export function validateExposureLimits(limits: ExposureLimits): string[] {
-  const errors: string[] = [];
-  (["perUnderlying", "perStrikeBucket", "perExpiry"] as const).forEach((key) => {
-    const v = limits[key];
-    if (!(v > 0 && v <= 1)) {
-      errors.push(`${key} must be a fraction of NAV in (0, 1]`);
-    }
-  });
-  return errors;
+export interface ShadowComparison {
+  /** Latest hypothetical NAV per share from the shadow run. */
+  shadowNavPerShare: number;
+  /** Latest realized NAV per share of the live vault (null if none). */
+  liveNavPerShare: number | null;
+  /** NAV per share the strategy model expected for the latest epoch. */
+  expectedNavPerShare: number;
+  /** Shadow minus live NAV per share (null when no live history). */
+  shadowVsLiveDelta: number | null;
+  /** Shadow minus expected NAV per share. */
+  shadowVsExpectedDelta: number;
+  /** Number of complete shadow epochs recorded so far. */
+  completedEpochs: number;
 }
 
-// ---------------------------------------------------------------------------
-// Share-lot accounting (cost basis, realized and unrealized PnL)
-//
-// Shared by the API and any client-side display. Rebuilding the ledger from
-// the same event stream always yields the same output: events are ordered by
-// (ledger, seq) and lots by (acquiredLedger, lotId). Schema: docs/vault-lot-ledger.md
-// ---------------------------------------------------------------------------
-
-/** Lot relief method. Stored on every ledger row so a future change cannot rewrite history. */
-export type LotReliefMethod = "fifo";
-export const DEFAULT_LOT_RELIEF_METHOD: LotReliefMethod = "fifo";
-
-/** Share amounts at or below this are rounding residue, never a lot. */
-export const DUST_SHARES = 1e-9;
-
-/** A dated acquisition lot held by one depositor in one vault. */
-export interface VaultShareLot {
-  lotId: string;
-  vaultId: string;
-  acquiredLedger: number;
-  acquiredAt: string; // ledger close time (ISO), never receipt time
-  /** Shares still held from this lot. */
-  shares: number;
-  /** Cost basis still attached to the remaining shares, in USD. */
-  costUsd: number;
-  /** NAV per share used when the shares were minted. */
-  navPerShare: number;
+/**
+ * Shadow (paper-trading) state for a vault strategy. Tracked in its own
+ * namespace, with its own hypothetical NAV series and epoch stream, so
+ * the registry, indexer, and this read model never conflate it with real
+ * balances.
+ */
+export interface ShadowState {
+  /** Always `shadow` — makes the paper-trading label explicit in payloads. */
+  mode: "shadow";
+  /** Hypothetical NAV-per-share series, one point per complete epoch. */
+  navSeries: ShadowNavPoint[];
+  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
+  epochs: EpochRecord[];
+  /** Side-by-side comparison data for the operator console/analytics. */
+  comparison: ShadowComparison;
 }
 
-/** A lot-affecting event as indexed from the vault contract. */
-export interface VaultLotEvent {
-  seq: number;
-  kind: "deposit" | "transfer_in" | "redemption" | "transfer_out";
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  /** deposit/transfer_in: cost in USD. redemption/transfer_out: gross proceeds in USD. */
-  amountUsd: number;
-  /** Fees that reduce proceeds. Management fees are already reflected in NAV and are not repeated here. */
-  feesUsd: number;
-  navPerShare: number;
-}
-
-/** One ledger row per lot-affecting event. This is the export row. */
-export interface VaultLedgerRow {
-  seq: number;
-  kind: VaultLotEvent["kind"];
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  amountUsd: number;
-  feesUsd: number;
-  navPerShare: number;
-  costBasisUs
+/**
+ * Promotion criteria that must be met before a shadow strategy can be
+ * moved to live allocation. Evaluated by the backend promotion gate; the
+ * adapter surfaces the thresholds so the operator console can display
+ * progress and block promotion when unmet.
+ */
+export interface

@@ -14,6 +14,20 @@ version: "3.9"
 # Runtime overrides (copy .env.compose.example to .env.compose and edit):
 #   ZENITH_BACKEND_IMAGE   backend image tag (default: ghcr.io/zenith-options/backend:latest)
 #   ZENITH_FRONTEND_IMAGE  frontend image tag (default: ghcr.io/zenith-options/frontend:latest)
+#   ZENITH_DB_IMAGE        postgres image tag (default: postgres:16-alpine)
+#   ZENITH_DB_NAME         database name (default: zenith)
+#   ZENITH_DB_USER         database user (default: zenith)
+#   ZENITH_DB_PASSWORD     database password (default: zenith)
+#
+# Migrations (issue #281):
+#   Migrations run as a separate one-shot `migrate` service, never on
+#   application boot. The backend waits for `migrate` to complete
+#   successfully before starting, so a failed migration blocks the deploy
+#   instead of leaving a half-migrated schema serving traffic.
+#
+#   docker compose --profile full run --rm migrate up      # apply pending
+#   docker compose --profile full run --rm migrate down    # roll back last
+#   docker compose --profile full run --rm migrate status  # show state
 #
 # Trust boundaries (see docs/network-surfaces.md):
 #   - Only `frontend` (BFF) and `backend` (API) publish host ports.
@@ -58,6 +72,45 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  db:
+    profiles: ["full"]
+    image: ${ZENITH_DB_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: ${ZENITH_DB_NAME:-zenith}
+      POSTGRES_USER: ${ZENITH_DB_USER:-zenith}
+      POSTGRES_PASSWORD: ${ZENITH_DB_PASSWORD:-zenith}
+    ports:
+      - "5432:5432"
+    volumes:
+      - zenith-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ZENITH_DB_USER:-zenith} -d ${ZENITH_DB_NAME:-zenith}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot migration runner. Runs the versioned, checksum-enforced
+  # migrations in ./migrations as a separate deploy step. Never started by
+  # the application itself; invoked explicitly via `docker compose run`.
+  migrate:
+    profiles: ["full"]
+    image: ${ZENITH_BACKEND_IMAGE:-ghcr.io/zenith-options/backend:latest}
+    entrypoint: ["node", "scripts/migrate.js"]
+    command: ["up"]
+    working_dir: /app
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://${ZENITH_DB_USER:-zenith}:${ZENITH_DB_PASSWORD:-zenith}@db:5432/${ZENITH_DB_NAME:-zenith}}
+      MIGRATIONS_DIR: ${MIGRATIONS_DIR:-/app/migrations}
+      # Short lock timeout + retries so migrations never block vault writes.
+      MIGRATION_LOCK_TIMEOUT_MS: ${MIGRATION_LOCK_TIMEOUT_MS:-5000}
+      MIGRATION_LOCK_RETRIES: ${MIGRATION_LOCK_RETRIES:-5}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   backend:
     profiles: ["full"]
     image: ${ZENITH_BACKEND_IMAGE:-ghcr.io/zenith-options/backend:latest}
@@ -65,10 +118,17 @@ services:
       - "8081:8081"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${ZENITH_DB_USER:-zenith}:${ZENITH_DB_PASSWORD:-zenith}@db:5432/${ZENITH_DB_NAME:-zenith}}
       # Verifies inbound service tokens; signing keys come from the managed store.
       SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
       SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
       SERVICE_TOKEN_CLOCK_SKEW_SECS: ${SERVICE_TOKEN_CLOCK_SKEW_SECS:-30}
+    depends_on:
+      db:
+        condition: service_healthy
+      # Gate application start on a successful migration run.
+      migrate:
+        condition: service_completed_successfully
     networks:
       - vault-public
       - vault-internal
@@ -130,6 +190,9 @@ services:
       - vault-internal
       - vault-egress
     restart: unless-stopped
+
+volumes:
+  zenith-db-data:
 
 # ---------------------------------------------------------------------------
 # Networks encode the trust boundaries:

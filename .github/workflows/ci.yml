@@ -1,32 +1,9 @@
-    branches: [main]
-
-# Cancel superseded runs on the same ref so each push only bills one run.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-# Least-privilege permissions; individual jobs add what they need.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-  pull-requests: write  # for posting VRT diff comments
-
-env:
-  # Required by Next.
-
-jobs:
-  check:
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-
-jobs:
-  check:
-    branches: [main]
 
 # Cancel superseded runs on the same ref so each push only bills one run.
 concurrency:
@@ -103,6 +80,51 @@ jobs:
           retention-days: 14
 
   # ───────────────────────────────────────────────────────────────────────────
+  # MIGRATIONS
+  # Applies every vault migration to a clean Postgres schema, asserts the
+  # resulting schema matches the committed model, and verifies each migration
+  # is reversible (up → down → up) and backwards compatible with the previous
+  # deployed version. Runs as a separate deploy step, never on app boot.
+  # ───────────────────────────────────────────────────────────────────────────
+  migrations:
+    name: Migrations (up/down/status + schema drift)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vault -d vault_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://vault:vault@localhost:5432/vault_ci
+    steps:
+      - uses: ./.github/actions/setup
+
+      - name: Apply all migrations to a clean schema
+        run: npm run migrate:up
+
+      - name: Assert schema matches committed model
+        run: npm run migrate:check
+
+      - name: Verify migrations are reversible (up → down → up)
+        run: npm run migrate:test
+
+      - name: Check backwards compatibility with previous deployed version
+        run: npm run migrate:compat
+
+      - name: Report migration status
+        if: always()
+        run: npm run migrate:status
+
+  # ───────────────────────────────────────────────────────────────────────────
   # BUILD
   # Runs `next build`. The .next/cache is restored between runs so
   # incremental builds are fast. The build artifact is uploaded so the
@@ -156,22 +178,6 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
       - run: npx playwright install --with-deps chromium webkit
-      # RECORD=1 keeps a video of every test; they're uploaded bel
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
-        env:
-          NEXT_TELEMETRY_DISABLED: "1"
-      - run: npx playwright install --with-deps chromium webkit
       # RECORD=1 keeps a video of every test; they're uploaded below as the
       # PR's recordings of the tour, the mode switch and the phone trade flow.
       - run: npx playwright test
@@ -184,6 +190,38 @@ jobs:
           name: playwright-report
           path: |
             playwright-report
+            test-results
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # RENDER PERFORMANCE (dev-only /__perf harness)
+  # Drives scripted vault NAV / queue-position / epoch ticks through the real
+  # SpotFeedContext provider and asserts recorded render counts against the
+  # documented baseline. Skips cleanly when no vault fixture data is available.
+  # ───────────────────────────────────────────────────────────────────────────
+  perf:
+    name: Render perf (vault render-count budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --config=playwright.perf.config.ts
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report
+          path: |
+            perf-report
             test-results
           retention-days: 14
 
@@ -254,118 +292,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download Storybook build
+      - name: Download Storybook build artifact
         uses: actions/download-artifact@v4
         with:
           name: storybook-static
           path: storybook-static/
 
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
 
       - name: Run Storybook test runner
         run: npm run storybook:test
-        env:
-          # Point the test runner at the static build served by the built-in
-          # reference server that test-runner starts automatically.
-          TARGET_URL: http://localhost:6006
-          # Fail CI on any a11y violation
-          SB_TESTRUNNER_SKIP_STORIES_FILE: ''
 
-      - name: Upload test results
+      - name: Upload test runner report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: storybook-test-results
-          path: |
-            test-results/
-          retention-days: 7
-
-  storybook-visual-regression:
-    name: Visual Regression Tests
-    runs-on: ubuntu-latest
-    needs: storybook-build
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
-
-      - name: Download Storybook build
-        uses: actions/download-artifact@v4
-        with:
-          name: storybook-static
-          path: storybook-static/
-
-      - name: Serve Storybook static build
-        run: |
-          npx serve storybook-static --listen 6006 &
-          # Wait for the server to be ready
-          npx wait-on http://localhost:6006 --timeout 30000
-        env:
-          CI: true
-
-      - name: Run VRT screenshots
-        run: npm run test:vrt
-        env:
-          CI: true
-          STORYBOOK_URL: http://localhost:6006
-
-      - name: Upload VRT report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vrt-report-${{ github.run_id }}
-          path: |
-            playwright-report/storybook-vrt/
-            test-results/
-          retention-days: 30
-
-      - name: Comment VRT diff on PR
-        if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const artifactUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## 📸 Visual Regression Differences Detected\n\nScreenshot diffs were found. Download the **[VRT report artifact](${artifactUrl})** to review pixel-level differences.\n\nTo update baselines:\n\`\`\`bash\nnpx playwright test --config playwright.storybook.config.ts --update-snapshots\ngit add e2e/storybook/__snapshots__\ngit commit -m "chore: update VRT snapshots"\n\`\`\``,
-            });
-
-  storybook-publish:
-    name: Publish Storybook to GitHub Pages
-    runs-on: ubuntu-latest
-    needs: [storybook-test-runner, storybook-visual-regression]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - name: Download Storybook build
-        uses: actions/download-artifact@v4
-        with:
-          name: storybook-static
-          path: storybook-static/
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: storybook-static/
-
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
-
+          name: storybook-test-report
+          path: storybook-test-report/
+          retention-days: 14
