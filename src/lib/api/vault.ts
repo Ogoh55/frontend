@@ -2,6 +2,10 @@
  * Vault on-chain operations: deposit collateral into the Zenith vault
  * contract and withdraw free collateral back to the wallet.
  *
+ * This is the margin-collateral vault (NEXT_PUBLIC_VAULT_CONTRACT_ID). It is
+ * unrelated to the Phase 2 options vault scaffolded in `contracts/vault`
+ * (wired later via `./vaults.ts`).
+ *
  * Both flows use the same pattern:
  *   1. Ask the backend to build a Soroban transaction XDR.
  *   2. Ask Freighter to sign it.

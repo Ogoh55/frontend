@@ -1,0 +1,29 @@
+{
+  "name": "@zenith-options/vault-sdk",
+  "version": "0.1.0",
+  "description": "Typed client for the Zenith Options Phase 2 vault REST contract",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "zenith",
+    "options",
+    "vault",
+    "stellar",
+    "sdk"
+  ]
+}

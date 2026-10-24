@@ -1,0 +1,12 @@
+[package]
+name = "zenith-options-vault-common"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Shared storage, auth, error and event definitions for the Zenith Phase 2 options vault contracts"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk.workspace = true
