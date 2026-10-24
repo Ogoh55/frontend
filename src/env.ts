@@ -21,6 +21,11 @@ const parsed = parseEnv({
   NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET,
+  VAULT_RATE_LIMIT_READ_PER_WALLET: process.env.VAULT_RATE_LIMIT_READ_PER_WALLET,
+  VAULT_RATE_LIMIT_READ_PER_IP: process.env.VAULT_RATE_LIMIT_READ_PER_IP,
+  VAULT_RATE_LIMIT_WRITE_PER_WALLET: process.env.VAULT_RATE_LIMIT_WRITE_PER_WALLET,
+  VAULT_RATE_LIMIT_WRITE_PER_IP: process.env.VAULT_RATE_LIMIT_WRITE_PER_IP,
+  VAULT_RATE_LIMIT_WINDOW_SECONDS: process.env.VAULT_RATE_LIMIT_WINDOW_SECONDS,
   SOROBAN_RPC_URLS: process.env.SOROBAN_RPC_URLS,
   SOROBAN_RPC_MAX_CONCURRENCY: process.env.SOROBAN_RPC_MAX_CONCURRENCY,
   SOROBAN_RPC_MAX_ATTEMPTS: process.env.SOROBAN_RPC_MAX_ATTEMPTS,
@@ -102,6 +107,46 @@ export function contractEnvVarName(key: string): string {
 }
 
 /**
+ * Vault API abuse-protection limits (issue #220).
+ *
+ * Per-environment configurable so staging can be relaxed while production
+ * stays strict. Limits are enforced per-wallet first (primary identity) with
+ * IP as a secondary dimension so shared NAT egress does not lock out
+ * legitimate users. Window is the sliding window length in seconds.
+ */
+export type VaultRateLimitConfig = {
+  /** Max read requests per wallet per window. */
+  readPerWallet: number;
+  /** Max read requests per IP per window (secondary dimension). */
+  readPerIp: number;
+  /** Max state-changing requests per wallet per window. */
+  writePerWallet: number;
+  /** Max state-changing requests per IP per window (secondary dimension). */
+  writePerIp: number;
+  /** Sliding window length in seconds. */
+  windowSeconds: number;
+};
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+const isProduction = env.NODE_ENV === "production";
+
+/**
+ * Documented vault rate limits. Defaults are strict in production and relaxed
+ * elsewhere; every value can be overridden per environment via env vars.
+ */
+export const vaultRateLimits: VaultRateLimitConfig = {
+  readPerWallet: positiveInt(parsed.VAULT_RATE_LIMIT_READ_PER_WALLET, isProduction ? 60 : 600),
+  readPerIp: positiveInt(parsed.VAULT_RATE_LIMIT_READ_PER_IP, isProduction ? 120 : 1200),
+  writePerWallet: positiveInt(parsed.VAULT_RATE_LIMIT_WRITE_PER_WALLET, isProduction ? 10 : 100),
+  writePerIp: positiveInt(parsed.VAULT_RATE_LIMIT_WRITE_PER_IP, isProduction ? 30 : 300),
+  windowSeconds: positiveInt(parsed.VAULT_RATE_LIMIT_WINDOW_SECONDS, 60),
+};
+
+/**
  * Soroban RPC resilience configuration (issue #282).
  *
  * `SOROBAN_RPC_URLS` is a comma-separated list of RPC endpoints used by the
@@ -150,8 +195,6 @@ function parseRpcUrls(raw: string | undefined, fallback: string): string[] {
   }
   return urls;
 }
-
-const isProduction = process.env.NODE_ENV === "production";
 
 if (isProduction && (parsed.SOROBAN_RPC_URLS === undefined || parsed.SOROBAN_RPC_URLS.trim() === "")) {
   throw new Error(

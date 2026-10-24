@@ -12,6 +12,20 @@ export default defineConfig({
     video: 'retain-on-failure',
     ...devices['Desktop Chrome'],
   },
+  projects: [
+    {
+      name: 'Desktop Chrome',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'iPhone 13',
+      use: { ...devices['iPhone 13'] },
+    },
+    {
+      name: 'Pixel 7',
+      use: { ...devices['Pixel 7'] },
+    },
+  ],
   webServer: {
     command: 'npm run storybook -- --ci --port 6006',
     url: 'http://127.0.0.1:6006',
