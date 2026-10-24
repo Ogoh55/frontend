@@ -27,6 +27,30 @@
       "totalRenderMs":  { "threshold": 0.20 },
       "p95RenderMs":    { "threshold": 0.30,  "note": "Tab switch mounts/unmounts heavy panels; more variance expected" },
       "totalLongTaskMs":{ "threshold": null }
+    },
+    "vault-list-render": {
+      "commitCount":    { "threshold": 0.15 },
+      "totalRenderMs":  { "threshold": 0.20,  "note": "Vault listing cold-render — 4 cards, Fast 3G" },
+      "p95RenderMs":    { "threshold": 0.25 },
+      "totalLongTaskMs":{ "threshold": null }
+    },
+    "vault-detail-render": {
+      "commitCount":    { "threshold": 0.15 },
+      "totalRenderMs":  { "threshold": 0.20,  "note": "Vault detail page with epoch timeline and sidebar" },
+      "p95RenderMs":    { "threshold": 0.25 },
+      "totalLongTaskMs":{ "threshold": null }
+    },
+    "epoch-transition": {
+      "commitCount":    { "threshold": 0.10 },
+      "totalRenderMs":  { "threshold": 0.15,  "note": "Epoch phase change re-render must stay tight" },
+      "p95RenderMs":    { "threshold": 0.15 },
+      "totalLongTaskMs":{ "threshold": 0,     "note": "Zero long tasks allowed during epoch transition" }
+    },
+    "withdrawal-queue-render": {
+      "commitCount":    { "threshold": 0.15 },
+      "totalRenderMs":  { "threshold": 0.20,  "note": "50-item withdrawal queue list render" },
+      "p95RenderMs":    { "threshold": 0.25 },
+      "totalLongTaskMs":{ "threshold": null }
     }
   }
 }
