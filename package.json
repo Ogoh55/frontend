@@ -13,7 +13,8 @@
     "migrate:down": "node scripts/migrate.js down",
     "migrate:status": "node scripts/migrate.js status",
     "migrate:check": "node scripts/migrate.js check",
-    "security:bounty-scope": "node scripts/security/validate-bounty-scope.mjs"
+    "security:bounty-scope": "node scripts/security/validate-bounty-scope.mjs",
+    "backtest:vault": "npx --yes tsx scripts/vault-backtest.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

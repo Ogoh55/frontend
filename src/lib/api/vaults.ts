@@ -19,7 +19,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -111,6 +114,9 @@ import { apiGet, apiPost } from "./client";
  * windows, and the deletion/export workflow this module mirrors.
  */
 
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -823,16 +829,4 @@ export interface ShadowState {
   mode: "shadow";
   /** Hypothetical NAV-per-share series, one point per complete epoch. */
   navSeries: ShadowNavPoint[];
-  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
-  epochs: EpochRecord[];
-  /** Side-by-side comparison data for the operator console/analytics. */
-  comparison: ShadowComparison;
-}
-
-/**
- * Promotion criteria that must be met before a shadow strategy can be
- * moved to live allocation. Evaluated by the backend promotion gate; the
- * adapter surfaces the thresholds so the operator console can display
- * progress and block promotion when unmet.
- */
-export interface
+  /** Shadow epoch record stream (never merged
