@@ -146,6 +146,22 @@ import { submitTransactionXdr } from "./stellar";
  *
  * Decoders MUST fail loudly on an unknown `schema_version` rather than
  * producing a plausible-looking wrong value.
+ * Admin corrections (issue #293) — four-eyes approval, append-only:
+ *   GET  /api/v1/vaults/{id}/corrections            → VaultCorrection[]
+ *   POST /api/v1/vaults/{id}/corrections            { type, reason, evidenceUrl, supersedes, payload } → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/approve  → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/reject   → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/apply    → VaultCorrection
+ *   POST /api/v1/vaults/{id}/corrections/{cid}/preview  → CorrectionPreview
+ *
+ *   Tranche waterfall (issue #295) — pure/deterministic, callable off-chain:
+ *   GET  /api/v1/vaults/{id}/tranches               → VaultTranche[]
+ *   POST /api/v1/vaults/{id}/tranches/preview       { epochPremium, realizedLoss, fees } → TrancheWaterfallResult
+ *
+ *   Idle-collateral lending yield (issue #296) — narrow adapter, degrades to
+ *   "no external yield" when the lending market is paused/unavailable:
+ *   GET  /api/v1/vaults/{id}/collateral-policy     → CollateralDeploymentPolicy
+ *   GET  /api/v1/vaults/{id}/collateral-yield      → CollateralYieldBreakdown
  *
  * NAV / share-price source of truth (issue #290):
  *
@@ -1199,6 +1215,11 @@ export interface VaultEpochLedgerEntry {
   navBefore: number; // USD per share at epoch start
   navAfter: number | null; // USD per share at epoch end; null while open
   feeTaken: number; // USD, management + performance fees taken in the epoch
+  /**
+   * Idle-collateral lending yield attributed to this epoch (issue #296).
+   * Tracked separately from strategy P&L so yield attribution stays auditable.
+   */
+  collateralYield?: CollateralYieldLedgerEntry;
 }
 
 /** The user's position in a vault. */
