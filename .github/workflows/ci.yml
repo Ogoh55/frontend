@@ -23,6 +23,10 @@ env:
   NEXT_PUBLIC_API_URL: http://localhost:8081
   NEXT_PUBLIC_STELLAR_NETWORK: testnet
   NEXT_PUBLIC_STELLAR_TESTNET_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+  # Pinned contract toolchain (equivalent of .nvmrc for Rust/Soroban).
+  RUST_TOOLCHAIN: "1.81.0"
+  SOROBAN_CLI_VERSION: "21.0.0"
+  WASM_TARGET: wasm32-unknown-unknown
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
@@ -102,6 +106,111 @@ jobs:
 
       - name: Verify ABI / event schema snapshot
         run: npm run abi:check
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # CONTRACTS
+  # Builds the vault contract workspace to WASM with a pinned Rust/Soroban
+  # toolchain, runs the contract unit + fuzz-lite suites, records the WASM
+  # hash, and exports the contract spec/ABI as a release artifact. Only runs
+  # when something under contracts/ changed (no-op otherwise).
+  # ───────────────────────────────────────────────────────────────────────────
+  contracts:
+    name: Contracts (build, test, spec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect contract changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            contracts:
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Skip (no contract changes)
+        if: steps.changes.outputs.contracts != 'true'
+        run: echo "No changes under contracts/ — skipping contract build."
+
+      - name: Install pinned Rust toolchain
+        if: steps.changes.outputs.contracts == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache Cargo dependencies
+        if: steps.changes.outputs.contracts == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('contracts/**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install pinned Soroban CLI
+        if: steps.changes.outputs.contracts == 'true'
+        run: cargo install --locked soroban-cli --version "$SOROBAN_CLI_VERSION"
+
+      - name: Build contracts to WASM (reproducible)
+        if: steps.changes.outputs.contracts == 'true'
+        working-directory: contracts
+        env:
+          # Deterministic build settings: strip debug info, no incremental
+          # compilation, and a fixed source path so the WASM hash is stable
+          # across consecutive runs.
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build -C debuginfo=0"
+        run: cargo build --release --locked --target "$WASM_TARGET"
+
+      - name: Run contract unit tests
+        if: steps.changes.outputs.contracts == 'true'
+        working-directory: contracts
+        run: cargo test --locked
+
+      - name: Run fuzz-lite tests
+        if: steps.changes.outputs.contracts == 'true'
+        working-directory: contracts
+        run: cargo test --locked --features fuzz-lite
+
+      - name: Record WASM hash
+        if: steps.changes.outputs.contracts == 'true'
+        working-directory: contracts
+        run: |
+          echo "## Contract WASM hashes" >> "$GITHUB_STEP_SUMMARY"
+          for wasm in target/${{ env.WASM_TARGET }}/release/*.wasm; do
+            [ -e "$wasm" ] || continue
+            hash=$(sha256sum "$wasm" | awk '{print $1}')
+            echo "- \`$(basename "$wasm")\`: \`$hash\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "$(basename "$wasm") $hash" >> wasm-hashes.txt
+          done
+          cat wasm-hashes.txt
+
+      - name: Export contract spec/ABI
+        if: steps.changes.outputs.contracts == 'true'
+        working-directory: contracts
+        run: |
+          mkdir -p spec
+          for wasm in target/${{ env.WASM_TARGET }}/release/*.wasm; do
+            [ -e "$wasm" ] || continue
+            name=$(basename "$wasm" .wasm)
+            soroban contract spec --wasm "$wasm" > "spec/$name.json"
+          done
+
+      - name: Upload contract artifacts (WASM + spec + hashes)
+        if: steps.changes.outputs.contracts == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vault-contracts-${{ github.sha }}
+          path: |
+            contracts/target/${{ env.WASM_TARGET }}/release/*.wasm
+            contracts/spec/
+            contracts/wasm-hashes.txt
+          retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
   # MIGRATIONS

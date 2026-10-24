@@ -9,3 +9,6 @@ files:
     # ICU MessageFormat: keeps {placeholders}, plurals and <tags> intact in the editor.
     type: json
     content_segmentation: 0
+    # Vault surfaces (#221) are namespaced under `vault.*` in the same catalog so
+    # they sync through this existing pipeline without colliding with the
+    # options-chain keys. No separate source file is needed.

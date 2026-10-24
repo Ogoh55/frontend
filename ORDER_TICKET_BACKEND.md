@@ -1,46 +1,73 @@
-# Order ticket — backend price-protection contract
+# Order Ticket Backend
 
-The professional order ticket (`OrderTicket` / `src/lib/orderTicket.ts`)
-enforces quote lifetime and max-slippage / limit-price checks **client-side
-today**. The backend should enforce the same rules so a compromised or
-stale client cannot bypass protection.
+This document describes the backend contract surface consumed by the operator
+console and the event indexer. It is the source of truth for the API shapes the
+frontend relies on.
 
-## Proposed request shape
+## Vaults
 
-`POST /api/v1/positions/open`
+- `GET /vaults` — list vaults with current parameters.
+- `GET /vaults/:id` — vault detail.
+
+## Governance: Timelock & Multisig Proposals (#224)
+
+Privileged vault changes (fee bps, fee recipient, capacity limits, strategy
+weights/parameters, oracle configuration, and upgrade authorization) are no
+longer operator actions. They must flow through an on-chain governance
+workflow:
+
+`propose` → approvals by the configured signer set → `queue` → mandatory delay
+→ `execute`, plus `cancel` and expiry for stale proposals.
+
+### Lifecycle
+
+| Stage     | Description                                                                 |
+|-----------|-----------------------------------------------------------------------------|
+| proposed  | Proposal created with an explicit typed action payload.                     |
+| approved  | Signers approve; approval count tracked against the multisig threshold.     |
+| queued    | Once threshold is met, the proposal is queued and an ETA is set.            |
+| executed  | After the mandatory delay elapses and before expiry, the action applies.    |
+| cancelled | A signer cancels a pending/queued proposal before execution.                |
+| expired   | A proposal not executed before its expiry is stale and cannot be executed.  |
+
+Approvals may be revoked before execution. The multisig threshold and delay are
+stored in contract storage and may only be changed through the same governance
+workflow (they cannot be lowered without a timelock).
+
+### Events
+
+Every stage emits an event consumable by the indexer:
+
+- `ProposalCreated`
+- `ProposalApproved`
+- `ProposalQueued`
+- `ProposalExecuted`
+- `ProposalCancelled`
+- `ProposalExpired`
+
+### Read-only proposal listings
+
+The operator console displays proposals read-only. The backend exposes:
+
+- `GET /vaults/:id/proposals?status=pending|executed` — list proposals.
+
+Each proposal payload:
 
 ```json
 {
-  "underlying": "XLM",
-  "strike": 0.12,
-  "expiry_days": 30,
-  "option_type": "call",
-  "position_type": "long",
-  "contracts": 1,
-  "max_slippage_bps": 50,
-  "limit_price": 0.0042,
-  "quote_id": "optional-opaque-id",
-  "quoted_premium": 0.0040
+  "id": "string",
+  "vaultId": "string",
+  "action": "setFeeBps | setFeeRecipient | setCapacityLimit | setStrategyWeights | setOracleConfig | authorizeUpgrade | setThreshold | setDelay",
+  "params": {},
+  "status": "proposed | approved | queued | executed | cancelled | expired",
+  "approvals": 0,
+  "threshold": 0,
+  "eta": "ISO-8601 timestamp or null",
+  "expiresAt": "ISO-8601 timestamp",
+  "createdAt": "ISO-8601 timestamp"
 }
 ```
 
-## Enforcement rules
-
-1. If `limit_price` is set:
-   - Long (buy): reject when fill premium **>** `limit_price`
-   - Short (write): reject when fill premium **<** `limit_price`
-2. If `max_slippage_bps` is set (and the fill is worse than `quoted_premium`):
-   - Reject when `|fill - quoted| / quoted * 10000 > max_slippage_bps`
-3. On rejection respond with **409**:
-
-```json
-{
-  "code": "SLIPPAGE_EXCEEDED",
-  "quoted": 0.0040,
-  "fill": 0.0045,
-  "message": "Fill exceeded client price protection"
-}
-```
-
-Until the backend implements this, the ticket still blocks worse fills
-locally via `checkPriceProtection()` before treating the order as filled.
+`approvals` is the current approval count and `eta` is the earliest execution
+time once queued. The console must not offer direct parameter editing; all
+changes are submitted as proposals.

@@ -104,6 +104,61 @@ import it. The route reads the signer from `ProposalSignerProvider`
 
 Wrap the app (or this route) in that provider once the wallet store is restored.
 
+## Timelock & multisig approval workflow (Issue #224)
+
+Vault parameter and upgrade changes are **not** applied by the wizard directly. The
+wizard only *submits* a proposal; the on-chain governance module enforces the rest.
+
+### Lifecycle
+
+```
+propose → approve (× threshold) → queue → delay elapses → execute
+                 ↘ cancel (any time before execute)
+                 ↘ expire (stale, never queued/executed in time)
+```
+
+| Stage | Who | Effect |
+| --- | --- | --- |
+| `propose` | any signer | Records a typed action payload; emits `ProposalCreated` |
+| `approve` | each signer | Adds an approval; emits `ProposalApproved`. Revocable before `queue` |
+| `queue` | any signer, once approvals ≥ threshold | Stamps `eta = now + delay`; emits `ProposalQueued` |
+| `execute` | anyone, after `eta` and before expiry | Applies the action; emits `ProposalExecuted` |
+| `cancel` | proposer or signer | Emits `ProposalCancelled` |
+| expiry | — | Proposals past their deadline emit `ProposalExpired` and can no longer execute |
+
+### Governance-only setters
+
+The following privileged setters are reachable **only** through an executed proposal —
+there is no separate admin entry point:
+
+- fee bps and fee recipient
+- capacity limits
+- strategy weights / strategy parameters
+- oracle configuration
+- contract upgrade authorization
+
+The threshold and delay parameters themselves are also changed only through the same
+workflow, so they cannot be lowered without a timelock.
+
+### Edge cases
+
+- Duplicate proposals for the same parameter are rejected.
+- Approvals can be revoked before `queue`; a signer-set change does not retroactively
+  invalidate already-queued proposals.
+- Execution before `eta`, after expiry, or a replay of an executed proposal reverts.
+- Replay protection is keyed by proposal id and survives upgrades.
+
+### Backend & operator console
+
+The vault registry/API exposes pending and executed proposals (with `eta` and approval
+count) so the operator console can display them **read-only**. Editing parameters directly
+from the console is out of scope for this issue.
+
+### Events
+
+`ProposalCreated`, `ProposalApproved`, `ProposalQueued`, `ProposalExecuted`,
+`ProposalCancelled`, `ProposalExpired` — all consumable by the indexer.
+
 ## Tests
 
 ```

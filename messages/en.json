@@ -138,6 +138,68 @@
     "hotkeysSoon": "Custom keyboard shortcut bindings coming soon. Export/import your bindings above."
   },
   "vaults": {
+    "title": "Vaults",
+    "intro": "Deposit collateral into covered-option vaults and earn premium from writers.",
+    "discovery": {
+      "heading": "Vault Discovery",
+      "empty": "No vaults available yet.",
+      "searchPlaceholder": "Search vaults",
+      "columns": {
+        "vault": "Vault",
+        "collateral": "Collateral",
+        "navPerShare": "NAV / Share",
+        "apy": "APY",
+        "tvl": "TVL",
+        "status": "Status"
+      }
+    },
+    "status": {
+      "active": "Active",
+      "paused": "Paused",
+      "closed": "Closed",
+      "pending": "Pending"
+    },
+    "deposit": {
+      "title": "Deposit",
+      "amountLabel": "Amount",
+      "amountPlaceholder": "0.00",
+      "sharesReceived": "Shares received",
+      "submit": "Deposit",
+      "submitting": "Depositing…",
+      "success": "Deposit submitted.",
+      "error": "Deposit failed. Please try again."
+    },
+    "withdraw": {
+      "title": "Withdraw",
+      "amountLabel": "Shares",
+      "amountPlaceholder": "0.00",
+      "assetsReceived": "Assets received",
+      "submit": "Withdraw",
+      "submitting": "Withdrawing…",
+      "success": "Withdrawal submitted.",
+      "error": "Withdrawal failed. Please try again."
+    },
+    "epoch": {
+      "heading": "Epoch History",
+      "empty": "No epochs recorded yet.",
+      "count": "{count, plural, =0 {No epochs} one {# epoch} other {# epochs}}",
+      "queueCount": "{count, plural, =0 {Queue empty} one {# queued} other {# queued}}",
+      "columns": {
+        "epoch": "Epoch",
+        "startedAt": "Started",
+        "endedAt": "Ended",
+        "duration": "Duration",
+        "navPerShare": "NAV / Share",
+        "yield": "Yield"
+      }
+    },
+    "disclaimer": "Vault returns are not guaranteed. Past performance does not predict future results.",
+    "errors": {
+      "loadFailed": "Failed to load vault data.",
+      "notFound": "Vault not found.",
+      "insufficientBalance": "Insufficient balance.",
+      "invalidAmount": "Enter a valid amount."
+    },
     "notifications": {
       "v1": {
         "epoch_opened": "Epoch {epoch} is open for deposits in {vault}.",
