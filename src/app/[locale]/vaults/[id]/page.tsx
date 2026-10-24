@@ -13,6 +13,7 @@ import {
   fetchVaultDetail,
   depositToVault,
   withdrawFromVault,
+  vaultStatusPolicy,
   acknowledgeDisclosure,
   fetchMyDisclosureAcknowledgements,
   hashDisclosureText,
@@ -99,6 +100,8 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
 
   const nav = vault?.sharePrice && vault.sharePrice > 0 ? vault.sharePrice : null;
 
+  const permittedActions = vault ? vaultStatusPolicy(vault.status).permittedActions : [];
+
   // Re-query acknowledgements whenever the connected wallet changes, and clear any
   // checkbox or rejection state that belonged to the previous wallet.
   useEffect(() => {
@@ -139,7 +142,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   };
 
   const handleDeposit = async () => {
-    if (!vault || !token || !address || !currentAck || gateReason) return;
+    if (!vault || !token || !address || !currentAck || gateReason || !permittedActions.includes("deposit")) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
     setTxStatus("pending");
@@ -166,7 +169,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   };
 
   const handleWithdraw = async () => {
-    if (!vault || !token) return;
+    if (!vault || !token || !permittedActions.includes("withdraw")) return;
     const shares = parseFloat(withdrawShares);
     if (isNaN(shares) || shares <= 0) return;
     setTxStatus("pending");
@@ -419,11 +422,16 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     <div style={{ marginBottom: 10 }}>Connect your wallet to deposit or withdraw.</div>
                     <WalletConnect />
                   </div>
+                ) : permittedActions.length === 0 ? (
+                  <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16, fontSize: 12, color: "var(--text-mid)", textAlign: "center" }}>
+                    <div style={{ marginBottom: 6, fontWeight: 600, color: "var(--text-hi)" }}>Vault {vaultStatusPolicy(vault.status).label}</div>
+                    <div>Deposits and withdrawals are not available in this status.</div>
+                  </div>
                 ) : (
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
                     {/* Tab switcher */}
                     <div style={{ display: "flex", borderBottom: "1px solid var(--border-default)" }}>
-                      {(["deposit", "withdraw"] as const).map(flow => (
+                      {(["deposit", "withdraw"] as const).filter(flow => permittedActions.includes(flow)).map(flow => (
                         <button key={flow} onClick={() => { setActiveFlow(activeFlow === flow ? null : flow); setTxStatus(null); }}
                           style={{
                             flex: 1, padding: "10px 0", border: "none", cursor: "pointer",
@@ -438,7 +446,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       ))}
                     </div>
 
-                    {activeFlow === "deposit" && (
+                    {activeFlow === "deposit" && permittedActions.includes("deposit") && (
                       <div style={{ padding: 16 }}>
                         {acks === null && (
                           <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{t("checking")}</div>
@@ -537,7 +545,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       </div>
                     )}
 
-                    {activeFlow === "withdraw" && (
+                    {activeFlow === "withdraw" && permittedActions.includes("withdraw") && (
                       <div style={{ padding: 16 }}>
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
                           Withdrawal requests are queued and processed at the end of the current epoch.

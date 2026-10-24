@@ -40,8 +40,6 @@ import { apiGet, ApiError } from "./client";
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
-/** `full` is derived from TVL vs. capacity in `effectiveStatus`; the backend may also report it. */
-export type VaultStatus = "open" | "paused" | "closed_to_deposits" | "full";
 
 /**
  * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
@@ -63,6 +61,75 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /**
  * Summary shown on the /vaults listing page. Fields the backend does not
  * serve yet are `null` and must render as absent, never as zero.
@@ -72,6 +139,7 @@ export interface VaultSummary {
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number | null;
   /** APY methodology note shown in tooltip. */
@@ -84,7 +152,6 @@ export interface VaultSummary {
   currentExpiry: string | null; // ISO date
   riskRating: RiskRating;
   description: string;
-  status: VaultStatus;
   /** Epoch length (tenor) in days. */
   epochDays: number;
   /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
@@ -110,10 +177,11 @@ export const VAULT_STRATEGY_LABELS: Record<VaultStrategy, string> = {
 };
 
 export const VAULT_STATUS_LABELS: Record<VaultStatus, string> = {
-  open:               "Open",
-  paused:             "Paused",
-  closed_to_deposits: "Closed to deposits",
-  full:               "Full",
+  draft:        "Draft",
+  open:         "Open",
+  paused:       "Paused",
+  winding_down: "Winding Down",
+  closed:       "Closed",
 };
 
 export const VAULT_RISK_LABELS: Record<RiskRating, string> = {
@@ -331,6 +399,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    status: "open",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -339,7 +408,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "medium",
     description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    status: "open",
     epochDays: 7,
     maxDrawdownPct: 0.07,
     currentEpoch: 47,
@@ -368,6 +436,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "BTC Cash-Secured Put",
     underlying: "BTC",
     strategy: "cash_secured_put",
+    status: "open",
     apy: 0.15,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
     tvl: 1850000,
@@ -376,7 +445,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-17",
     riskRating: "high",
     description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    status: "open",
     epochDays: 30,
     maxDrawdownPct: 0.21,
     currentEpoch: 18,
@@ -403,6 +471,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "ETH Iron Condor",
     underlying: "ETH",
     strategy: "iron_condor",
+    status: "open",
     apy: 0.18,
     apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
     tvl: 620000,
@@ -411,7 +480,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-10",
     riskRating: "low",
     description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    status: "open",
     epochDays: 30,
     maxDrawdownPct: null,
     currentEpoch: 11,
@@ -437,6 +505,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "SOL Wheel",
     underlying: "SOL",
     strategy: "wheel",
+    status: "winding_down",
     apy: 0.31,
     apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
     tvl: 98000,
@@ -445,7 +514,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "high",
     description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    status: "closed_to_deposits",
     epochDays: 7,
     maxDrawdownPct: null,
     currentEpoch: 28,
@@ -602,88 +670,4 @@ export async function fetchVaults(token?: string | null): Promise<VaultSummary[]
 
 export async function fetchVaultDetail(id: string, token?: string | null): Promise<VaultDetail | null> {
   try {
-    return await apiGet<VaultDetail>(`/api/v1/vaults/${encodeURIComponent(id)}`, token ?? null);
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404) return null;
-    throw e;
-  }
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string,
-  disclosure: { wallet: string; disclosureVersion: string }
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount, disclosure_version }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock server-side gate: the live backend derives the wallet from the bearer token.
-  assertDisclosureAccepted(disclosure.wallet, disclosure.disclosureVersion);
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  _id: string,
-  _shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  throw new Error("Vault withdrawals are not yet available");
-}
-
-// ---------------------------------------------------------------------------
-// Cross-strategy allocator policy (pure)
-// See docs/vault-allocator.md for the rebalancing policy semantics.
-// ---------------------------------------------------------------------------
-
-/** One child vault the allocator holds shares of. */
-export interface AllocatorChild {
-  vaultId: string;
-  /** Target weight of allocator NAV, 0–1. */
-  targetWeight: number;
-  /** Absolute weight drift (0–1) tolerated before a rebalance is triggered. */
-  driftBand: number;
-}
-
-/** Governed, versioned target-weight configuration for an allocator. */
-export interface AllocatorPolicy {
-  /** Bumped on every governed change so past rebalances stay auditable. */
-  version: number;
-  children: AllocatorChild[];
-}
-
-/** Marked state of one child holding, as seen by the allocator. */
-export interface AllocatorHolding {
-  vaultId: string;
-  /** USD value of shares held, marked at the child's last published epoch NAV. */
-  value: number;
-  /** False when the child has not published NAV for its current epoch. */
-  navPublished: boolean;
-  paused: boolean;
-}
-
-export interface AllocatorDrift {
-  vaultId: string;
-  currentWeight: number;
-  drift: number;
-  breached: boolean;
-  /** Child can be traded now (NAV published for current epoch and not paused). */
-  tradeable: boolean;
-}
-
-export interface AllocatorNav {
-  /** Sum of marked holding values, USD. */
-  nav: number;
-  /** True when any holding is priced from a stale mark or cannot be traded. */
-  degraded: boolean;
-  untradeableVaultIds: string[];
-}
-
-const WEIGHT_SUM_TOLERANCE = 1e-9;
-
-/**
- * Returns human-readable policy errors. An empty array means the policy is valid.
- * `allocatorIds`
+    return await apiGet<VaultDetail>(`/api/v1

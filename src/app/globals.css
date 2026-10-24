@@ -1,3 +1,43 @@
+/* Visually hidden but still read by screen readers (live regions). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/*
+ * Motion policy. Every flash, transition and CSS animation goes through
+ * these rules. `data-motion` is set from the resolved preference
+ * (src/lib/a11y/motion.ts). Before hydration, or with JS off, the OS
+ * `prefers-reduced-motion` query covers the same cases unless the user has
+ * explicitly chosen "full". Inline styles need !important to be overridden.
+ */
+html[data-motion="reduce"] *,
+html[data-motion="reduce"] *::before,
+html[data-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="full"]) *,
+  html:not([data-motion="full"]) *::before,
+  html:not([data-motion="full"]) *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /*
   Design tokens. Semantic --color-* variables are the source of truth; the
   short legacy names (--bg, --call, --text-hi, ...) alias them so existing
