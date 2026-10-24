@@ -1212,6 +1212,29 @@ export interface PositionGreeks {
 }
 
 /**
+ * Per-vault premium disposition policy for an epoch.
+ *
+ * - `COMPOUND`: collected premiums are added to vault assets before the NAV
+ *   snapshot is committed, raising NAV-per-share for all holders.
+ * - `DISTRIBUTE`: collected premiums are moved to a distribution claim account
+ *   and every snapshot share holder can claim their pro-rata amount on demand.
+ *
+ * The mode is fixed at epoch open and immutable for that epoch, so it cannot
+ * be chosen after the epoch outcome is known.
+ */
+export type PremiumPolicy = "COMPOUND" | "DISTRIBUTE";
+
+/**
+ * Documented handling of unclaimed DISTRIBUTE premiums after the claim deadline.
+ *
+ * - `roll_to_next_epoch`: unclaimed amounts are carried into the next epoch's
+ *   distribution pool (default).
+ * - `return_to_treasury`: unclaimed amounts are swept to the protocol treasury
+ *   once the deadline passes.
+ */
+export type UnclaimedPolicy = "roll_to_next_epoch" | "return_to_treasury";
+
+/**
  * Execution mode of a vault strategy.
  *
  * - `live`: real capital is committed and real option orders are submitted.
@@ -1392,6 +1415,10 @@ export interface VaultSummary {
   state: VaultState;
   /** True while an unresolved loss event exists (deposits disabled). */
   depositsDisabled: boolean;
+  /** Premium disposition policy fixed for the current epoch. */
+  premiumPolicy: PremiumPolicy;
+  /** How unclaimed DISTRIBUTE premiums are handled after the deadline. */
+  unclaimedPolicy: UnclaimedPolicy;
   /** Epoch length (tenor) in days. */
   epochDays: number;
   /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
@@ -1605,6 +1632,8 @@ export interface EpochRecord {
   pnlPct: number; // epoch return, positive = profit for depositors
   /** Structured loss event recognized at this epoch's close, if any. */
   lossEvent: VaultLossEvent | null;
+  /** Policy that was fixed at this epoch's open. */
+  premiumPolicy: PremiumPolicy;
 }
 
 /**
@@ -1630,6 +1659,36 @@ export interface VaultLossEvent {
   badDebt: number;
   /** ISO timestamp the loss was recognized. */
   recognizedAt: string;
+}
+
+/**
+ * A DISTRIBUTE-mode epoch the user can claim from.
+ *
+ * Claims are index-based: the contract tracks a cumulative
+ * `premiumPerShare` accumulator and each holder's `claimedPerShare`
+ * checkpoint, so cost does not scale with holder count.
+ */
+export interface DistributionClaim {
+  epochNumber: number;
+  /** Cumulative premium-per-share accumulator at the epoch snapshot. */
+  premiumPerShare: number;
+  /** Amount the connected user can still claim, in USD. */
+  claimable: number;
+  /** ISO deadline after which unclaimed funds follow `unclaimedPolicy`. */
+  deadline: string;
+  /** Whether the user has already claimed this epoch. */
+  claimed: boolean;
+}
+
+/** The user's position in a vault. */
+export interface UserVaultPosition {
+  shares: number;
+  shareValue: number; // current USD value per share
+  totalValue: number;
+  accruedPremium: number;
+  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
+  /** DISTRIBUTE-mode epochs with outstanding or historical claims. */
+  distributions: DistributionClaim[];
 }
 
 /** Schema version of VaultEpochLedgerEntry. Bump on any breaking field change. */
