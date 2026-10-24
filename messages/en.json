@@ -140,5 +140,26 @@
   "notFound": {
     "title": "Page not found",
     "back": "Back to the terminal"
+  },
+  "vaultDisclosure": {
+    "title": "Vault Risk Disclosure",
+    "checking": "Checking disclosure status…",
+    "p1": "Option-writing vaults sell call or put options on the underlying asset to earn premium. Premium income is not guaranteed and may not offset losses.",
+    "p2": "Assignment risk: the vault may be assigned at the strike price. Put vaults may be forced to buy the underlying above its market value. Call vaults may have upside capped at the strike.",
+    "p3": "Loss scenarios: a sharp move in the underlying can produce losses larger than the premium collected. You can lose part or all of your deposit.",
+    "p4": "Vault smart contracts are unaudited and may contain defects. Deposits are exposed to smart contract risk.",
+    "p5": "Past APY does not predict future returns. Deposit only funds you can afford to lose.",
+    "acceptRisks": "I have read the disclosure above and accept its risks.",
+    "attestJurisdiction": "I confirm I am not a resident of, and am not acting on behalf of a person in, a jurisdiction where these vaults are restricted.",
+    "accept": "Accept disclosure",
+    "accepting": "Recording acceptance…",
+    "acceptedAt": "Accepted {date}",
+    "versionLabel": "Disclosure version {version}",
+    "depositBlocked": "Deposit unavailable",
+    "reason": {
+      "DISCLOSURE_NOT_ACCEPTED": "Accept the current risk disclosure to deposit.",
+      "DISCLOSURE_VERSION_STALE": "The risk disclosure has been updated. Review and accept the new version to continue.",
+      "JURISDICTION_NOT_ELIGIBLE": "Vault deposits are not available for the jurisdiction you declared. If you believe this is an error, contact support."
+    }
   }
 }
