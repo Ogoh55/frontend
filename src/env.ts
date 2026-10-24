@@ -60,6 +60,24 @@ export const activeStellarNetwork = stellarNetworkConfig[env.NEXT_PUBLIC_STELLAR
 /** Uppercase network suffix used to select a per-network contract ID. */
 export const stellarNetworkSuffix = env.NEXT_PUBLIC_STELLAR_NETWORK === "mainnet" ? "MAINNET" : "TESTNET";
 
+/**
+ * Live/mock flag for the vault data layer (issue #276).
+ *
+ * When `false` (the default) the vault adapter serves mock data and the cache
+ * never revalidates against the backend. When `true` the adapter performs real
+ * reads and the cache applies the staleness/revalidation policy. Kept as a
+ * single derived flag so the read-path cache and the mock→live migration share
+ * one source of truth.
+ */
+export const vaultLiveDataEnabled = parsed.NEXT_PUBLIC_VAULT_LIVE_DATA === "true";
+
+/**
+ * Staleness window (ms) for cached NAV reads before a background revalidation
+ * is triggered. Configurable so degraded-mode rollouts can widen it without a
+ * code change.
+ */
+export const vaultNavStaleMs = Number(parsed.NEXT_PUBLIC_VAULT_NAV_STALE_MS ?? 30_000);
+
 /** Contract key → configured contract ID, or undefined when not deployed. */
 export type GovernableContractKey =
   | "governor"

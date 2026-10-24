@@ -504,6 +504,262 @@ export const VAULT_MAX_PAGE_SIZE = 100;
 export const VAULT_DEFAULT_PAGE_SIZE = 25;
 
 /**
+ * Stable, versioned moneyness band used as the strike-bucket key for
+ * concentration limits. Buckets are enums (not free strings) so the sizing
+ * step and contract enforcement can never disagree on a key.
+ */
+export type StrikeBucket = "deep_otm" | "otm" | "atm" | "itm" | "deep_itm";
+
+/**
+ * Declarative concentration limits for a vault, each expressed as a fraction
+ * of the committed epoch NAV (0–1). Evaluated by the shared
+ * `evaluateExposure()` helper so sizing and enforcement cannot drift.
+ */
+export interface ExposureLimits {
+  /** Max fraction of NAV written against a single underlying. */
+  perUnderlying: number;
+  /** Max fraction of NAV written into a single strike bucket. */
+  perStrikeBucket: number;
+  /** Max fraction of NAV written into a single expiry. */
+  perExpiry: number;
+}
+
+/** Current written exposure, keyed by the same dimensions as the limits. */
+export interface ExposureState {
+  /** Committed epoch NAV used as the denominator (no live mark). */
+  nav: number;
+  byUnderlying: Record<string, number>;
+  byStrikeBucket: Partial<Record<StrikeBucket, number>>;
+  byExpiry: Record<string, number>;
+}
+
+/** A strategy intent requesting a written notional before sizing. */
+export interface StrategyIntent {
+  underlying: string;
+  strikeBucket: StrikeBucket;
+  expiry: string; // ISO date
+  requestedNotional: number;
+}
+
+/** Recorded clamp decision for observability. */
+export interface SizingDecision {
+  approvedNotional: number;
+  clamped: boolean;
+  /** Tightest binding dimension, or null when unclamped. */
+  reason: "perUnderlying" | "perStrikeBucket" | "perExpiry" | null;
+  /** Remaining headroom (in notional) on the binding dimension. */
+  remainingHeadroom: number;
+}
+
+/**
+ * Transfer policy for vault LP shares.
+ *
+ * - `OPEN`        — shares are freely transferable (current default).
+ * - `ALLOWLISTED` — transfers are permitted only when the recipient is on
+ *                   the vault's allowlist (and not on the denylist).
+ * - `BLOCKED`     — all share transfers are disabled. Mint (deposit) and
+ *                   burn (redeem / forced burn) remain permitted so a
+ *                   restriction can never trap a depositor's principal.
+ */
+export type TransferPolicy = "OPEN" | "ALLOWLISTED" | "BLOCKED";
+
+/**
+ * A single allowlist entry with explicit provenance so an entry's origin is
+ * auditable. Entries are versioned; the vault's `allowlistVersion` is bumped
+ * on every mutation and recorded alongside the operator that made it.
+ */
+export interface AllowlistEntry {
+  address: string;
+  /** Monotonic version at which this entry was added. */
+  version: number;
+  /** Operator/backend identity that added the entry. */
+  addedBy: string;
+  /** ISO timestamp of the addition. */
+  addedAt: string;
+  /** Optional jurisdiction tag driving eligibility gating. */
+  jurisdiction?: string;
+}
+
+/**
+ * Audited record of a policy or allowlist mutation. Surfaced in the
+ * depositor-facing disclosure and transparency surfaces.
+ */
+export interface ComplianceAuditRecord {
+  id: string;
+  kind: "policy_change" | "allowlist_add" | "allowlist_remove";
+  /** Resulting allowlist version after the mutation. */
+  version: number;
+  address?: string;
+  /** Previous policy, for `policy_change` records. */
+  previousPolicy?: TransferPolicy;
+  /** New policy, for `policy_change` records. */
+  policy?: TransferPolicy;
+  actor: string;
+  /** ISO timestamp at which the change takes effect (timelock). */
+  effectiveAt: string;
+  createdAt: string;
+}
+
+/**
+ * Compliance hook surface for the backend compliance service. The contract
+ * never reaches out to an oracle itself; instead the backend supplies a
+ * pre-transfer advisory and consumes a post-settlement reconciliation feed.
+ */
+export interface ComplianceHooks {
+  /**
+   * Pre-transfer advisory. Returns `true` to allow, `false` to deny. The
+   * contract treats a missing hook as allow (policy still applies).
+   */
+  preTransferCheck?: (from: string, to: string, amount: number) => boolean;
+  /**
+   * Post-settlement reconciliation feed. Invoked after a transfer settles so
+   * the backend can reconcile screening decisions.
+   */
+  onSettled?: (event: TransferSettlementEvent) => void;
+}
+
+/** Emitted to the reconciliation feed after a transfer settles. */
+export interface TransferSettlementEvent {
+  vaultId: string;
+  from: string;
+  to: string;
+  amount: number;
+  policy: TransferPolicy;
+  allowlistVersion: number;
+  /** ISO timestamp of settlement. */
+  settledAt: string;
+}
+
+/**
+ * Distinct, documented error code for a transfer rejected by the allowlist.
+ * Part of the error taxonomy; surfaced verbatim to callers.
+ */
+export const ERR_TRANSFER_NOT_ALLOWLISTED = "VAULT_TRANSFER_NOT_ALLOWLISTED";
+/** Distinct error code for a transfer rejected by the denylist. */
+export const ERR_TRANSFER_DENYLISTED = "VAULT_TRANSFER_DENYLISTED";
+/** Distinct error code for a transfer rejected because the policy is BLOCKED. */
+export const ERR_TRANSFER_BLOCKED = "VAULT_TRANSFER_BLOCKED";
+
+/** Result of a `can_transfer` evaluation. */
+export interface TransferDecision {
+  allowed: boolean;
+  /** Error code when `allowed` is false, else null. */
+  code: string | null;
+}
+
+/**
+ * Transfer-restriction configuration for a vault's LP shares.
+ */
+export interface TransferRestrictions {
+  policy: TransferPolicy;
+  /** Monotonic version, bumped on every policy/allowlist mutation. */
+  allowlistVersion: number;
+  allowlist: AllowlistEntry[];
+  /** Denylist addresses. An address on both lists is denied (deny wins). */
+  denylist: string[];
+  /** Addresses exempt from restrictions (contract, redemption queue). */
+  exempt: string[];
+}
+
+/**
+ * Single source of truth for whether a share transfer is permitted. Every
+ * transfer path (including future batch paths) must route through this.
+ *
+ * Exempt addresses (the contract itself and the redemption queue) bypass the
+ * policy so redemptions and forced burns always succeed. An address present
+ * on both the allowlist and denylist is denied deterministically.
+ */
+export function can_transfer(
+  restrictions: TransferRestrictions,
+  from: string,
+  to: string,
+  hooks?: ComplianceHooks,
+): TransferDecision {
+  // Exempt endpoints (contract, redemption queue) always pass.
+  if (restrictions.exempt.includes(from) || restrictions.exempt.includes(to)) {
+    return { allowed: true, code: null };
+  }
+
+  if (restrictions.policy === "BLOCKED") {
+    return { allowed: false, code: ERR_TRANSFER_BLOCKED };
+  }
+
+  if (restrictions.policy === "ALLOWLISTED") {
+    // Deny wins: an address on both lists is denied.
+    if (restrictions.denylist.includes(to)) {
+      return { allowed: false, code: ERR_TRANSFER_DENYLISTED };
+    }
+    const allowed = restrictions.allowlist.some((e) => e.address === to);
+    if (!allowed) {
+      return { allowed: false, code: ERR_TRANSFER_NOT_ALLOWLISTED };
+    }
+  }
+
+  // Pre-transfer advisory from the backend compliance service.
+  if (hooks?.preTransferCheck && !hooks.preTransferCheck(from, to, 0)) {
+    return { allowed: false, code: ERR_TRANSFER_DENYLISTED };
+  }
+
+  return { allowed: true, code: null };
+}
+
+/**
+ * Apply an allowlist addition, returning the updated restrictions and an
+ * audited record. The version is bumped so provenance is auditable.
+ */
+export function addAllowlistEntry(
+  restrictions: TransferRestrictions,
+  entry: Omit<AllowlistEntry, "version">,
+  actor: string,
+  now: string = new Date().toISOString(),
+): { restrictions: TransferRestrictions; audit: ComplianceAuditRecord } {
+  const version = restrictions.allowlistVersion + 1;
+  const next: TransferRestrictions = {
+    ...restrictions,
+    allowlistVersion: version,
+    allowlist: [...restrictions.allowlist, { ...entry, version }],
+  };
+  const audit: ComplianceAuditRecord = {
+    id: `allowlist_add:${entry.address}:${version}`,
+    kind: "allowlist_add",
+    version,
+    address: entry.address,
+    actor,
+    effectiveAt: now,
+    createdAt: now,
+  };
+  return { restrictions: next, audit };
+}
+
+/**
+ * Apply an allowlist removal, returning the updated restrictions and an
+ * audited record. The version is bumped so provenance is auditable.
+ */
+export function removeAllowlistEntry(
+  restrictions: TransferRestrictions,
+  address: string,
+  actor: string,
+  now: string = new Date().toISOString(),
+): { restrictions: TransferRestrictions; audit: ComplianceAuditRecord } {
+  const version = restrictions.allowlistVersion + 1;
+  const next: TransferRestrictions = {
+    ...restrictions,
+    allowlistVersion: version,
+    allowlist: restrictions.allowlist.filter((e) => e.address !== address),
+  };
+  const audit: ComplianceAuditRecord = {
+    id: `allowlist_remove:${address}:${version}`,
+    kind: "allowlist_remove",
+    version,
+    address,
+    actor,
+    effectiveAt: now,
+    createdAt: now,
+  };
+  return { restrictions: next, audit };
+}
+
+/**
  * Execution mode of a vault strategy.
  *
  * - `live`: real capital is committed and real option orders are submitted.
