@@ -52,7 +52,8 @@ const clientEnvSchema = z.object({
   NEXT_PUBLIC_APP_VERSION: z.string().optional(),
   NEXT_PUBLIC_BUILD_SHA: z.string().optional(),
 
-  // Vaults data source (src/lib/api/vaults.ts). Unset or "" means the mock fixtures.
+  // Vaults data source (src/lib/api/vaults.ts). Unset or "" means the mock fixtures;
+  // anything but "live" uses the mock.
   NEXT_PUBLIC_VAULTS: z.preprocess(
     (value) => (value === "" ? undefined : value),
     z.enum(["mock", "live"]).optional()

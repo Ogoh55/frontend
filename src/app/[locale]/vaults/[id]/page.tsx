@@ -28,6 +28,7 @@ import {
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
+import { VaultAuditLog } from "../../../../components/VaultAuditLog";
 import { VaultGovernancePanel } from "../../../../components/VaultGovernancePanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
@@ -601,7 +602,3 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                           {withdrawShares && !isNaN(parseFloat(withdrawShares)) && parseFloat(withdrawShares) > 0 && (
                             <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
                               ≈ ${(parseFloat(withdrawShares) * vault.sharePrice).toFixed(2)} USDC at current NAV
-                            </div>
-                          )}
-                        </div>
-                        <div style={{ marginBottom:
