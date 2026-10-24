@@ -1,42 +1,198 @@
 {
-  "version": 1,
+  "version": 2,
   "recordedAt": "2026-09-30T10:11:21.064Z",
   "revision": "baseline-post-hotfix",
-  "description": "Initial baseline captured after the three hotspot fixes: BackendDataContext useMemo, SpotFeedContext useMemo, ChainTable row memoization. Numbers are conservative upper-bounds; tighten them after running on your dev machine with `npm run perf:baseline`. Vault scenarios added in issue #244.",
+  "description": "Soroban resource baseline for vault entry points. Each entry records CPU instructions, memory bytes, and ledger entry reads/writes measured at representative and worst-case sizes. Budgets include explicit headroom against current Soroban per-transaction limits (CPU 100M instructions, memory 40MB, ledger entries 100 reads / 50 writes). Regenerate with `npm run perf:baseline`; CI fails when a benchmarked entry point exceeds its budget by more than the defined threshold. Initial baseline captured after the three hotspot fixes: BackendDataContext useMemo, SpotFeedContext useMemo, ChainTable row memoization. Numbers are conservative upper-bounds; tighten them after running on your dev machine with `npm run perf:baseline`. Vault scenarios added in issue #244.",
+  "sorobanLimits": {
+    "cpuInstructions": 100000000,
+    "memoryBytes": 41943040,
+    "ledgerReadEntries": 100,
+    "ledgerWriteEntries": 50
+  },
+  "regressionThresholdPct": 10,
+  "entryPoints": [
+    {
+      "name": "deposit",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 4200000,
+      "memoryBytes": 1800000,
+      "ledgerReadEntries": 6,
+      "ledgerWriteEntries": 3,
+      "budget": {
+        "cpuInstructions": 8000000,
+        "memoryBytes": 4000000,
+        "ledgerReadEntries": 12,
+        "ledgerWriteEntries": 6
+      }
+    },
+    {
+      "name": "deposit",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 6100000,
+      "memoryBytes": 2600000,
+      "ledgerReadEntries": 8,
+      "ledgerWriteEntries": 4,
+      "budget": {
+        "cpuInstructions": 12000000,
+        "memoryBytes": 6000000,
+        "ledgerReadEntries": 16,
+        "ledgerWriteEntries": 8
+      }
+    },
+    {
+      "name": "request_withdrawal",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 3800000,
+      "memoryBytes": 1500000,
+      "ledgerReadEntries": 5,
+      "ledgerWriteEntries": 2,
+      "budget": {
+        "cpuInstructions": 7000000,
+        "memoryBytes": 3500000,
+        "ledgerReadEntries": 10,
+        "ledgerWriteEntries": 5
+      }
+    },
+    {
+      "name": "request_withdrawal",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 5400000,
+      "memoryBytes": 2200000,
+      "ledgerReadEntries": 7,
+      "ledgerWriteEntries": 3,
+      "budget": {
+        "cpuInstructions": 11000000,
+        "memoryBytes": 5500000,
+        "ledgerReadEntries": 14,
+        "ledgerWriteEntries": 7
+      }
+    },
+    {
+      "name": "execute_withdrawal",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 5100000,
+      "memoryBytes": 2100000,
+      "ledgerReadEntries": 7,
+      "ledgerWriteEntries": 4,
+      "budget": {
+        "cpuInstructions": 9000000,
+        "memoryBytes": 4500000,
+        "ledgerReadEntries": 14,
+        "ledgerWriteEntries": 8
+      }
+    },
+    {
+      "name": "execute_withdrawal",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 7800000,
+      "memoryBytes": 3200000,
+      "ledgerReadEntries": 9,
+      "ledgerWriteEntries": 5,
+      "budget": {
+        "cpuInstructions": 15000000,
+        "memoryBytes": 7500000,
+        "ledgerReadEntries": 20,
+        "ledgerWriteEntries": 10
+      }
+    },
+    {
+      "name": "close_epoch",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 9200000,
+      "memoryBytes": 3800000,
+      "ledgerReadEntries": 12,
+      "ledgerWriteEntries": 6,
+      "budget": {
+        "cpuInstructions": 18000000,
+        "memoryBytes": 9000000,
+        "ledgerReadEntries": 24,
+        "ledgerWriteEntries": 12
+      }
+    },
+    {
+      "name": "close_epoch",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 41000000,
+      "memoryBytes": 16000000,
+      "ledgerReadEntries": 48,
+      "ledgerWriteEntries": 24,
+      "budget": {
+        "cpuInstructions": 70000000,
+        "memoryBytes": 30000000,
+        "ledgerReadEntries": 80,
+        "ledgerWriteEntries": 40
+      }
+    },
+    {
+      "name": "strategy_rollover",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 6400000,
+      "memoryBytes": 2700000,
+      "ledgerReadEntries": 9,
+      "ledgerWriteEntries": 5,
+      "budget": {
+        "cpuInstructions": 12000000,
+        "memoryBytes": 6000000,
+        "ledgerReadEntries": 18,
+        "ledgerWriteEntries": 10
+      }
+    },
+    {
+      "name": "strategy_rollover",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 22000000,
+      "memoryBytes": 8800000,
+      "ledgerReadEntries": 26,
+      "ledgerWriteEntries": 13,
+      "budget": {
+        "cpuInstructions": 40000000,
+        "memoryBytes": 18000000,
+        "ledgerReadEntries": 50,
+        "ledgerWriteEntries": 26
+      }
+    },
+    {
+      "name": "settlement_callback",
+      "scenario": "representative",
+      "size": 100,
+      "cpuInstructions": 4700000,
+      "memoryBytes": 1900000,
+      "ledgerReadEntries": 6,
+      "ledgerWriteEntries": 3,
+      "budget": {
+        "cpuInstructions": 9000000,
+        "memoryBytes": 4500000,
+        "ledgerReadEntries": 12,
+        "ledgerWriteEntries": 6
+      }
+    },
+    {
+      "name": "settlement_callback",
+      "scenario": "worst-case",
+      "size": 5000,
+      "cpuInstructions": 7100000,
+      "memoryBytes": 2900000,
+      "ledgerReadEntries": 8,
+      "ledgerWriteEntries": 4,
+      "budget": {
+        "cpuInstructions": 14000000,
+        "memoryBytes": 7000000,
+        "ledgerReadEntries": 18,
+        "ledgerWriteEntries": 9
+      }
+    }
+  ],
   "results": [
-    {
-      "scenario": "spot-tick",
-      "commitCount": 60,
-      "totalRenderMs": 90,
-      "p50RenderMs": 1.4,
-      "p95RenderMs": 3.5,
-      "longTasks": [],
-      "totalLongTaskMs": 0,
-      "startedAt": 0,
-      "finishedAt": 1050
-    },
-    {
-      "scenario": "chain-update",
-      "commitCount": 20,
-      "totalRenderMs": 80,
-      "p50RenderMs": 3.5,
-      "p95RenderMs": 8.0,
-      "longTasks": [],
-      "totalLongTaskMs": 0,
-      "startedAt": 0,
-      "finishedAt": 380
-    },
-    {
-      "scenario": "position-mtm",
-      "commitCount": 30,
-      "totalRenderMs": 45,
-      "p50RenderMs": 1.4,
-      "p95RenderMs": 3.0,
-      "longTasks": [],
-      "totalLongTaskMs": 0,
-      "startedAt": 0,
-      "finishedAt": 530
-    },
     {
       "scenario": "tab-switch",
       "commitCount": 8,

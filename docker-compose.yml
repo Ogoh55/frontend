@@ -6,10 +6,12 @@ version: "3.9"
 # Profiles:
 #   (default)  — frontend only, mock mode enabled (no backend required)
 #   full       — frontend + backend API + internal services (indexer, scheduler, keeper)
+#   fork       — mainnet-state fork + chaos-testing environment (issue #228)
 #
 # Quick start:
 #   docker compose up                     # mock mode, frontend only
 #   docker compose --profile full up      # with real backend
+#   docker compose --profile fork up      # fork + chaos harness (see scripts/fork/README.md)
 #
 # Runtime overrides (copy .env.compose.example to .env.compose and edit):
 #   ZENITH_BACKEND_IMAGE   backend image tag (default: ghcr.io/zenith-options/backend:latest)
@@ -191,8 +193,83 @@ services:
       - vault-egress
     restart: unless-stopped
 
-volumes:
-  zenith-db-data:
+  # -------------------------------------------------------------------------
+  # Fork + chaos environment (issue #228).
+  #
+  # Two-stage design so a snapshot can be pinned and shared:
+  #   1. `snapshot` captures public ledger state at a chosen sequence into a
+  #      named volume (no secrets — only public ledger data).
+  #   2. `fork-rpc` boots a local Soroban RPC that serves that snapshot, and
+  #      `chaos-runner` deploys the compiled vault suite against it and runs
+  #      the scripted chaos scenarios with fault injection at the RPC boundary.
+  #
+  # Determinism: SNAPSHOT_SEED drives both the fault schedule and the ledger
+  # timestamps used for epoch boundaries, so the same snapshot + seed yields
+  # the same scenario outcome. The RPC is bound to localhost only and refuses
+  # to start if FORK_RPC_URL points at a public/production endpoint.
+  # -------------------------------------------------------------------------
+  snapshot:
+    profiles: ["fork"]
+    image: ${ZENITH_FORK_IMAGE:-ghcr.io/zenith-options/fork-tooling:latest}
+    build:
+      context: .
+      dockerfile: scripts/fork/Dockerfile
+    command: ["snapshot", "capture"]
+    environment:
+      SNAPSHOT_LEDGER_SEQ: ${SNAPSHOT_LEDGER_SEQ:-0}
+      SNAPSHOT_OUT: /snapshots
+      # Public read-only source; never a signing key.
+      SNAPSHOT_SOURCE_RPC: ${SNAPSHOT_SOURCE_RPC:-https://soroban-testnet.stellar.org}
+    volumes:
+      - fork-snapshots:/snapshots
+    restart: "no"
+
+  fork-rpc:
+    profiles: ["fork"]
+    image: ${ZENITH_FORK_IMAGE:-ghcr.io/zenith-options/fork-tooling:latest}
+    build:
+      context: .
+      dockerfile: scripts/fork/Dockerfile
+    command: ["rpc", "serve"]
+    depends_on:
+      snapshot:
+        condition: service_completed_successfully
+    environment:
+      SNAPSHOT_IN: /snapshots
+      SNAPSHOT_SEED: ${SNAPSHOT_SEED:-1}
+      FORK_RPC_BIND: 0.0.0.0:8000
+      # Guard: the harness refuses to run against a non-local RPC.
+      FORK_RPC_ALLOW_REMOTE: "false"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - fork-snapshots:/snapshots
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  chaos-runner:
+    profiles: ["fork"]
+    image: ${ZENITH_FORK_IMAGE:-ghcr.io/zenith-options/fork-tooling:latest}
+    build:
+      context: .
+      dockerfile: scripts/fork/Dockerfile
+    command: ["chaos", "run"]
+    depends_on:
+      fork-rpc:
+        condition: service_healthy
+    environment:
+      FORK_RPC_URL: http://fork-rpc:8000
+      SNAPSHOT_SEED: ${SNAPSHOT_SEED:-1}
+      CHAOS_SCENARIOS: ${CHAOS_SCENARIOS:-all}
+      CHAOS_REPORT_DIR: /reports
+    volumes:
+      - fork-reports:/reports
+    restart: "no"
 
 # ---------------------------------------------------------------------------
 # Networks encode the trust boundaries:
@@ -209,3 +286,8 @@ networks:
     internal: true
   vault-egress:
     driver: bridge
+
+volumes:
+  zenith-db-data:
+  fork-snapshots:
+  fork-reports:

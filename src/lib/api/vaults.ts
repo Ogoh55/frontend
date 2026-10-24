@@ -116,6 +116,35 @@ import { submitTransactionXdr } from "./stellar";
  *   - While an unresolved loss event exists the vault is `impaired` and
  *     deposits are disabled.
  *
+ * ---------------------------------------------------------------------------
+ * Vault event / ABI schema versioning (issue #229)
+ * ---------------------------------------------------------------------------
+ * The Soroban contract spec is the source of truth for vault events and entry
+ * points. This adapter mirrors that spec and is checked against the committed
+ * snapshot in `contracts/abi/vault-spec.json` by `scripts/check-abi-snapshot`
+ * in CI. Do not hand-edit the shapes below without bumping
+ * `VAULT_SCHEMA_VERSION` and adding a changelog entry.
+ *
+ * Compatibility policy:
+ *   - Within a major version, changes are additive only (new optional fields,
+ *     new events, new entry points). Existing fields keep their name, type and
+ *     meaning.
+ *   - Removing or semantically changing a field requires an explicit deprecation
+ *     window (documented in the changelog) before it is dropped.
+ *   - Breaking majors are migrated with dual-emit: the contract emits both the
+ *     old and new event shapes for one full release cycle so indexers can cut
+ *     over without data loss.
+ *
+ * Numeric mapping (Soroban → JS):
+ *   - i128 / u128 amounts are emitted as decimal strings and parsed to `number`
+ *     only when within Number.MAX_SAFE_INTEGER; otherwise they are surfaced as
+ *     strings to avoid silent precision loss.
+ *   - u32 (epoch numbers, expiry days) map directly to `number`.
+ *   - u64 timestamps map to ISO-8601 strings.
+ *
+ * Decoders MUST fail loudly on an unknown `schema_version` rather than
+ * producing a plausible-looking wrong value.
+ *
  * NAV / share-price source of truth (issue #290):
  *
  *   Share issuance is priced from the vault's internal book value
@@ -214,6 +243,52 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const MAX_PAGES = 20;
+
+/** Current vault event/ABI schema major version. Bump on any breaking change. */
+export const VAULT_SCHEMA_VERSION = 1 as const;
+
+/** Stable topic layout for every emitted vault event. */
+export const VAULT_EVENT_TOPICS = {
+  deposit: ["vault", "deposit"],
+  withdraw: ["vault", "withdraw"],
+  epoch_settled: ["vault", "epoch_settled"],
+} as const;
+
+/** Enumerable vault contract error codes (mirrors the contract spec). */
+export const VaultErrorCode = {
+  Unauthorized: 1,
+  VaultFull: 2,
+  InsufficientShares: 3,
+  EpochNotSettled: 4,
+  InvalidAmount: 5,
+  UnknownSchemaVersion: 6,
+} as const;
+export type VaultErrorCode = (typeof VaultErrorCode)[keyof typeof VaultErrorCode];
+
+/** Base shape every decoded vault event carries. */
+export interface VaultEventEnvelope {
+  /** Explicit schema version; consumers must reject unknown values. */
+  schema_version: number;
+  /** Stable topic layout, e.g. ["vault", "deposit"]. */
+  topic: readonly string[];
+  /** Ledger sequence the event was emitted in. */
+  ledger: number;
+}
+
+/**
+ * Decode a raw vault event, validating its schema version.
+ * Throws on an unknown version so consumers never mis-decode silently.
+ * Unknown extra fields are preserved and ignored by typed consumers.
+ */
+export function decodeVaultEvent(raw: Record<string, unknown>): VaultEventEnvelope & Record<string, unknown> {
+  const version = raw.schema_version;
+  if (typeof version !== "number" || version !== VAULT_SCHEMA_VERSION) {
+    throw new Error(
+      `Unsupported vault event schema_version: ${String(version)} (expected ${VAULT_SCHEMA_VERSION})`,
+    );
+  }
+  return raw as VaultEventEnvelope & Record<string, unknown>;
+}
 
 // ---------------------------------------------------------------------------
 // Wire schemas (source of truth for the frozen contract)
@@ -898,14 +973,6 @@ export interface WithdrawalRequest {
   /** USD paid out, summed over every pass at that pass's processing NAV. */
   payoutUsd: number;
   status: WithdrawalStatus;
-}
-
-/** State of the vault at the point where the withdrawal queue is processed. */
-export interface ProcessingPoint {
-  /** NAV per share at processing. Requests settle at this price. */
-  navPerShare: number;
-  /** USD of liquid capital available to pay out. */
-  liquidityUsd: number;
 }
 
 /**

@@ -24,11 +24,11 @@ env:
   NEXT_PUBLIC_STELLAR_NETWORK: testnet
   NEXT_PUBLIC_STELLAR_TESTNET_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LINT
-# Runs next lint. Treats any warning as an error (--max-warnings 0).
-# ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # LINT
+  # Runs next lint. Treats any warning as an error (--max-warnings 0).
+  # ───────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -78,6 +78,30 @@ jobs:
           name: coverage-report
           path: coverage/
           retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ABI / EVENT SCHEMA SNAPSHOT
+  # Rebuilds the vault contract spec and compares it against the checked-in
+  # snapshot (contracts/abi/vault-spec.json). A diff fails the gate unless the
+  # schema version was bumped and a matching changelog entry was added.
+  # See docs/VAULT_SCHEMA_COMPATIBILITY.md for the policy.
+  # ───────────────────────────────────────────────────────────────────────────
+  abi-snapshot:
+    name: ABI / Event Schema Snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify ABI / event schema snapshot
+        run: npm run abi:check
 
   # ───────────────────────────────────────────────────────────────────────────
   # MIGRATIONS
@@ -303,6 +327,10 @@ jobs:
 
       - name: Run Storybook test runner
         run: npm run storybook:test
+        env:
+          # Point the test runner at the static build served by the built-in
+          # reference server.
+          TARGET_URL: http://127.0.0.1:6006
 
       - name: Upload test runner report
         if: always()

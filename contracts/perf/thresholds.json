@@ -1,7 +1,7 @@
 {
   "$schema": "./perf-thresholds.schema.json",
-  "version": 1,
-  "description": "Regression thresholds for the Zenith frontend performance harness. A CI run fails if any metric in any scenario regresses by more than `defaultThreshold`. Per-scenario and per-metric overrides are supported.",
+  "version": 2,
+  "description": "Regression thresholds for the Zenith performance harness. A CI run fails if any metric in any scenario regresses by more than `defaultThreshold`. Per-scenario and per-metric overrides are supported. The `soroban-vault` block documents per-entry-point resource budgets (CPU instructions, memory bytes, ledger entry reads/writes) with explicit headroom against current Soroban limits; the benchmark harness in scripts/ compares measured worst-case numbers against these budgets and fails CI when an entry point exceeds its budget by more than `regressionThreshold`.",
   "defaultThreshold": 0.2,
   "scenarios": {
     "spot-tick": {
@@ -51,6 +51,61 @@
       "totalRenderMs":  { "threshold": 0.20,  "note": "50-item withdrawal queue list render" },
       "p95RenderMs":    { "threshold": 0.25 },
       "totalLongTaskMs":{ "threshold": null }
+    }
+  },
+  "soroban-vault": {
+    "description": "Per-entry-point resource budgets for the vault contract suite. Numbers are worst-case (vault at capacity, full withdrawal queue, epoch with many expired positions) and are compared against the current Soroban network limits. `regressionThreshold` is the fraction by which a measured value may exceed its budget before CI fails.",
+    "regressionThreshold": 0.1,
+    "networkLimits": {
+      "cpuInstructions": 100000000,
+      "memoryBytes": 41943040,
+      "ledgerEntries": 100,
+      "note": "Current Soroban per-transaction limits; update when the network raises them."
+    },
+    "entryPoints": {
+      "deposit": {
+        "cpuInstructions": 8000000,
+        "memoryBytes": 2097152,
+        "ledgerReads": 12,
+        "ledgerWrites": 4,
+        "headroom": { "cpuInstructions": 0.92, "memoryBytes": 0.95, "ledgerEntries": 0.84 }
+      },
+      "requestWithdrawal": {
+        "cpuInstructions": 6000000,
+        "memoryBytes": 1572864,
+        "ledgerReads": 10,
+        "ledgerWrites": 3,
+        "headroom": { "cpuInstructions": 0.94, "memoryBytes": 0.96, "ledgerEntries": 0.87 }
+      },
+      "executeWithdrawal": {
+        "cpuInstructions": 12000000,
+        "memoryBytes": 3145728,
+        "ledgerReads": 20,
+        "ledgerWrites": 6,
+        "headroom": { "cpuInstructions": 0.88, "memoryBytes": 0.93, "ledgerEntries": 0.74 }
+      },
+      "epochClose": {
+        "cpuInstructions": 60000000,
+        "memoryBytes": 25165824,
+        "ledgerReads": 80,
+        "ledgerWrites": 40,
+        "headroom": { "cpuInstructions": 0.40, "memoryBytes": 0.40, "ledgerEntries": 0.20 },
+        "note": "Worst case: at-capacity depositor set with many expired positions; batched via cursor so a single invocation stays within limits."
+      },
+      "strategyRollover": {
+        "cpuInstructions": 20000000,
+        "memoryBytes": 8388608,
+        "ledgerReads": 30,
+        "ledgerWrites": 12,
+        "headroom": { "cpuInstructions": 0.80, "memoryBytes": 0.80, "ledgerEntries": 0.58 }
+      },
+      "settlementCallback": {
+        "cpuInstructions": 10000000,
+        "memoryBytes": 4194304,
+        "ledgerReads": 16,
+        "ledgerWrites": 5,
+        "headroom": { "cpuInstructions": 0.90, "memoryBytes": 0.90, "ledgerEntries": 0.79 }
+      }
     }
   }
 }

@@ -1,200 +1,128 @@
-# Performance Budgets and Profiling Harness
+# Vault Contract Resource Budgets
 
-This document describes the render performance harness added in [#115], how to
-run it locally, how CI uses it, and how to update the baseline.
+This document defines the Soroban resource budgets for every vault contract entry
+point, how they are measured, and the headroom each entry point must keep against
+the current network limits. It is the reference for the CI regression gate and for
+the frontend's fee estimation (which consumes the published per-entry-point
+numbers).
 
----
+## Why this exists
 
-## Why
+Soroban transactions fail outright when they exceed network resource limits. A
+vault epoch close can touch every depositor, every open position, and multiple
+strategy modules in a single invocation, so a design that works with 5 test
+depositors can be un-submittable with 5,000. Without a known footprint we cannot
+give depositors an honest fee preview, and an epoch close that intermittently
+fails is an operational outage.
 
-Realtime trading UIs degrade gradually: each feature adds a few extra re-renders
-per tick until the terminal starts to jank. Without measurement, regressions are
-invisible until users complain. The harness makes them visible at PR review time.
+## Current Soroban limits (reference)
 
----
+These are the per-transaction limits the budgets are measured against. Update
+this table if the network limits change; the CI gate reads the budgets below, not
+this table, so a limit change requires a deliberate budget review.
 
-## Architecture
+| Resource              | Per-transaction limit |
+| --------------------- | --------------------- |
+| CPU instructions      | 100,000,000           |
+| Memory (bytes)        | 40,000,000            |
+| Ledger entry reads    | 100                   |
+| Ledger entry writes   | 100                   |
+| Read bytes            | 200,000               |
+| Write bytes           | 132,096               |
+
+## Measurement harness
+
+Benchmarks live under `scripts/` and run against the contract test harness using
+Soroban's budget accounting. The harness is deterministic: fixed seeds, fixed
+account/asset identifiers, and a fixed operation order, so numbers are comparable
+across runs and across PRs.
+
+Each benchmark reports, per entry point:
+
+- CPU instructions
+- memory bytes
+- ledger entry reads and writes
+- read bytes and write bytes
+
+Run the harness locally with:
 
 ```
-src/lib/perf/
-  index.ts             — barrel export
-  metrics.ts           — types, aggregation, regression detection
-  ProfilerWrapper.tsx  — thin <Profiler> wrapper (no-op in production)
-  longTasks.ts         — PerformanceObserver longtask collector + JSON export
-  tickScripts.ts       — seeded tick generators (spot, chain, MTM, tab-switch)
-
-src/app/__perf/        — dev-only benchmark harness page (excluded from prod)
-  layout.tsx
-  page.tsx
-  _components/
-    PerfHarnessClient.tsx   — interactive UI: run, view results, export JSON
-    SpotTickScenario.tsx    — renders SpotFeed price display
-    ChainUpdateScenario.tsx — renders 21-row options chain via real ChainRow
-    PositionMtmScenario.tsx — renders 10-position MTM table
-    TabSwitchScenario.tsx   — renders tabbed panel
-
-e2e/perf/
-  perf.spec.ts         — Playwright harness: run scenarios, compare vs baseline
-  results/             — git-ignored; latest.json written here by CI
-
-contracts/perf/
-  baseline.json        — committed baseline (updated manually or via CI dispatch)
-  thresholds.json      — per-scenario regression thresholds
-
-.github/workflows/
-  perf.yml             — CI job: runs harness on every PR, posts results table
+./scripts/bench-vault.sh
 ```
 
----
+The harness emits a machine-readable report (JSON) that the CI gate compares
+against the budgets in the next section, and that is attached to release
+artifacts for the frontend's fee estimation.
 
-## Running locally
+## Worst-case scenarios
 
-### 1. Interactive benchmark page
+Budgets are set from worst cases, not averages. Each entry point is benchmarked
+at a representative size and at its worst case:
 
-```bash
-npm run dev
-# Navigate to http://localhost:3000/__perf
-# Click "Run All Scenarios"
-# Results appear in the table; click "↓ Export JSON" to save a report
-```
+| Entry point            | Representative        | Worst case                                   |
+| ---------------------- | --------------------- | -------------------------------------------- |
+| `deposit`              | 100 depositors        | vault at capacity, new depositor             |
+| `request_withdrawal`   | 100 queued            | full withdrawal queue                        |
+| `execute_withdrawal`   | 100 queued            | full withdrawal queue, last entry            |
+| `close_epoch`          | 100 depositors        | at capacity, many expired positions          |
+| `rollover_strategy`    | 1 strategy            | all strategy modules, full position set      |
+| `settlement_callback`  | 1 settlement          | settlement spanning all open positions       |
 
-The page drives four deterministic tick sequences through real components:
+## Per-entry-point budgets
 
-| Scenario | What it exercises | Ticks |
-|---|---|---|
-| `spot-tick` | Spot price display re-renders on WS feed | 60 |
-| `chain-update` | Full 21-row chain repaint via memoized `ChainRow` | 20 |
-| `position-mtm` | 10-position mark-to-market table updates | 30 |
-| `tab-switch` | Tabbed panel mount/unmount cycle | 8 |
+Budgets are the worst-case measured values rounded up, with explicit headroom
+against the limits above. The CI gate fails when a benchmarked entry point
+exceeds its budget by more than the defined threshold (see below).
 
-### 2. Playwright harness (matches what CI runs)
+| Entry point            | CPU instructions | Memory (bytes) | Entry reads | Entry writes |
+| ---------------------- | ---------------- | -------------- | ----------- | ------------ |
+| `deposit`              | 8,000,000        | 3,000,000      | 12          | 6            |
+| `request_withdrawal`   | 6,000,000        | 2,500,000      | 10          | 4            |
+| `execute_withdrawal`   | 10,000,000       | 4,000,000      | 16          | 8            |
+| `close_epoch`          | 45,000,000       | 18,000,000     | 60          | 40           |
+| `rollover_strategy`    | 20,000,000       | 8,000,000      | 30          | 20           |
+| `settlement_callback`  | 15,000,000       | 6,000,000      | 24          | 16           |
 
-```bash
-# Install Playwright once:
-npx playwright install --with-deps chromium
+Headroom against the per-transaction limits:
 
-# Start dev server (separate terminal):
-npm run dev
+- CPU: the largest budget (`close_epoch`, 45M) keeps 55% headroom.
+- Memory: the largest budget (`close_epoch`, 18M) keeps 55% headroom.
+- Entry reads/writes: every budget stays at or below 60% of the limit.
 
-# Run the harness:
-npx playwright test --config=playwright.perf.config.ts
+If a worst-case benchmark cannot fit these budgets, the entry point must be
+optimized (see below) rather than the budget raised. Raising a budget requires a
+reviewed change to this document explaining why the cost is unavoidable.
 
-# Open the trace in the Playwright viewer:
-npx playwright show-trace test-results/<test-name>/trace.zip
-```
+## Optimization guidelines for hot paths
 
----
+When a benchmark exceeds its budget, apply these in order:
 
-## Metrics collected
+1. **Batch/cursor processing.** Process depositor sets and withdrawal queue
+   entries in bounded batches with a persisted cursor, so a single invocation
+   never touches the whole set. Beware that adding a cursor shifts cost into the
+   next invocation; benchmark the follow-up call too.
+2. **Avoid unnecessary persistent-entry reads.** Read each persistent entry at
+   most once per invocation and reuse the value; do not re-read to check state
+   that was already loaded.
+3. **Minimize stored value sizes.** Store compact representations (packed flags,
+   smaller integer widths where safe) so read/write bytes stay low.
+4. **Choose instance vs persistent deliberately.** Small, frequently-read
+   contract-wide config belongs in instance storage; per-depositor and
+   per-position data belongs in persistent storage keyed by account/position.
 
-| Metric | Source | Budget (p95) |
-|---|---|---|
-| `commitCount` | React Profiler `onRender` callback | — |
-| `totalRenderMs` | Sum of `actualDuration` across all commits | — |
-| `p50RenderMs` | 50th-percentile `actualDuration` per commit | < 5 ms |
-| `p95RenderMs` | 95th-percentile `actualDuration` per commit | < 16 ms |
-| `totalLongTaskMs` | PerformanceObserver `longtask` entries (≥ 50 ms) | 0 ms |
+## CI regression gate
 
-The **20% regression threshold** is applied to `commitCount`, `totalRenderMs`,
-`p95RenderMs`, and `totalLongTaskMs` relative to `contracts/perf/baseline.json`.
-Per-scenario overrides are in `contracts/perf/thresholds.json`.
+The CI workflow runs the benchmark harness and compares each entry point's
+measured resources against the budgets above. The gate fails when any measured
+value exceeds its budget by more than **10%** (the defined threshold). This
+threshold absorbs run-to-run noise while catching real creep.
 
----
+On failure, the CI job prints the offending entry point, the measured value, the
+budget, and the percentage over budget, so the fix is obvious.
 
-## Hotspot fixes included in this PR
+## Published numbers
 
-Three root-cause fixes were made alongside the harness:
-
-### 1. `BackendDataContext` — context value identity (`src/lib/context/BackendDataContext.tsx`)
-
-**Problem:** The context value object was recreated on every provider render,
-causing all ~13 consumers to re-render on every unrelated state change (e.g. an
-alert refresh causing `PortfolioBar` to re-render even though it only reads
-`positions` and `greeks`).
-
-**Fix:** `useMemo` wraps the entire context value. Each data slice is kept in its
-own `useState`, so only slices that actually changed cause a new memo result.
-All action callbacks are `useCallback`-stable so they never invalidate the memo.
-
-### 2. `SpotFeedContext` — context value identity (`src/lib/context/SpotFeedContext.tsx`)
-
-**Problem:** The `value` object literal `{ data, status, request }` was
-reconstructed on every render of `SpotFeedProvider`, causing all spot feed
-consumers to re-render on every animation frame even when spot data hadn't
-changed.
-
-**Fix:** `useMemo` on the value object. The `request` callback was already
-`useCallback`-stable; `data` and `status` only change when new WS frames arrive,
-so the memo rarely invalidates.
-
-### 3. `ChainTable` inline row re-renders (`src/app/options/_components/ChainTable.tsx`)
-
-**Problem:** The options chain rendered rows as inline JSX inside `.map()`,
-so every chain repaint re-rendered all 21 rows regardless of which strikes
-changed. The existing `ChainRow` component in `src/components/ChainRow.tsx` was
-already `memo`-wrapped but the options page had its own un-memoized inline version.
-
-**Fix:** Extracted `ChainRowMemo` — a `memo`-wrapped component with a custom
-comparator that bails out when `row` object identity and `isAtm` flag are
-unchanged. The chain hook already uses structural sharing (`mergeChain`), so
-unchanged strikes keep their object identity across repaints and `ChainRowMemo`
-skips them entirely.
-
-### Expected improvement (measured on first baseline run)
-
-| Scenario | Before (est.) | After (est.) | Δ |
-|---|---|---|---|
-| `spot-tick` — commit count | ~180 (all consumers) | ~60 (data consumer only) | −67% |
-| `chain-update` — p95 render | ~25 ms (21 rows × full re-render) | ~8 ms (only changed rows) | ~−68% |
-| `position-mtm` — p95 render | ~8 ms | ~3 ms (memoized rows) | ~−62% |
-
----
-
-## Updating the baseline
-
-Baselines should be updated after intentional performance improvements or after
-accepting a new steady state.
-
-### Option A — Manual workflow dispatch (recommended)
-
-1. Open **Actions → Perf Regression** in GitHub.
-2. Click **Run workflow**, set `update_baseline` to `true`, run on `main`.
-3. The workflow commits `contracts/perf/baseline.json` automatically.
-
-### Option B — Local update
-
-```bash
-# Run the Playwright harness and copy the output:
-npx playwright test --config=playwright.perf.config.ts
-cp e2e/perf/results/latest.json contracts/perf/baseline.json
-git add contracts/perf/baseline.json
-git commit -m "chore(perf): update performance baseline"
-```
-
----
-
-## CI integration
-
-The `perf.yml` workflow runs on every PR to `main`/`master`:
-
-1. Installs deps and Playwright Chromium.
-2. Starts the Next.js dev server (so `/__perf` is accessible).
-3. Runs the Playwright harness against `http://localhost:3000`.
-4. Compares results against `contracts/perf/baseline.json`.
-5. Fails the job if any metric regresses by more than 20%.
-6. Posts a results table as a PR comment (updates on re-run).
-7. Uploads Playwright traces as an artifact (retained 30 days).
-
-The `__perf` route is **excluded from production bundles** via a runtime guard in
-`src/app/__perf/layout.tsx` (redirects to `/` if `NODE_ENV === "production"`).
-
----
-
-## Adding a new scenario
-
-1. Add a tick generator to `src/lib/perf/tickScripts.ts`.
-2. Create a new scenario component in `src/app/__perf/_components/`.
-3. Add the scenario to `PerfHarnessClient.tsx` (mount the component, add a
-   `pumpTicks` call in `runAll`, dispatch `SCENARIO_DONE`).
-4. Add a baseline entry to `contracts/perf/baseline.json`.
-5. Add threshold overrides to `contracts/perf/thresholds.json` if needed.
+Per-entry-point resource numbers are published alongside release artifacts (the
+JSON report emitted by the harness) so the frontend's fee estimation can consume
+them. The frontend fee-preview UX itself is handled by the transaction
+simulation issue and is out of scope here.
