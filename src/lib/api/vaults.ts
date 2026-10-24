@@ -26,7 +26,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -101,7 +104,7 @@ import { apiGet, apiPost } from "./client";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -124,6 +127,9 @@ import { apiGet, apiPost } from "./client";
  */
 
 import { env } from "../../env";
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -787,14 +793,4 @@ export interface LotRelief {
   costBasisUsd: number;
   /** Gross proceeds minus fees. */
   netProceedsUsd: number;
-  realizedPnlUsd: number;
-  consumed: { lotId: string; shares: number; costUsd: number }[];
-  remainingLots: VaultShareLot[];
-}
-
-function byLotOrder(a: VaultShareLot, b: VaultShareLot): number {
-  return a.acquiredLedger - b.acquiredLedger || a.lotId.localeCompare(b.lotId);
-}
-
-/**
- * Relieves `shares` from
+  realized

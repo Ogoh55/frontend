@@ -63,6 +63,16 @@ export const ALLOWLIST: AllowRule[] = [
   { pattern: route("/api/v1/vaults/:id/deposit"), methods: { POST: "required" } },
   { pattern: route("/api/v1/vaults/:id/withdraw"), methods: { POST: "required" } },
 
+  // Vault operator console. Operator authorization is enforced by the backend
+  // (403 is passed through); the BFF only attaches the session token.
+  { pattern: route("/api/v1/operator/vaults/:id/status"), methods: { GET: "required" } },
+  { pattern: route("/api/v1/operator/vaults/:id/rollover"), methods: { POST: "required" } },
+  { pattern: route("/api/v1/operator/vaults/:id/pause"), methods: { POST: "required" } },
+  { pattern: route("/api/v1/operator/vaults/:id/resume"), methods: { POST: "required" } },
+  { pattern: route("/api/v1/operator/vaults/:id/parameter-changes"), methods: { POST: "required" } },
+  { pattern: route("/api/v1/operator/vaults/:id/alerts/:id/resolve"), methods: { POST: "required" } },
+  { pattern: route("/api/v1/operator/audit-log"), methods: { GET: "required" } },
+
   // Watchlist & alerts
   { pattern: route("/api/v1/watchlist"), methods: { GET: "required", POST: "required" } },
   { pattern: route("/api/v1/watchlist/:id"), methods: { DELETE: "required" } },
