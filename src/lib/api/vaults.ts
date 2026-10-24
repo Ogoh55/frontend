@@ -1,4 +1,11 @@
-import { apiGet, apiPost } from "./client";
+import { z } from "zod";
+import { env } from "../../env";
+import { bffFetch } from "./client";
+import { ContractError, reportContractError } from "./contractError";
+import { toCsv, type CsvColumn } from "../csv";
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 
 /**
  * Vault transaction receipts client.
@@ -12,6 +19,12 @@ import { apiGet, apiPost } from "./client";
  * read-scoped token and only ever calls GET endpoints, so a UI regression
  * cannot escalate into a state-changing call.
  *
+ * Vaults REST contract — v1 (frozen).
+ *
+ * Owner: vaults. Counterpart: Zenith-options/backend. Any change to the wire
+ * shapes below is a contract change: bump VAULTS_API_VERSION and land the
+ * backend change in the same release.
+ *
  * The Phase 2 options vault contract is scaffolded under `contracts/vault`
  * (crate `zenith-options-vault`), but it is not yet deployed and the backend
  * API is not yet available. This module is unrelated to the margin-collateral
@@ -20,13 +33,19 @@ import { apiGet, apiPost } from "./client";
  * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
  * (Zenith-options/backend) through the REST contract below.
  *
- * Backend contract (for when the real API lands):
+ * Transport
+ *   All requests go through the BFF (`bffFetch`). The bearer token lives in
+ *   the httpOnly session cookie and is attached server-side; this module never
+ *   reads or sends it. GET routes are auth-optional, POST routes require a
+ *   session (see src/lib/bff/allowlist.ts).
  *
- *   GET /api/v1/vaults
- *   → VaultSummary[]
- *
- *   GET /api/v1/vaults/{id}
- *   → VaultDetail
+ * Endpoints (all under /api/v1/vaults)
+ *   GET  /                    ?limit&cursor                 → Page<VaultRegistryEntry>
+ *   GET  /{id}                                              → VaultDetail | 404
+ *   GET  /{id}/nav            ?from&to&limit&cursor         → Page<NavPoint>
+ *   GET  /{id}/epochs         ?from&to&limit&cursor         → Page<EpochRecord>
+ *   POST /{id}/deposit        { amount }                    → { tx_id }
+ *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
@@ -101,7 +120,7 @@ import { apiGet, apiPost } from "./client";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -121,14 +140,51 @@ import { apiGet, apiPost } from "./client";
  *
  * See docs/privacy/vault-data-inventory.md for the data inventory, retention
  * windows, and the deletion/export workflow this module mirrors.
+ *
+ * Wire format
+ *   - Every amount, price, share count and ratio is a decimal string
+ *     (/^-?\d+(\.\d+)?$/), never a JSON number. Amounts are USD collateral
+ *     unless the field ends in `_shares`. Ratios are fractions (0.18 = 18%).
+ *   - Instants are RFC 3339 with an offset (`*_at`, `phase_ends_at`).
+ *     Calendar dates are YYYY-MM-DD (`*_expiry`, `*_start`, `settlement_date`).
+ *   - Field names are snake_case (serde output). Unknown extra fields are
+ *     stripped; missing or mistyped fields fail validation (ContractError).
+ *
+ * Pagination and time ranges
+ *   - `cursor` is opaque. `limit` is 1–100 (default 50). `next_cursor: null`
+ *     marks the last page.
+ *   - `from` / `to` are inclusive RFC 3339 bounds. NAV points filter on `at`;
+ *     epochs filter on `settlement_date`.
+ *
+ * Error taxonomy (HTTP status → VaultsApiError.code)
+ *   401  unauthorized     Session expired. Not retried; re-authenticate.
+ *   403  forbidden        Vaults flag off, or wallet not allowlisted. Not retried.
+ *   404  not_found        getVault resolves to null.
+ *   409  epoch_closed     The epoch closed while the request was in flight.
+ *                         Not retried; the user retries in the next deposit window.
+ *   400/422 invalid_request
+ *   5xx  unavailable      Retryable.
+ *   client-side: timeout (10s), network, aborted, contract (schema violation).
+ *
+ * Degradation
+ *   Reads (list, detail, nav, epochs) that fail with a retryable error return
+ *   the last successful response for the same key in this session, so the
+ *   detail view keeps its values. Mutations (deposit, withdraw) are never
+ *   retried by the adapter and always surface their error.
+ *
+ * Mode
+ *   NEXT_PUBLIC_VAULTS=live selects the live client. Any other value (absent
+ *   or "mock") selects the mock client backed by MOCK_VAULTS. Pages import only
+ *   from this module, so flipping the flag needs no page changes.
  */
 import { useWalletStore } from '@/lib/store/wallet';
 
-import freighterApi from "@stellar/freighter-api";
-import { apiPost, type RequestOptions } from "./client";
-import { submitTransactionXdr } from "./stellar";
-import { bffFetch } from "./client";
-import { toCsv, type CsvColumn } from "../csv";
+export const VAULTS_API_VERSION = "v1" as const;
+const API = `/api/${VAULTS_API_VERSION}/vaults`;
+const REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+const MAX_PAGES = 20;
 
 export type VaultTxType =
   | 'deposit'
@@ -165,9 +221,114 @@ export interface VaultReceipt {
   updatedAt: string;
 }
 
-export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
-export type RiskRating = "low" | "medium" | "high";
-export type EpochPhase = "deposit" | "active" | "settlement";
+// ---------------------------------------------------------------------------
+// Wire schemas (source of truth for the frozen contract)
+// ---------------------------------------------------------------------------
+
+const DecimalStringSchema = z.string().regex(/^-?\d+(\.\d+)?$/, "must be a decimal string");
+const InstantSchema = z.string().datetime({ offset: true });
+const DateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD");
+
+export const VaultStrategySchema = z.enum(["covered_call", "cash_secured_put", "iron_condor", "wheel"]);
+export const RiskRatingSchema = z.enum(["low", "medium", "high"]);
+export const EpochPhaseSchema = z.enum(["deposit", "active", "settlement"]);
+export const EpochOutcomeSchema = z.enum(["expired_worthless", "exercised", "active"]);
+
+/** Registry entry: one row on the /vaults listing. */
+export const VaultRegistryEntrySchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  underlying: z.string(),
+  strategy: VaultStrategySchema,
+  apy: DecimalStringSchema,
+  apy_methodology: z.string(),
+  tvl_usd: DecimalStringSchema,
+  capacity_usd: DecimalStringSchema,
+  /** tvl_usd / capacity_usd, as a fraction 0–1. */
+  utilisation: DecimalStringSchema,
+  current_strike: DecimalStringSchema,
+  current_expiry: DateSchema,
+  risk_rating: RiskRatingSchema,
+  description: z.string(),
+});
+
+export const EpochRecordSchema = z.object({
+  epoch_number: z.number().int().nonnegative(),
+  deposit_start: DateSchema,
+  active_start: DateSchema,
+  settlement_date: DateSchema,
+  strike: DecimalStringSchema,
+  expiry_days: z.number().int().nonnegative(),
+  premium_collected: DecimalStringSchema,
+  outcome: EpochOutcomeSchema,
+  /** Epoch return as a fraction; positive = profit for depositors. */
+  pnl_ratio: DecimalStringSchema,
+});
+
+export const UserPositionSchema = z.object({
+  shares: DecimalStringSchema,
+  share_value: DecimalStringSchema,
+  total_value_usd: DecimalStringSchema,
+  accrued_premium_usd: DecimalStringSchema,
+  pending_withdrawal_shares: DecimalStringSchema,
+});
+
+/** Deposit/withdraw queue state for the current epoch. */
+export const QueueStateSchema = z.object({
+  deposit_pending_usd: DecimalStringSchema,
+  withdraw_pending_shares: DecimalStringSchema,
+  settles_at: InstantSchema,
+});
+
+/** Fee accrual breakdown, accrued through `accrued_through`. */
+export const FeeAccrualSchema = z.object({
+  management_accrued_usd: DecimalStringSchema,
+  performance_accrued_usd: DecimalStringSchema,
+  accrued_through: InstantSchema,
+});
+
+/** Full vault detail, including the current epoch and a bounded recent-epoch window. */
+export const VaultDetailSchema = VaultRegistryEntrySchema.extend({
+  current_epoch: z.number().int().nonnegative(),
+  current_phase: EpochPhaseSchema,
+  phase_ends_at: InstantSchema,
+  share_price: DecimalStringSchema,
+  total_shares: DecimalStringSchema,
+  fee_structure: z.object({
+    management_pct: DecimalStringSchema,
+    performance_pct: DecimalStringSchema,
+  }),
+  payoff_explanation: z.string(),
+  queue: QueueStateSchema,
+  fees: FeeAccrualSchema,
+  recent_epochs: z.array(EpochRecordSchema),
+  user_position: UserPositionSchema.nullable(),
+});
+
+export const NavPointSchema = z.object({
+  at: InstantSchema,
+  share_price: DecimalStringSchema,
+  total_shares: DecimalStringSchema,
+});
+
+export const DepositResponseSchema = z.object({ tx_id: z.string().min(1) });
+export const WithdrawResponseSchema = z.object({ tx_id: z.string().min(1), queued: z.boolean() });
+
+export type VaultRegistryEntryWire = z.infer<typeof VaultRegistryEntrySchema>;
+export type VaultDetailWire = z.infer<typeof VaultDetailSchema>;
+export type EpochRecordWire = z.infer<typeof EpochRecordSchema>;
+export type NavPointWire = z.infer<typeof NavPointSchema>;
+
+const pageOf = <T extends z.ZodTypeAny>(item: T) =>
+  z.object({ items: z.array(item), next_cursor: z.string().nullable() });
+
+// ---------------------------------------------------------------------------
+// UI types (camelCase, display-ready)
+// ---------------------------------------------------------------------------
+
+export type VaultStrategy = z.infer<typeof VaultStrategySchema>;
+export type RiskRating = z.infer<typeof RiskRatingSchema>;
+export type EpochPhase = z.infer<typeof EpochPhaseSchema>;
 
 /**
  * Execution mode of a vault strategy.
@@ -208,26 +369,6 @@ export interface InflationDefenseConfig {
   navJumpGuardPct: number;
   /** Classification of direct token transfers to the contract. */
   directTransferPolicy: DirectTransferPolicy;
-}
-
-/**
- * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
- * on one vault has no implicit authority over any other vault.
- *
- * - depositor: may deposit and withdraw/redeem
- * - operator: may set strategy parameters and roll epochs
- * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
- * - emergency_authority: protocol-level emergency authority, scoped to this vault
- */
-export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
-
-/** One role assignment on a vault. */
-export interface VaultRoleGrant {
-  role: VaultRole;
-  /** Account address of the role holder. */
-  holder: string;
-  /** ISO timestamp of when the role was granted. */
-  grantedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +440,26 @@ export function applyVaultTransition(
   return { status: to, changed: true };
 }
 
+/**
+ * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
+ * on one vault has no implicit authority over any other vault.
+ *
+ * - depositor: may deposit and withdraw/redeem
+ * - operator: may set strategy parameters and roll epochs
+ * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
+ * - emergency_authority: protocol-level emergency authority, scoped to this vault
+ */
+export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
+
+/** One role assignment on a vault. */
+export interface VaultRoleGrant {
+  role: VaultRole;
+  /** Account address of the role holder. */
+  holder: string;
+  /** ISO timestamp of when the role was granted. */
+  grantedAt: string;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -316,6 +477,8 @@ export interface VaultSummary {
   tvl: number;
   /** Maximum TVL before the vault is full. */
   capacity: number;
+  /** tvl / capacity (0–1). */
+  utilisation: number;
   currentStrike: number;
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
@@ -615,225 +778,4 @@ export async function fetchVaultHistory(
 export type DiagnosticsLookup =
   | { kind: 'vault'; vaultId: string }
   | { kind: 'account'; account: string }
-  | { kind: 'tx'; txHash: string }
-  | { kind: 'receipt'; idempotencyKey: string };
-
-/** A single field's on-chain vs backend value, with drift made explicit. */
-export interface DiagnosticField {
-  label: string;
-  onChain: string | null;
-  backend: string | null;
-  /** True when onChain and backend disagree (or one side is missing). */
-  drift: boolean;
-}
-
-export interface DiagnosticDrift {
-  /** Human-readable description of the discrepancy. */
-  detail: string;
-  /** ISO timestamp of the reconciliation job that reported the drift. */
-  reportedAt: string;
-}
-
-export interface DiagnosticsView {
-  lookup: DiagnosticsLookup;
-  vaultId: string | null;
-  account: string | null;
-  /** Side-by-side on-chain vs backend state, drift flagged per field. */
-  fields: DiagnosticField[];
-  /** Drift reported by reconciliation jobs, surfaced rather than hidden. */
-  drift: DiagnosticDrift[];
-  /** Queue position for pending withdrawals, if applicable. */
-  queuePosition: number | null;
-  /** Receipt status summary, if applicable. */
-  receiptStatus: VaultTxStatus | null;
-  /** NAV provenance (source + timestamp) as a decimal string, if known. */
-  navProvenance: string | null;
-  /** Halt reason when the vault is halted, otherwise null. */
-  haltReason: string | null;
-  /** ISO timestamp of the last reconciled on-chain state. */
-  lastReconciledAt: string | null;
-  /** True when the backend could not be reached and data is degraded. */
-  degraded: boolean;
-}
-
-export interface DiagnosticsPage {
-  views: DiagnosticsView[];
-  /** Opaque cursor for the next page of a large account history. */
-  nextCursor: string | null;
-  degraded: boolean;
-}
-
-/**
- * Read-scoped token issued to the diagnostics client. It is intentionally
- * separate from the operator token so the API surface — not UI hiding —
- * enforces that diagnostics can never mutate state.
- */
-export interface DiagnosticsAuth {
-  /** Read-scoped bearer token; the backend rejects any write with it. */
-  readToken: string;
-  /** Authenticated internal user the lookup is attributed to. */
-  actor: string;
-}
-
-function lookupParams(lookup: DiagnosticsLookup): URLSearchParams {
-  const params = new URLSearchParams();
-  switch (lookup.kind) {
-    case 'vault':
-      params.set('vaultId', lookup.vaultId);
-      break;
-    case 'account':
-      params.set('account', lookup.account);
-      break;
-    case 'tx':
-      params.set('txHash', lookup.txHash);
-      break;
-    case 'receipt':
-      params.set('idempotencyKey', lookup.idempotencyKey);
-      break;
-  }
-  return params;
-}
-
-/**
- * Perform a single consolidated read-only diagnostic lookup. Only issues a GET
- * with the read-scoped token; the backend records the lookup in the immutable
- * audit log attributed to the authenticated internal user.
- */
-export async function fetchDiagnostics(
-  lookup: DiagnosticsLookup,
-  auth: DiagnosticsAuth,
-  cursor?: string,
-): Promise<DiagnosticsPage> {
-  const params = lookupParams(lookup);
-  if (cursor) params.set('cursor', cursor);
-
-  try {
-    const res = await fetch(`/api/internal/diagnostics?${params.toString()}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${auth.readToken}`,
-        'X-Internal-Actor': auth.actor,
-      },
-    });
-    if (!res.ok) throw new Error(`diagnostics ${res.status}`);
-    const body = (await res.json()) as Omit<DiagnosticsPage, 'degraded'>;
-    return { ...body, degraded: false };
-  } catch {
-    return { views: [], nextCursor: null, degraded: true };
-  }
-}
-
-/** The user's position in a vault. */
-export interface UserVaultPosition {
-  shares: number;
-  shareValue: number; // current USD value per share
-  totalValue: number;
-  accruedPremium: number;
-  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
-}
-
-export type WithdrawalStatus = "queued" | "processed" | "cancelled";
-
-/** One redemption request in a vault's withdrawal queue. */
-export interface WithdrawalRequest {
-  id: string;
-  vaultId: string;
-  /** Epoch the request was made in. Earlier epochs are served first. */
-  requestEpoch: number;
-  /** Monotonic tie-break within an epoch, assigned at request time. */
-  seq: number;
-  /** ISO time of the original request. Kept when unfilled requests carry forward. */
-  requestedAt: string;
-  requestedShares: number;
-  /** Shares still escrowed and not yet redeemed. */
-  escrowedShares: number;
-  filledShares: number;
-  /** filledShares / requestedShares, 0–1. Updated on every processing pass. */
-  fillFraction: number;
-  /** USD paid out, summed over every pass at that pass's processing NAV. */
-  payoutUsd: number;
-  status: WithdrawalStatus;
-}
-
-/** State of the vault at the point where the withdrawal queue is processed. */
-export interface ProcessingPoint {
-  /** NAV per share at processing. Requests settle at this price. */
-  navPerShare: number;
-  /** USD of liquid capital available to pay out. */
-  liquidityUsd: number;
-}
-
-/**
- * One point in a hypothetical NAV-per-share series produced by a shadow
- * run. Kept in its own namespace so it can never be read as live NAV.
- */
-export interface ShadowNavPoint {
-  epochNumber: number;
-  /** Hypothetical NAV per share in USD (paper trading only). */
-  navPerShare: number;
-  /** NAV per share the strategy model expected for this epoch. */
-  expectedNavPerShare: number;
-  /** ISO timestamp the shadow epoch settled. */
-  recordedAt: string;
-}
-
-/**
- * Side-by-side comparison of a shadow run against live and expected
- * performance. All shadow figures are paper trading and must be labeled
- * as such in the UI.
- */
-export interface ShadowComparison {
-  /** Latest hypothetical NAV per share from the shadow run. */
-  shadowNavPerShare: number;
-  /** Latest realized NAV per share of the live vault (null if none). */
-  liveNavPerShare: number | null;
-  /** NAV per share the strategy model expected for the latest epoch. */
-  expectedNavPerShare: number;
-  /** Shadow minus live NAV per share (null when no live history). */
-  shadowVsLiveDelta: number | null;
-  /** Shadow minus expected NAV per share. */
-  shadowVsExpectedDelta: number;
-  /** Number of complete shadow epochs recorded so far. */
-  completedEpochs: number;
-}
-
-/**
- * Shadow (paper-trading) state for a vault strategy. Tracked in its own
- * namespace, with its own hypothetical NAV series and epoch stream, so
- * the registry, indexer, and this read model never conflate it with real
- * balances.
- */
-export interface ShadowState {
-  /** Always `shadow` — makes the paper-trading label explicit in payloads. */
-  mode: "shadow";
-  /** Hypothetical NAV-per-share series, one point per complete epoch. */
-  navSeries: ShadowNavPoint[];
-  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
-  epochs: EpochRecord[];
-  /** Side-by-side comparison data for the operator console/analytics. */
-  comparison: ShadowComparison;
-}
-
-/**
- * Promotion criteria that must be met before a shadow strategy can be
- * moved to live allocation. Evaluated by the backend promotion gate; the
- * adapter surfaces the thresholds so the operator console can display
- * progress and block promotion when unmet.
- */
-export interface PromotionCriteria {
-  /** Minimum number of complete shadow epochs required. */
-  minCompleteEpochs: number;
-  /** Max allowed |shadow − expected| NAV deviation per share (USD). */
-  maxNavDeviation: number;
-  /** Whether any invariant violations were recorded during the run. */
-  invariantViolations: number;
-}
-
-/** Full detail for a single vault. */
-export interface VaultDetail extends VaultSummary {
-  currentEpoch: number;
-  currentPhase: EpochPhase;
-  phaseEndsAt: string; // ISO — when the current phase ends
-  sharePrice: number; // current NAV per share in USD
-  totalShares: number;
-  /** Internal book value backing shares (
+  |
