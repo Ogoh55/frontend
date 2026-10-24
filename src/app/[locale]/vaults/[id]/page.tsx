@@ -30,6 +30,7 @@ import {
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
+import { VaultAuditLog } from "../../../../components/VaultAuditLog";
 import { VaultGovernancePanel } from "../../../../components/VaultGovernancePanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
@@ -597,5 +598,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             <div>
                               {depositState.pricedInEpoch !== null
                                 ? t("form.pricedIn", { epoch: depositState.pricedInEpoch })
-                                : t("form.pricedWaitlist")}{" "}
-                              {sharesLine(dep
+                                : t
