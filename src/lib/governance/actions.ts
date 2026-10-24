@@ -281,6 +281,88 @@ export const GOVERNABLE_CONTRACTS: GovernableContract[] = [
         dangerous: true,
         dangerNote: "Pausing the vault locks deposits and withdrawals until it is unpaused.",
       },
+      // ── Issue #243: audit-logged parameter changes ────────────────────────
+      {
+        name: "set_epoch_advance",
+        label: "Force epoch advance",
+        summary: "Rolls the vault into the next epoch immediately, bypassing the scheduled boundary.",
+        params: [
+          {
+            name: "justification",
+            label: "Justification",
+            type: "string",
+            help: "Required: explain why a forced advance is necessary (e.g. oracle failure, settlement delay).",
+            display: "text",
+            multiline: true,
+            placeholder: "Forced due to …",
+          },
+        ],
+        dangerous: true,
+        dangerNote: "Forcing an epoch advance can strand in-flight deposits and withdrawals. This action is immutably recorded in the vault audit log.",
+      },
+      {
+        name: "set_strategy",
+        label: "Change strategy",
+        summary: "Updates the vault's option-writing strategy (covered_call, cash_secured_put, iron_condor, wheel).",
+        params: [
+          {
+            name: "strategy",
+            label: "New strategy",
+            type: "symbol",
+            placeholder: "covered_call",
+            readMethod: "strategy",
+            display: "symbol",
+          },
+          {
+            name: "justification",
+            label: "Justification",
+            type: "string",
+            help: "Required: document the risk-committee rationale.",
+            display: "text",
+            multiline: true,
+            placeholder: "Changing strategy because …",
+          },
+        ],
+        dangerous: true,
+        dangerNote: "Strategy changes affect depositor risk profile. The change is immutably recorded in the vault audit log.",
+      },
+      {
+        name: "withdraw_treasury",
+        label: "Treasury withdrawal",
+        summary: "Pulls accrued performance fees or treasury funds to the fee recipient address.",
+        params: [
+          {
+            name: "amount",
+            label: "Amount",
+            type: "i128",
+            placeholder: "10000000000",
+            help: "Amount in stroops (1 XLM = 10,000,000 stroops).",
+            display: "xlm",
+            unit: "XLM",
+            decimals: 7,
+          },
+          {
+            name: "recipient",
+            label: "Recipient",
+            type: "address",
+            placeholder: "G…",
+            help: "Stellar address to receive the funds.",
+            display: "address",
+            dangerous: true,
+          },
+          {
+            name: "justification",
+            label: "Justification",
+            type: "string",
+            help: "Required: describe the purpose of this withdrawal.",
+            display: "text",
+            multiline: true,
+            placeholder: "Treasury withdrawal for …",
+          },
+        ],
+        dangerous: true,
+        dangerNote: "Treasury withdrawals move depositor-adjacent funds. This action is immutably recorded in the vault audit log.",
+      },
       // ── Issue #242: share-weighted depositor governance controls ──────────
       {
         name: "set_quorum_bps",
@@ -999,49 +1081,3 @@ export function buildFormFields(
  * Fallback value when a param has neither a stored value nor a suggestion.
  *
  * A bool must resolve to "false" rather than "": a <select> of true/false has
- * no empty option, so an empty value would render as "false" while still
- * encoding as a missing required argument.
- */
-function defaultForParam(param: ActionParamSpec): string {
-  return param.type === "bool" ? "false" : "";
-}
-
-/** Pre-fill a blank action with the catalog's suggested values. */
-export function defaultValuesFor(
-  contractKey: string,
-  functionName: string
-): Record<string, string> {
-  const fn = findFunction(contractKey, functionName);
-  if (!fn) return {};
-  const values: Record<string, string> = {};
-  for (const param of fn.params) {
-    const value = param.suggested !== undefined ? param.suggested : defaultForParam(param);
-    if (value !== "") values[param.name] = value;
-  }
-  return values;
-}
-
-export function describeParamError(error: ParamError): string {
-  switch (error) {
-    case "required":
-      return "This field is required.";
-    case "not_a_number":
-      return "Enter a whole number.";
-    case "out_of_range":
-      return "Value is outside the allowed range for this type.";
-    case "not_integer":
-      return "Whole numbers only.";
-    case "invalid_address":
-      return "Enter a valid Stellar account (G…) or contract (C…) address.";
-    case "invalid_contract":
-      return "Enter a valid contract (C…) address.";
-    case "invalid_symbol":
-      return "Symbols cannot contain spaces.";
-    case "too_long":
-      return "Value is too long.";
-    case "invalid_bool":
-      return "Choose true or false.";
-    case "empty_list":
-      return "Provide at least one value.";
-  }
-}
