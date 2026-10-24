@@ -52,6 +52,9 @@ const clientEnvSchema = z.object({
   NEXT_PUBLIC_APP_VERSION: z.string().optional(),
   NEXT_PUBLIC_BUILD_SHA: z.string().optional(),
 
+  // Vaults data source (src/lib/api/vaults.ts). Anything but "live" uses the mock.
+  NEXT_PUBLIC_VAULTS: z.enum(["mock", "live"]).optional(),
+
   // Governance (#89): governable contract IDs, per network. All optional so a
   // deployment without governance still boots — the wizard degrades to a
   // "contracts not configured" state rather than failing at import time.

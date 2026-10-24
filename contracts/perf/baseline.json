@@ -2,7 +2,7 @@
   "version": 1,
   "recordedAt": "2026-09-30T10:11:21.064Z",
   "revision": "baseline-post-hotfix",
-  "description": "Initial baseline captured after the three hotspot fixes: BackendDataContext useMemo, SpotFeedContext useMemo, ChainTable row memoization. Numbers are conservative upper-bounds; tighten them after running on your dev machine with `npm run perf:baseline`.",
+  "description": "Initial baseline captured after the three hotspot fixes: BackendDataContext useMemo, SpotFeedContext useMemo, ChainTable row memoization. Numbers are conservative upper-bounds; tighten them after running on your dev machine with `npm run perf:baseline`. Vault scenarios added in issue #244.",
   "results": [
     {
       "scenario": "spot-tick",
@@ -47,6 +47,54 @@
       "totalLongTaskMs": 0,
       "startedAt": 0,
       "finishedAt": 150
+    },
+    {
+      "scenario": "vault-list-render",
+      "commitCount": 4,
+      "totalRenderMs": 320,
+      "p50RenderMs": 80,
+      "p95RenderMs": 240,
+      "longTasks": [],
+      "totalLongTaskMs": 0,
+      "startedAt": 0,
+      "finishedAt": 380,
+      "notes": "Vault listing page cold render baseline — 4 mock vault cards, Fast 3G throttle."
+    },
+    {
+      "scenario": "vault-detail-render",
+      "commitCount": 6,
+      "totalRenderMs": 480,
+      "p50RenderMs": 90,
+      "p95RenderMs": 310,
+      "longTasks": [],
+      "totalLongTaskMs": 0,
+      "startedAt": 0,
+      "finishedAt": 540,
+      "notes": "Vault detail page with epoch timeline, historical epochs table, user position sidebar."
+    },
+    {
+      "scenario": "epoch-transition",
+      "commitCount": 2,
+      "totalRenderMs": 18,
+      "p50RenderMs": 8,
+      "p95RenderMs": 22,
+      "longTasks": [],
+      "totalLongTaskMs": 0,
+      "startedAt": 0,
+      "finishedAt": 30,
+      "notes": "Re-render cost when vault:epoch_transition custom event fires. Must stay < 100 ms with zero long tasks."
+    },
+    {
+      "scenario": "withdrawal-queue-render",
+      "commitCount": 5,
+      "totalRenderMs": 210,
+      "p50RenderMs": 40,
+      "p95RenderMs": 180,
+      "longTasks": [],
+      "totalLongTaskMs": 0,
+      "startedAt": 0,
+      "finishedAt": 260,
+      "notes": "50-item queued withdrawal list render. domInteractive baseline for regression guard."
     }
   ]
 }
