@@ -6,11 +6,24 @@ pipeline, and branch protection setup.
 ## Contents
 
 - [Getting started](#getting-started)
+- [Security researchers & bug bounty program](#security-researchers--bug-bounty-program)
 - [Development workflow](#development-workflow)
 - [CI pipeline](#ci-pipeline)
 - [Bundle budgets](#bundle-budgets)
 - [Branch protection setup](#branch-protection-setup)
 - [TypeScript strictness](#typescript-strictness)
+- [Reporting a security vulnerability](#reporting-a-security-vulnerability)
+
+---
+
+## Security researchers & bug bounty program
+
+If you have discovered a security vulnerability or potential defect affecting vault custody, smart contracts, backend APIs, or client signing surfaces:
+
+- **DO NOT open public GitHub issues or pull requests.**
+- Submit your finding confidentially via a **GitHub Private Security Advisory** on this repository or email encrypted reports to `security@zenith-options.org`.
+- Zenith maintains an active, public **Bug Bounty Program** with rewards up to **$25,000 USD / USDC** and full **Safe Harbour** protection for good-faith researchers.
+- Read the complete scope, asset inventory, and triage SLAs in [`docs/security/bug-bounty-program.md`](docs/security/bug-bounty-program.md) and [`SECURITY.md`](SECURITY.md).
 
 ---
 
@@ -245,15 +258,36 @@ sub-flags enabled (see `tsconfig.json`). The currently enabled flags are:
 | `noFallthroughCasesInSwitch` | No implicit switch fallthrough |
 
 The remaining strict flags (`strictNullChecks`, `noImplicitAny`) are not yet
-enabled because they surface ~200+ pre-existing type errors that need to be
-addressed incrementally. Tracked as a follow-up under
-**TODO(#103-strict): enable `strict: true`**.
+enabled because they
 
-To check the current TypeScript error count:
+---
 
-```bash
-npm run typecheck 2>&1 | grep "error TS" | wc -l
-```
+## Reporting a security vulnerability
 
-PRs that **fix** pre-existing type errors are welcome. PRs that **add new**
-type errors will be blocked by the `Typecheck` required status check.
+**Do not open a public issue, PR, or discussion for a security bug.**
+
+Security reports for the vault stack (vault contracts, vault backend API, and
+vault frontend surfaces) go through our coordinated vulnerability disclosure
+process. Researchers are the entry point for that program:
+
+- **Program page (scope, severity tiers, reward bands, safe harbour):**
+  [`docs/bug-bounty.md`](docs/bug-bounty.md)
+- **Repository security policy:** [`SECURITY.md`](SECURITY.md)
+- **Triage runbook (intake, SLAs, embargo/disclosure timeline):**
+  [`docs/triage-runbook.md`](docs/triage-runbook.md)
+
+### How to submit
+
+1. Read the scope and out-of-scope categories in
+   [`docs/bug-bounty.md`](docs/bug-bounty.md) before testing.
+2. Send the report to the private intake channel listed in
+   [`SECURITY.md`](SECURITY.md) — never via a public GitHub issue.
+3. Include reproduction steps, affected asset (contract ID / API endpoint /
+   frontend route), and impact assessment.
+
+You will receive an acknowledgement within the SLA defined in the triage
+runbook. Please respect the embargo window before any public disclosure.
+
+If you are unsure whether something is in scope, submit it anyway — triage
+will make the scope call, and good-faith reports are covered by the
+safe-harbour statement in the program page.
