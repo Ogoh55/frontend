@@ -288,6 +288,85 @@ export type VaultStrategy = z.infer<typeof VaultStrategySchema>;
 export type RiskRating = z.infer<typeof RiskRatingSchema>;
 export type EpochPhase = z.infer<typeof EpochPhaseSchema>;
 
+// ---------------------------------------------------------------------------
+// Multi-asset collateral support (issue #217)
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical collateral asset descriptor for a vault.
+ *
+ * A vault declares exactly one collateral asset at creation and it is
+ * immutable afterwards. Classic Stellar assets use 7 decimals; Soroban
+ * token contracts may declare arbitrary decimals. All contract math works
+ * in base units; display units are derived at the API boundary via
+ * `normalizeAmount` / `formatAssetAmount`.
+ */
+export interface CollateralAsset {
+  /** Asset code, e.g. "USDC" or "AQUA". */
+  code: string;
+  /**
+   * Classic Stellar issuer (G...) for classic assets, or the Soroban token
+   * contract id (C...) for token contracts. Null for native XLM.
+   */
+  issuer: string | null;
+  /** Soroban token contract id (C...) when the asset is a token contract. */
+  contractId: string | null;
+  /** Declared decimals for the asset (7 for classic Stellar assets). */
+  decimals: number;
+}
+
+/** Classic Stellar assets always use 7 decimals. */
+export const CLASSIC_ASSET_DECIMALS = 7;
+
+/**
+ * Per-network allowlist of supported collateral assets. Vault creation is
+ * validated against this list; assets without a healthy oracle are excluded.
+ */
+export interface CollateralAllowlist {
+  network: "mainnet" | "testnet" | "futurenet";
+  assets: CollateralAsset[];
+}
+
+/**
+ * Single shared normalization helper: convert a base-unit integer amount
+ * into display units using the asset's declared decimals. Used for share
+ * pricing, NAV, capacity, and fee math so no module re-implements scaling.
+ */
+export function normalizeAmount(baseUnits: bigint | number, decimals: number): number {
+  const units = typeof baseUnits === "bigint" ? baseUnits : BigInt(Math.trunc(baseUnits));
+  return Number(units) / 10 ** decimals;
+}
+
+/** Inverse of `normalizeAmount`: display units → base-unit integer. */
+export function toBaseUnits(amount: number, decimals: number): bigint {
+  return BigInt(Math.round(amount * 10 ** decimals));
+}
+
+/**
+ * Validate that a display-unit amount does not exceed the asset's declared
+ * decimals. Returns an error message for over-precision amounts, or null.
+ */
+export function validateAssetPrecision(amount: number, decimals: number): string | null {
+  if (!Number.isFinite(amount) || amount < 0) return "Amount must be a non-negative number";
+  const scaled = amount * 10 ** decimals;
+  if (Math.abs(scaled - Math.round(scaled)) > 1e-6) {
+    return `Amount exceeds ${decimals} decimal places for this asset`;
+  }
+  return null;
+}
+
+/**
+ * Format a base-unit amount for display using the asset's decimals.
+ * Very small share prices are preserved (never rounded to zero) by
+ * falling back to significant-digit formatting.
+ */
+export function formatAssetAmount(baseUnits: bigint | number, decimals: number): string {
+  const value = normalizeAmount(baseUnits, decimals);
+  if (value === 0) return "0";
+  if (Math.abs(value) < 0.01) return value.toPrecision(4);
+  return value.toLocaleString(undefined, { maximumFractionDigits: Math.min(decimals, 6) });
+}
+
 /**
  * Execution mode of a vault strategy.
  *
@@ -442,6 +521,8 @@ export interface VaultSummary {
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  /** Immutable collateral asset this vault operates in. */
+  collateralAsset: CollateralAsset;
   /** Execution mode; `shadow` results are paper trading, not realized. */
   mode: VaultMode;
   status: VaultStatus;
