@@ -32,6 +32,7 @@ import {
   type VaultSummary,
 } from "../../../lib/api/vaults";
 import { useFlag } from "../../../lib/flags";
+import { VaultHealthBadge } from "../../../components/VaultHealthBadge";
 
 const ABSENT = "—";
 
