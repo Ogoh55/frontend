@@ -281,6 +281,83 @@ export const GOVERNABLE_CONTRACTS: GovernableContract[] = [
         dangerous: true,
         dangerNote: "Pausing the vault locks deposits and withdrawals until it is unpaused.",
       },
+      // ── Issue #241: cash buffer and JIT unwind governance controls ────────
+      {
+        name: "set_cash_buffer_bps",
+        label: "Target cash buffer",
+        summary: "Sets the target idle-cash buffer as a fraction of TVL (basis points).",
+        params: [
+          {
+            name: "buffer_bps",
+            label: "Target buffer",
+            type: "u32",
+            placeholder: "500",
+            help: "Basis points of TVL to keep as idle cash. 500 = 5%.",
+            readMethod: "cash_buffer_bps",
+            unit: "%",
+            decimals: 2,
+            display: "bps",
+            suggested: "500",
+          },
+        ],
+      },
+      {
+        name: "set_min_buffer_bps",
+        label: "Minimum cash buffer",
+        summary: "Hard floor below which the vault halts new deposits and raises an alert.",
+        params: [
+          {
+            name: "min_buffer_bps",
+            label: "Minimum buffer",
+            type: "u32",
+            placeholder: "200",
+            help: "Basis points of TVL. 200 = 2%.",
+            readMethod: "min_buffer_bps",
+            unit: "%",
+            decimals: 2,
+            display: "bps",
+            suggested: "200",
+          },
+        ],
+        dangerous: true,
+        dangerNote: "Lowering the minimum buffer increases the risk of the vault being unable to service redemptions without a fire-sale unwind.",
+      },
+      {
+        name: "set_unwind_priority",
+        label: "JIT unwind priority",
+        summary: "Sets the criterion used to rank positions for the JIT unwind plan.",
+        params: [
+          {
+            name: "priority",
+            label: "Unwind priority",
+            type: "symbol",
+            placeholder: "least_loss",
+            help: "One of: least_loss, nearest_expiry, largest_notional.",
+            readMethod: "unwind_priority",
+            display: "symbol",
+            suggested: "least_loss",
+          },
+        ],
+      },
+      {
+        name: "set_max_unwind_slippage_bps",
+        label: "Max unwind slippage",
+        summary: "Maximum slippage the JIT engine will accept before escalating to the operator.",
+        params: [
+          {
+            name: "slippage_bps",
+            label: "Max slippage",
+            type: "u32",
+            placeholder: "200",
+            help: "Basis points. 200 = 2%.",
+            readMethod: "max_unwind_slippage_bps",
+            unit: "%",
+            decimals: 2,
+            display: "bps",
+            suggested: "200",
+          },
+        ],
+      },
       // ── Issue #243: audit-logged parameter changes ────────────────────────
       {
         name: "set_epoch_advance",
@@ -1008,76 +1085,4 @@ export function describeAction(action: ProposalAction): string {
 /** Why an action is flagged dangerous, or null when it is safe. */
 export function dangerNote(action: ProposalAction): string | null {
   const contract = findContract(action.contractKey);
-  const fn = contract?.functions.find((f) => f.name === action.functionName);
-  if (!fn) return null;
-  if (fn.dangerous) return fn.dangerNote ?? "This action can affect all protocol funds.";
-  const dangerousParam = fn.params.find((p) => p.dangerous);
-  return dangerousParam ? `“${dangerousParam.label}” cannot be changed back safely.` : null;
-}
-
-export function isDangerous(action: ProposalAction): boolean {
-  return dangerNote(action) !== null;
-}
-
-// ---------------------------------------------------------------------------
-// Form generator
-// ---------------------------------------------------------------------------
-
-/** A single rendered form field, produced from an `ActionParamSpec`. */
-export interface FormField {
-  /** DOM id — stable across renders so labels stay associated. */
-  id: string;
-  name: string;
-  label: string;
-  type: ActionParamType;
-  value: string;
-  placeholder: string;
-  help?: string;
-  multiline: boolean;
-  /** Render as a select (enumerations) rather than a text input. */
-  options?: { value: string; label: string }[];
-  /** Controlled-component callback target. */
-  inputMode?: "text" | "numeric";
-}
-
-const BOOL_OPTIONS = [
-  { value: "false", label: "false" },
-  { value: "true", label: "true" },
-];
-
-/**
- * Generate the form model for a governable function.  This is the
- * schema-driven form generator the wizard renders — no per-parameter JSX.
- */
-export function buildFormFields(
-  action: Pick<ProposalAction, "contractKey" | "functionName" | "values">,
-  idPrefix = "action"
-): FormField[] {
-  const fn = findFunction(action.contractKey, action.functionName);
-  if (!fn) return [];
-
-  return fn.params.map((param) => {
-    const field: FormField = {
-      id: `${idPrefix}-${param.name}`,
-      name: param.name,
-      label: param.label,
-      type: param.type,
-      value: action.values[param.name] ?? param.suggested ?? defaultForParam(param),
-      placeholder: param.placeholder ?? "",
-      help: param.help,
-      multiline: param.multiline === true || param.type === "vec<address>",
-    };
-
-    if (param.type === "bool") field.options = BOOL_OPTIONS;
-    if (param.type === "u32" || param.type === "u64" || param.type === "u128" || param.type === "i128") {
-      field.inputMode = "numeric";
-    }
-
-    return field;
-  });
-}
-
-/**
- * Fallback value when a param has neither a stored value nor a suggestion.
- *
- * A bool must resolve to "false" rather than "": a <select> of true/false has
+  const fn = contract?.functions.find((f) => f.name === action

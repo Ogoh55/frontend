@@ -33,6 +33,7 @@ import {
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
+import { VaultLiquidityPanel } from "../../../../components/VaultLiquidityPanel";
 import { VaultAuditLog } from "../../../../components/VaultAuditLog";
 import { VaultGovernancePanel } from "../../../../components/VaultGovernancePanel";
 import { VaultHealthPanel } from "../../../../components/VaultHealthPanel";
@@ -467,6 +468,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                 </div>
 
                 <VaultReturnProjection historicalEpochs={vault.historicalEpochs} />
+                <VaultLiquidityPanel vault={vault} />
+                <VaultAuditLog vaultId={vault.id} />
+                <VaultGovernancePanel vault={vault} />
               </div>
 
               {/* Right sidebar: user position + deposit/withdraw */}
@@ -667,4 +671,86 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             type="number"
                             min={0}
                             value={depositAmount}
-                            onChange={e => setDepositAmount(e
+                            onChange={e => setDepositAmount(e.target.value)}
+                            placeholder="0.00"
+                            style={{
+                              width: "100%", padding: "8px 10px",
+                              background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
+                              color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
+                            }}
+                          />
+                          {depositAmount && !isNaN(parseFloat(depositAmount)) && parseFloat(depositAmount) > 0 && (
+                            <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
+                              ≈ {(parseFloat(depositAmount) / vault.sharePrice).toFixed(4)} shares
+                            </div>
+                          )}
+                        </div>
+                        {/* Queued withdrawal notice if epoch is active */}
+                        {vault.currentPhase === "active" && (
+                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--atm)", padding: "6px 8px", background: "var(--atm-dim)" }}>
+                            Deposits during active epochs are queued for the next epoch start.
+                          </div>
+                        )}
+                        {/* Depositor disclosures: shown and acknowledged before the deposit can be submitted */}
+                        <div style={{ marginBottom: 12, padding: 10, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", fontSize: 10, color: "var(--text-lo)", lineHeight: 1.6 }}>
+                          <div><span style={{ color: "var(--text-mid)" }}>Risk level:</span> {vault.riskRating}</div>
+                          <div><span style={{ color: "var(--text-mid)" }}>Strategy:</span> {vault.description}</div>
+                          <div>
+                            <span style={{ color: "var(--text-mid)" }}>Fees:</span>{" "}
+                            {vault.feeStructure.managementPct}% management annually, {vault.feeStructure.performancePct}% performance
+                          </div>
+                          <div>
+                            Deposits are queued and redemptions are processed through the withdrawal queue at epoch end;
+                            redemption at the final NAV is not guaranteed to match the current share price.
+                          </div>
+                          <label style={{ display: "flex", gap: 6, alignItems: "flex-start", marginTop: 8, color: "var(--text-hi)", cursor: "pointer" }}>
+                            <input
+                              type="checkbox"
+                              checked={disclosuresAcknowledged}
+                              onChange={e => setDisclosuresAcknowledged(e.target.checked)}
+                              style={{ marginTop: 2 }}
+                            />
+                            <span>I have read the risk level, strategy, fees and queue/redemption terms above.</span>
+                          </label>
+                        </div>
+                        {gateReason && (
+                          <div role="alert" style={{ marginBottom: 10, fontSize: 10, color: "var(--put)", padding: "6px 8px", background: "var(--put-dim)" }}>
+                            <strong>{t("depositBlocked")}:</strong> {t(`reason.${gateReason}`)}
+                          </div>
+                        )}
+                        <button
+                          onClick={handleDeposit}
+                          disabled={!disclosuresAcknowledged || txStatus === "pending" || !currentAck || !!gateReason || !depositAmount || isNaN(parseFloat(depositAmount)) || parseFloat(depositAmount) <= 0}
+                          style={{
+                            width: "100%", padding: "10px 0", background: "var(--brand)",
+                            color: "var(--bg)", border: "none", fontSize: 13, fontWeight: 700,
+                            cursor: txStatus === "pending" || !currentAck || gateReason ? "default" : "pointer",
+                            opacity: txStatus === "pending" || !currentAck || gateReason ? 0.6 : 1,
+                          }}
+                        >
+                          {txStatus === "pending" ? "Confirming…" : "Deposit"}
+                        </button>
+                      </div>
+                    )}
+
+                    {activeFlow === "withdraw" && permittedActions.includes("withdraw") && (
+                      <div style={{ padding: 16 }}>
+                        <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
+                          Withdrawal requests are queued and processed at the end of the current epoch.
+                          Shares are redeemed at the final NAV after settlement.
+                        </div>
+                        <div style={{ marginBottom: 12 }}>
+                          <label style={{ fontSize: 10, color: "var(--text-lo)", display: "block", marginBottom: 4 }}>Shares to Withdraw</label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={withdrawShares}
+                            onChange={e => setWithdrawShares(e.target.value)}
+                            placeholder="0.0000"
+                            style={{
+                              width: "100%", padding: "8px 10px",
+                              background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
+                              color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
+                            }}
+                          />
+                          {withdrawShares && !isNaN(parseFloat(withdrawShares)) &&
