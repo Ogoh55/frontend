@@ -1,0 +1,8 @@
+{
+  "vaults": {
+    "defaultValue": false,
+    "stage": "internal",
+    "stages": ["internal", "canary", "ga"],
+    "runbook": "docs/feature-flag-rollout.md"
+  }
+}

@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { fmtK, fmtN, seededRandom } from "../../lib/pricing";
+import { useGridNavigation } from "../../lib/hooks/useGridNavigation";
 import { EmptyState, ErrorState, SkeletonRegion, Skeleton } from "../../components/states";
 import { Term } from "../onboarding/Term";
 import type { ChainResult, ChainRow } from "./useChain";
@@ -14,7 +15,12 @@ interface Props {
   sym: string;
   expiryLabel: string;
   onTrade: (row: ChainRow, side: TradeSide, mode: TradeMode) => void;
+  /** Set while the order ticket is open; focus returns to the last traded cell when it closes. */
+  ticketOpen?: boolean;
 }
+
+// Wide-layout grid columns, left to right. Trade columns are the bid/ask buttons.
+const GRID_COLS = 11;
 
 // Display-only mock volume/OI — deterministic so SSR and client agree.
 const mockVol = (strike: number) => Math.round(seededRandom(strike * 1000) * 200 + 20);
@@ -55,15 +61,48 @@ function ChainSkeleton() {
  * toggle. Both are always rendered and CSS picks one, so there's no
  * hydration mismatch and no layout jump when the width is known.
  */
-export function ChainView({ chain, sym, expiryLabel, onTrade }: Props) {
+export function ChainView({ chain, sym, expiryLabel, onTrade, ticketOpen = false }: Props) {
   const [mobileSide, setMobileSide] = useState<TradeSide>("call");
+  const [announcement, setAnnouncement] = useState("");
+  const gridRef = useRef<HTMLDivElement>(null);
+  const lastTrade = useRef<{ row: number; col: number } | null>(null);
   const { query, rows, source } = chain;
+  const rowKeys = useMemo(() => rows.map(r => r.strike), [rows]);
+  const { getCellProps, onKeyDown: navKeyDown, focusCell } = useGridNavigation({
+    containerRef: gridRef, rowKeys, colCount: GRID_COLS,
+  });
+
+  // Hand focus back to the cell that opened the ticket, unless the user has already moved elsewhere.
+  const wasTicketOpen = useRef(false);
+  useEffect(() => {
+    const active = document.activeElement;
+    if (wasTicketOpen.current && !ticketOpen && lastTrade.current && (!active || active === document.body)) {
+      focusCell(lastTrade.current.row, lastTrade.current.col);
+    }
+    wasTicketOpen.current = ticketOpen;
+  }, [ticketOpen, focusCell]);
 
   if (source === "none") {
     return <div className="chain-container" data-tour="chain"><ChainSkeleton /></div>;
   }
 
   const atmIdx = rows.findIndex(r => !r.itmCall);
+
+  // Enter/Space on a bid or ask button fires its click; remember the cell so focus can return to it.
+  const trade = (row: number, col: number, fn: () => void) => () => {
+    lastTrade.current = { row, col };
+    fn();
+  };
+
+  // "Q" reads the focused cell's label aloud on demand. Ticks never announce on their own.
+  const onGridKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "q" || e.key === "Q") {
+      e.preventDefault();
+      setAnnouncement((e.target as HTMLElement).getAttribute("aria-label") ?? "");
+      return;
+    }
+    navKeyDown(e);
+  };
 
   return (
     <div className="chain-container" data-tour="chain" data-testid="chain" data-source={source}>
@@ -94,63 +133,83 @@ export function ChainView({ chain, sym, expiryLabel, onTrade }: Props) {
       ) : (
         <>
           {/* ── Wide: both sides ─────────────────────────────────────── */}
-          <div className="chain-desktop">
-            <div className="chain-header">
-              <div className="ch call"><Term id="volume">Vol</Term></div>
-              <div className="ch call"><Term id="oi">OI</Term></div>
-              <div className="ch call"><Term id="bid">Bid</Term></div>
-              <div className="ch call"><Term id="ask">Ask</Term></div>
-              <div className="ch call"><Term id="iv">IV</Term></div>
-              <div className="ch center"><Term id="strike">Strike</Term></div>
-              <div className="ch put"><Term id="iv">IV</Term></div>
-              <div className="ch put"><Term id="ask">Ask</Term></div>
-              <div className="ch put"><Term id="bid">Bid</Term></div>
-              <div className="ch put"><Term id="oi">OI</Term></div>
-              <div className="ch put"><Term id="volume">Vol</Term></div>
+          <div className="chain-desktop" role="grid" ref={gridRef} aria-label={`${sym} ${expiryLabel} options chain`}
+            aria-rowcount={rows.length + 1} aria-colcount={GRID_COLS} onKeyDown={onGridKeyDown}>
+            <div className="chain-header" role="row" aria-rowindex={1}>
+              <div className="ch call" role="columnheader"><Term id="volume">Vol</Term></div>
+              <div className="ch call" role="columnheader"><Term id="oi">OI</Term></div>
+              <div className="ch call" role="columnheader"><Term id="bid">Bid</Term></div>
+              <div className="ch call" role="columnheader"><Term id="ask">Ask</Term></div>
+              <div className="ch call" role="columnheader"><Term id="iv">IV</Term></div>
+              <div className="ch center" role="columnheader"><Term id="strike">Strike</Term></div>
+              <div className="ch put" role="columnheader"><Term id="iv">IV</Term></div>
+              <div className="ch put" role="columnheader"><Term id="ask">Ask</Term></div>
+              <div className="ch put" role="columnheader"><Term id="bid">Bid</Term></div>
+              <div className="ch put" role="columnheader"><Term id="oi">OI</Term></div>
+              <div className="ch put" role="columnheader"><Term id="volume">Vol</Term></div>
             </div>
             {rows.map((row, i) => {
               const isAtm = i === atmIdx;
               const vol = mockVol(row.strike);
               const oi = mockOi(row.strike);
               const k = fmtK(row.strike);
+              const atm = isAtm ? ", at the money" : "";
+              const callBid = Math.max(0, row.call.premium - spread(row, "call"));
+              const callAsk = row.call.premium + spread(row, "call");
+              const putBid = Math.max(0, row.put.premium - spread(row, "put"));
+              const putAsk = row.put.premium + spread(row, "put");
+              const metric = (col: number, side: TradeSide, text: string, label: string, className: string) => (
+                <div role="gridcell" className={className} aria-label={`${sym} ${k} ${side}${atm}, ${label} ${text}`}
+                  {...getCellProps(i, col)}>{text}</div>
+              );
               return (
-                <div key={row.strike}
+                <div key={row.strike} role="row" aria-rowindex={i + 2}
                   className={`chain-row${row.itmCall ? " itm-call" : ""}${row.itmPut ? " itm-put" : ""}`}
                   style={{ background: isAtm ? "var(--atm-dim)" : undefined }}>
-                  <div className="cc">{vol}</div>
-                  <div className="cc">{oi.toLocaleString()}</div>
-                  <button type="button" className="cc tradeable call" title="Click to write (sell)"
-                    aria-label={`Write ${sym} ${k} call at bid ${fmtN(Math.max(0, row.call.premium - spread(row, "call")))}`}
-                    onClick={() => onTrade(row, "call", "write")}>
-                    {fmtN(Math.max(0, row.call.premium - spread(row, "call")))}
-                  </button>
-                  <button type="button" className="cc tradeable call" title="Click to buy"
-                    aria-label={`Buy ${sym} ${k} call at ask ${fmtN(row.call.premium + spread(row, "call"))}`}
-                    onClick={() => onTrade(row, "call", "buy")}>
-                    {fmtN(row.call.premium + spread(row, "call"))}
-                  </button>
-                  <div className="cc brand">{(row.call.iv * 100).toFixed(1)}</div>
-                  <div className={`strike-cell${isAtm ? " atm" : ""}`}>
+                  {metric(0, "call", String(vol), "volume", "cc")}
+                  {metric(1, "call", oi.toLocaleString(), "open interest", "cc")}
+                  <div role="gridcell" style={{ display: "contents" }}>
+                    <button type="button" className="cc tradeable call" title="Click to write (sell)" {...getCellProps(i, 2)}
+                      aria-label={`Write ${sym} ${k} call at bid ${fmtN(callBid)}, delta ${row.call.delta.toFixed(2)}${atm}`}
+                      onClick={trade(i, 2, () => onTrade(row, "call", "write"))}>
+                      {fmtN(callBid)}
+                    </button>
+                  </div>
+                  <div role="gridcell" style={{ display: "contents" }}>
+                    <button type="button" className="cc tradeable call" title="Click to buy" {...getCellProps(i, 3)}
+                      aria-label={`Buy ${sym} ${k} call at ask ${fmtN(callAsk)}, delta ${row.call.delta.toFixed(2)}${atm}`}
+                      onClick={trade(i, 3, () => onTrade(row, "call", "buy"))}>
+                      {fmtN(callAsk)}
+                    </button>
+                  </div>
+                  {metric(4, "call", (row.call.iv * 100).toFixed(1), "implied volatility percent", "cc brand")}
+                  <div role="gridcell" className={`strike-cell${isAtm ? " atm" : ""}`}
+                    aria-label={`${sym} strike ${k}${atm}`} {...getCellProps(i, 5)}>
                     {k}
                     {isAtm && <div style={{ fontSize: 7, marginTop: 1, opacity: 0.6 }}>ATM</div>}
                   </div>
-                  <div className="cc brand">{(row.put.iv * 100).toFixed(1)}</div>
-                  <button type="button" className="cc tradeable put" title="Click to buy"
-                    aria-label={`Buy ${sym} ${k} put at ask ${fmtN(row.put.premium + spread(row, "put"))}`}
-                    onClick={() => onTrade(row, "put", "buy")}>
-                    {fmtN(row.put.premium + spread(row, "put"))}
-                  </button>
-                  <button type="button" className="cc tradeable put" title="Click to write (sell)"
-                    aria-label={`Write ${sym} ${k} put at bid ${fmtN(Math.max(0, row.put.premium - spread(row, "put")))}`}
-                    onClick={() => onTrade(row, "put", "write")}>
-                    {fmtN(Math.max(0, row.put.premium - spread(row, "put")))}
-                  </button>
-                  <div className="cc">{oi.toLocaleString()}</div>
-                  <div className="cc">{vol}</div>
+                  {metric(6, "put", (row.put.iv * 100).toFixed(1), "implied volatility percent", "cc brand")}
+                  <div role="gridcell" style={{ display: "contents" }}>
+                    <button type="button" className="cc tradeable put" title="Click to buy" {...getCellProps(i, 7)}
+                      aria-label={`Buy ${sym} ${k} put at ask ${fmtN(putAsk)}, delta ${row.put.delta.toFixed(2)}${atm}`}
+                      onClick={trade(i, 7, () => onTrade(row, "put", "buy"))}>
+                      {fmtN(putAsk)}
+                    </button>
+                  </div>
+                  <div role="gridcell" style={{ display: "contents" }}>
+                    <button type="button" className="cc tradeable put" title="Click to write (sell)" {...getCellProps(i, 8)}
+                      aria-label={`Write ${sym} ${k} put at bid ${fmtN(putBid)}, delta ${row.put.delta.toFixed(2)}${atm}`}
+                      onClick={trade(i, 8, () => onTrade(row, "put", "write"))}>
+                      {fmtN(putBid)}
+                    </button>
+                  </div>
+                  {metric(9, "put", oi.toLocaleString(), "open interest", "cc")}
+                  {metric(10, "put", String(vol), "volume", "cc")}
                 </div>
               );
             })}
           </div>
+          <div role="status" aria-live="polite" className="sr-only">{announcement}</div>
 
           {/* ── Narrow: one side, sticky strike ──────────────────────── */}
           <div className="chain-mobile" data-testid="chain-mobile">
