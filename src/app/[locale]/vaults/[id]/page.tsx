@@ -8,6 +8,7 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
@@ -63,6 +64,7 @@ function fmtDateTime(iso: string) {
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
+  const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
   const t = useTranslations("vaults");
   const tDisclosure = useTranslations("vaultDisclosure");
@@ -98,10 +100,10 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   );
 
   useEffect(() => {
-    fetchVaultDetail(id, token)
+    fetchVaultDetail(id, token, { enabled: vaultsEnabled })
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, [id, token]);
+  }, [id, token, vaultsEnabled]);
 
   // Re-evaluate limit staleness while the page stays open.
   useEffect(() => {
@@ -175,6 +177,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        enabled: vaultsEnabled,
       });
       const pricing = state.pricedInEpoch !== null
         ? t("form.pricedIn", { epoch: state.pricedInEpoch })
@@ -259,7 +262,11 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
             </div>
           )}
 
-          {!loading && !error && !vault && (
+          {!loading && !error && !vault && !vaultsEnabled && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
+          )}
+
+          {!loading && !error && !vault && vaultsEnabled && (
             <div style={{ fontSize: 13, color: "var(--text-lo)" }}>Vault not found.</div>
           )}
 
@@ -494,7 +501,10 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
                     {/* Tab switcher */}
                     <div style={{ display: "flex", borderBottom: "1px solid var(--border-default)" }}>
-                      {(["deposit", "withdraw"] as const).filter(flow => permittedActions.includes(flow)).map(flow => (
+                      {(["deposit", "withdraw"] as const)
+                        .filter(flow => permittedActions.includes(flow))
+                        .filter(flow => flow !== "deposit" || vaultsEnabled)
+                        .map(flow => (
                         <button key={flow} onClick={() => { setActiveFlow(activeFlow === flow ? null : flow); setTxStatus(null); }}
                           style={{
                             flex: 1, padding: "10px 0", border: "none", cursor: "pointer",
@@ -509,7 +519,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       ))}
                     </div>
 
-                    {activeFlow === "deposit" && permittedActions.includes("deposit") && (
+                    {activeFlow === "deposit" && vaultsEnabled && permittedActions.includes("deposit") && (
                       <div style={{ padding: 16 }}>
                         {acks === null && (
                           <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{tDisclosure("checking")}</div>
@@ -590,10 +600,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                           </div>
                         )}
                         {overMax && depositState && (
-                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--put)" }}>
-                            {t("form.overMax", { amount: fmtUsd(depositState.maxDeposit) })}
-                          </div>
-                        )}
-                        {/* Depositor disclosures: shown and acknowledged before the deposit can be submitted */}
-                        <div style={{ marginBottom: 12, padding: 10, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", fontSize: 10, color: "var(--text-lo)", lineHeight: 1.6 }}>
-                          <div><span style={{ color: "var(--text-mid)" }}>Risk
+                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--put
