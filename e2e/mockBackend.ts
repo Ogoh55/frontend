@@ -17,6 +17,10 @@ export interface MockOptions {
   epochLedger?: unknown[];
   /** Force a specific vault route to fail with the given status/body. */
   vaultErrors?: Record<string, { status: number; body: unknown }>;
+  /** Vault-written supply summary keyed by (underlying, expiry, strike). */
+  vaultSupply?: unknown;
+  /** Make the vault supply endpoint fail with 500 (source unavailable). */
+  vaultSupplyUnavailable?: boolean;
 }
 
 export interface MockBackend {
@@ -51,6 +55,36 @@ function chain(sym: string, days: number) {
     const K = Math.round(S * (1 + (i - 10) * 0.04) * 10000) / 10000;
     return { strike: K, expiry_days: days, call: price(S, K, days / 365, true), put: price(S, K, days / 365, false), is_itm_call: S > K, is_itm_put: S < K };
   });
+}
+
+/**
+ * Deterministic vault supply summary for the mocked chain: a handful of strikes
+ * near the money carry vault-written OI so the annotation/filter/overlay have
+ * something real to render. Shape mirrors the aggregated supply endpoint.
+ */
+function vaultSupply(sym: string, days: number) {
+  const S = SPOT[sym] ?? 1;
+  const rows = [
+    { offset: -2, option_type: "call", vault_oi: 120, total_oi: 400 },
+    { offset: 0, option_type: "call", vault_oi: 85, total_oi: 250 },
+    { offset: 1, option_type: "put", vault_oi: 60, total_oi: 300 },
+    { offset: 3, option_type: "put", vault_oi: 40, total_oi: 160 },
+  ];
+  return {
+    underlying: sym,
+    expiry_days: days,
+    contracts: rows.map(r => {
+      const strike = Math.round(S * (1 + r.offset * 0.04) * 10000) / 10000;
+      return {
+        strike,
+        expiry_days: days,
+        option_type: r.option_type,
+        vault_oi: r.vault_oi,
+        total_oi: r.total_oi,
+        vault_share: r.total_oi > 0 ? r.vault_oi / r.total_oi : 0,
+      };
+    }),
+  };
 }
 
 export const samplePosition = {
@@ -120,6 +154,11 @@ export async function mockBackend(page: Page, opts: MockOptions = {}): Promise<M
       if (p === "/chain") return json(chain(url.searchParams.get("underlying") ?? "XLM", Number(url.searchParams.get("expiry_days") ?? 30)));
       if (p.startsWith("/expiries/")) return json({ underlying: "XLM", spot: 0.1182, vol: 0.82, expiries: [7, 14, 30, 60, 90, 180].map(d => ({ days_to_expiry: d, label: `${d}D`, timestamp: 0 })) });
       if (p === "/spot") return json({ prices: SPOT, vols: {} });
+      if (p === "/vaults/supply") {
+        if (opts.vaultSupplyUnavailable) return json({ error: "vault supply unavailable" }, 503);
+        if (opts.vaultSupply !== undefined) return json(opts.vaultSupply);
+        return json(vaultSupply(url.searchParams.get("underlying") ?? "XLM", Number(url.searchParams.get("expiry_days") ?? 30)));
+      }
 
       // Everything below is authed — tokens are per mode.
       if (auth !== `Bearer ${mode}-token`) return json({ error: "unauthorized" }, 401);

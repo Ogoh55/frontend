@@ -26,6 +26,12 @@ const parsed = parseEnv({
   VAULT_RATE_LIMIT_WRITE_PER_WALLET: process.env.VAULT_RATE_LIMIT_WRITE_PER_WALLET,
   VAULT_RATE_LIMIT_WRITE_PER_IP: process.env.VAULT_RATE_LIMIT_WRITE_PER_IP,
   VAULT_RATE_LIMIT_WINDOW_SECONDS: process.env.VAULT_RATE_LIMIT_WINDOW_SECONDS,
+  NEXT_PUBLIC_ANCHOR_TESTNET_URL: process.env.NEXT_PUBLIC_ANCHOR_TESTNET_URL,
+  NEXT_PUBLIC_ANCHOR_MAINNET_URL: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_URL,
+  NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS,
+  NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
+  NEXT_PUBLIC_STATUS_PAGE_URL: process.env.NEXT_PUBLIC_STATUS_PAGE_URL,
+  NEXT_PUBLIC_INCIDENT_FEED_URL: process.env.NEXT_PUBLIC_INCIDENT_FEED_URL,
   SOROBAN_RPC_URLS: process.env.SOROBAN_RPC_URLS,
   SOROBAN_RPC_MAX_CONCURRENCY: process.env.SOROBAN_RPC_MAX_CONCURRENCY,
   SOROBAN_RPC_MAX_ATTEMPTS: process.env.SOROBAN_RPC_MAX_ATTEMPTS,
@@ -200,6 +206,81 @@ export function getVaultRegistryEntry(
   const match = entries.find((entry) => entry.contractId === contractId);
   if (match) return match;
   return { contractId, wasmHash: "", auditRevision: "", verified: false };
+
+/**
+ * Per-network anchor configuration for fiat on-ramp/off-ramp (issue #265).
+ *
+ * The anchor base URL is public (the interactive URL is minted server-side by
+ * the BFF proxy), but anchor credentials stay server-side. `assets` is a
+ * comma-separated list of asset codes the anchor supports for SEP-24; when
+ * empty the "Fund from bank" / "Cash out" entry points are hidden.
+ */
+const anchorConfigByNetwork = {
+  TESTNET: {
+    baseUrl: parsed.NEXT_PUBLIC_ANCHOR_TESTNET_URL,
+    assets: parsed.NEXT_PUBLIC_ANCHOR_TESTNET_ASSETS,
+  },
+  MAINNET: {
+    baseUrl: parsed.NEXT_PUBLIC_ANCHOR_MAINNET_URL,
+    assets: parsed.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
+  },
+} as const;
+
+export interface AnchorConfig {
+  /** Anchor base URL, or undefined when no anchor is configured. */
+  baseUrl?: string;
+  /** Asset codes the anchor supports for SEP-24 deposit/withdraw. */
+  assets: string[];
+}
+
+function parseAnchorAssets(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((code) => code.trim().toUpperCase())
+    .filter((code) => code.length > 0);
+}
+
+const activeAnchor = anchorConfigByNetwork[stellarNetworkSuffix];
+
+/** Anchor config for the active network; `baseUrl` is undefined when unset. */
+export const anchorConfig: AnchorConfig = {
+  baseUrl: activeAnchor.baseUrl?.trim() || undefined,
+  assets: parseAnchorAssets(activeAnchor.assets),
+};
+
+/**
+ * Whether an anchor is configured for `assetCode` on the active network.
+ * Used to progressively enhance the deposit/redemption flows.
+ */
+export function isAnchorSupported(assetCode: string | undefined): boolean {
+  if (!anchorConfig.baseUrl || !assetCode) return false;
+  return anchorConfig.assets.includes(assetCode.trim().toUpperCase());
+}
+
+/**
+ * Public status page + incident feed configuration (issue #268).
+ *
+ * The status page is hosted separately from the trading app so a bad frontend
+ * deploy cannot take down the page that reports the outage. The incident feed
+ * is a public, read-only JSON endpoint consumed by the in-app banner; both are
+ * optional so the app degrades gracefully when they are not configured.
+ */
+export interface StatusPageConfig {
+  /** Public status page URL, or undefined when not configured. */
+  statusPageUrl?: string;
+  /** Public incident feed URL, or undefined when not configured. */
+  incidentFeedUrl?: string;
+}
+
+export const statusPageConfig: StatusPageConfig = {
+  statusPageUrl: parsed.NEXT_PUBLIC_STATUS_PAGE_URL?.trim() || undefined,
+  incidentFeedUrl: parsed.NEXT_PUBLIC_INCIDENT_FEED_URL?.trim() || undefined,
+};
+
+/** Whether a public status page is configured for the active deployment. */
+export function isStatusPageConfigured(): boolean {
+  return Boolean(statusPageConfig.statusPageUrl);
 }
 
 /**

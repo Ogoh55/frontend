@@ -229,6 +229,51 @@ import { submitTransactionXdr } from "./stellar";
  * See docs/privacy/vault-data-inventory.md for the data inventory, retention
  * windows, and the deletion/export workflow this module mirrors.
  *
+ * Fiat on-ramp / off-ramp (SEP-24 interactive, SEP-6 non-interactive):
+ *
+ *   GET  /api/vaults/anchor/config?network=&asset=
+ *   → AnchorConfig | null   (null ⇒ no anchor configured ⇒ hide entry points)
+ *
+ *   POST /api/vaults/anchor/quote  { network, asset, direction, amount }
+ *   → AnchorQuote
+ *
+ *   POST /api/vaults/anchor/transaction  { network, asset, direction, amount, quoteId }
+ *   → AnchorTransaction   (interactiveUrl is minted server-side, never client-supplied)
+ *
+ *   GET  /api/vaults/anchor/transaction/{id}
+ *   → AnchorTransaction
+ *
+ * Anchor credentials stay server-side in the BFF proxy; the client only ever
+ * sees the normalized shapes below. Anchor transactions are modelled as a
+ * separate state machine from the vault deposit so a refund/expiry never
+ * leaves a half-applied vault position.
+ *
+ * Recurring auto-deposit (DCA) schedules:
+ *
+ *   GET    /api/vaults/{id}/schedules            → AutoDepositSchedule[]
+ *   POST   /api/vaults/{id}/schedules            { amount, cadence, ... } → AutoDepositSchedule
+ *   PATCH  /api/vaults/{id}/schedules/{sid}      { ...patch }             → AutoDepositSchedule
+ *   POST   /api/vaults/{id}/schedules/{sid}/pause   → AutoDepositSchedule
+ *   POST   /api/vaults/{id}/schedules/{sid}/resume  → AutoDepositSchedule
+ *   DELETE /api/vaults/{id}/schedules/{sid}      → void
+ *
+ * Schedules are persisted server-side against the account (never
+ * localStorage). Each execution is driven by a durable scheduler job that
+ * calls the exact same deposit service as the interactive flow, and is
+ * idempotent per (schedule_id, scheduled_slot) so a retry cannot
+ * double-deposit.
+ *
+ * Vault-written options supply (issue #267):
+ *
+ *   GET /api/v1/vaults/supply?underlying=&expiry=
+ *   → VaultSupplySummary   (one aggregated summary keyed by strike; never
+ *                           per-row lookups, so long expiries don't N+1)
+ *
+ * The summary is joined client-side into the options chain / vol surface.
+ * When the endpoint is unavailable (404/5xx/network) or the vault flag is
+ * off, callers must render the chain exactly as before — no placeholder
+ * zeros presented as real supply data.
+ *
  * Wire format
  *   - Every amount, price, share count and ratio is a decimal string
  *     (/^-?\d+(\.\d+)?$/), never a JSON number. Amounts are USD collateral
