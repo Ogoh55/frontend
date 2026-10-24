@@ -1,0 +1,5 @@
+[package]
+name = "vault-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared strategy interface for the Zenith vault suite"

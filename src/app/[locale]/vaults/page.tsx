@@ -1,16 +1,43 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
-import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import {
+  capacityUtilization,
+  effectiveStatus,
+  filterVaults,
+  fetchVaults,
+  fmtFeePct,
+  fmtPct,
+  fmtUsd,
+  parseVaultQuery,
+  serializeVaultQuery,
+  sortVaults,
+  totalFeePct,
+  VAULT_COMPARE_MAX,
+  VAULT_RISK_LABELS,
+  VAULT_SORT_LABELS,
+  VAULT_STATUS_LABELS,
+  VAULT_STRATEGY_LABELS,
+  type RiskRating,
+  type VaultQuery,
+  type VaultSortKey,
+  type VaultStatus,
+  type VaultStrategy,
+  type VaultSummary,
+} from "../../../lib/api/vaults";
+import { useFlag } from "../../../lib/flags";
 
-const STRATEGY_LABELS: Record<VaultStrategy, string> = {
-  covered_call:      "Covered Call",
-  cash_secured_put:  "Cash-Secured Put",
-  iron_condor:       "Iron Condor",
-  wheel:             "Wheel",
+/** Metrics where a smaller value is the better one, so the first click sorts ascending. */
+const SORT_DEFAULT_DIR: Record<VaultSortKey, "asc" | "desc"> = {
+  apy: "desc",
+  utilization: "desc",
+  tvl: "desc",
+  drawdown: "asc",
+  fees: "asc",
 };
 
 const RISK_COLORS: Record<RiskRating, string> = {
@@ -25,31 +52,75 @@ const RISK_BG: Record<RiskRating, string> = {
   high:   "var(--put-dim)",
 };
 
-function capacityPct(tvl: number, capacity: number) {
-  return Math.min(100, (tvl / capacity) * 100);
-}
+const LABEL_STYLE = { fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)" } as const;
 
-function fmt(n: number, d = 2) {
-  return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-}
+const SELECT_STYLE = {
+  background: "var(--bg-overlay)", border: "1px solid var(--border-default)", color: "var(--text-hi)",
+  fontSize: 12, padding: "6px 8px", minWidth: 140,
+} as const;
 
-function fmtUsd(n: number) {
-  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
-  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
-  return `$${n.toFixed(2)}`;
-}
+const TH_STYLE = {
+  ...LABEL_STYLE, padding: "8px 10px", textAlign: "left", whiteSpace: "nowrap", borderBottom: "1px solid var(--border-default)",
+} as const;
 
-export default function VaultsPage() {
-  const [vaults, setVaults] = useState<VaultSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+const TD_STYLE = { padding: "10px", fontSize: 12, color: "var(--text-mid)", borderBottom: "1px solid var(--border-subtle)", whiteSpace: "nowrap" } as const;
+
+function VaultsIndex() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const [vaults, setVaults] = useState<VaultSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
+  const vaultsEnabled = useFlag("vaults");
 
   useEffect(() => {
-    fetchVaults()
-      .then(v => { setVaults(v); setLoading(false); })
-      .catch(e => { setError(e.message); setLoading(false); });
-  }, []);
+    let cancelled = false;
+    setError(null);
+    fetchVaults({ enabled: vaultsEnabled })
+      .then(v => { if (!cancelled) setVaults(v); })
+      .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : "Unknown error"); });
+    return () => { cancelled = true; };
+  }, [attempt, vaultsEnabled]);
+
+  const underlyings = useMemo(
+    () => [...new Set((vaults ?? []).map(v => v.underlying))].sort(),
+    [vaults]
+  );
+  const query = useMemo(() => parseVaultQuery(searchParams, underlyings), [searchParams, underlyings]);
+  const rows = useMemo(
+    () => (vaults ? sortVaults(filterVaults(vaults, query), query) : []),
+    [vaults, query]
+  );
+  const tenors = useMemo(
+    () => [...new Set((vaults ?? []).map(v => v.epochDays))].sort((a, b) => a - b),
+    [vaults]
+  );
+
+  // State lives in the URL. Each change is a push, so back/forward walks through filter states.
+  const update = useCallback((patch: Partial<VaultQuery>) => {
+    const qs = serializeVaultQuery({ ...query, ...patch });
+    router.push(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [query, pathname, router]);
+
+  const onSort = (key: VaultSortKey) => {
+    update(query.sort === key
+      ? { dir: query.dir === "asc" ? "desc" : "asc" }
+      : { sort: key, dir: SORT_DEFAULT_DIR[key] });
+  };
+
+  const toggleCompare = (id: string) => {
+    if (query.ids.includes(id)) {
+      update({ ids: query.ids.filter(x => x !== id) });
+    } else if (query.ids.length < VAULT_COMPARE_MAX) {
+      update({ ids: [...query.ids, id] });
+    }
+  };
+
+  const hasFilters = Boolean(query.strategy || query.underlying || query.status || query.risk) || query.tenor !== null;
+  const loading = vaults === null && error === null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "var(--bg)", overflow: "hidden", fontFamily: "var(--font-sans)" }}>
@@ -64,7 +135,7 @@ export default function VaultsPage() {
         <div style={{ maxWidth: 1080, margin: "0 auto", padding: "32px 24px 64px" }}>
 
           {/* Page header */}
-          <div style={{ marginBottom: 32 }}>
+          <div style={{ marginBottom: 24 }}>
             <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, fontWeight: 600, marginBottom: 6 }}>
               Option-Writing Vaults
             </h1>
@@ -79,17 +150,67 @@ export default function VaultsPage() {
             </p>
           </div>
 
+          {/* Filters */}
+          {vaults && (
+            <div role="group" aria-label="Filter vaults" style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-end", marginBottom: 16 }}>
+              <FilterSelect label="Strategy" value={query.strategy ?? ""} onChange={v => update({ strategy: (v || null) as VaultStrategy | null })}
+                options={Object.entries(VAULT_STRATEGY_LABELS).map(([value, label]) => ({ value, label }))} />
+              <FilterSelect label="Underlying" value={query.underlying ?? ""} onChange={v => update({ underlying: v || null })}
+                options={underlyings.map(u => ({ value: u, label: u }))} />
+              <FilterSelect label="Status" value={query.status ?? ""} onChange={v => update({ status: (v || null) as VaultStatus | null })}
+                options={Object.entries(VAULT_STATUS_LABELS).map(([value, label]) => ({ value, label }))} />
+              <FilterSelect label="Risk" value={query.risk ?? ""} onChange={v => update({ risk: (v || null) as RiskRating | null })}
+                options={Object.entries(VAULT_RISK_LABELS).map(([value, label]) => ({ value, label }))} />
+              <FilterSelect label="Tenor" value={query.tenor === null ? "" : String(query.tenor)} onChange={v => update({ tenor: v ? Number(v) : null })}
+                options={tenors.map(d => ({ value: String(d), label: `${d}-day epochs` }))} />
+              {hasFilters && (
+                <button type="button" onClick={() => update({ strategy: null, underlying: null, status: null, risk: null, tenor: null })} style={{
+                  ...SELECT_STYLE, minWidth: 0, cursor: "pointer", color: "var(--text-lo)",
+                }}>
+                  Clear filters
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Compare bar */}
+          {vaults && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, padding: "10px 12px", marginBottom: 12, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)" }}>
+              <span style={{ fontSize: 12, color: "var(--text-mid)" }}>
+                {query.ids.length === 0
+                  ? `Select 2–${VAULT_COMPARE_MAX} vaults to compare side by side.`
+                  : `${query.ids.length} selected for comparison.`}
+              </span>
+              {query.ids.length >= 2 ? (
+                <Link href={`/vaults/compare?ids=${query.ids.join(",")}`} style={{
+                  padding: "6px 14px", background: "var(--brand)", color: "var(--bg)", fontSize: 12, fontWeight: 700, textDecoration: "none",
+                }}>
+                  Compare →
+                </Link>
+              ) : (
+                <span style={{ fontSize: 11, color: "var(--text-lo)" }}>Compare unlocks at 2 vaults</span>
+              )}
+            </div>
+          )}
+
+          {/* Loading */}
           {loading && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {[1, 2, 3].map(i => (
-                <div key={i} className="skeleton" style={{ height: 120, width: "100%" }} />
+                <div key={i} className="skeleton" style={{ height: 44, width: "100%" }} />
               ))}
             </div>
           )}
 
+          {/* Error with retry */}
           {error && (
-            <div style={{ padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
-              Failed to load vaults: {error}
+            <div role="alert" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
+              <span>Failed to load vaults: {error}</span>
+              <button type="button" onClick={() => setAttempt(a => a + 1)} style={{
+                background: "none", border: "1px solid var(--put)", color: "var(--put)", padding: "4px 12px", cursor: "pointer", fontSize: 11,
+              }}>
+                Retry
+              </button>
             </div>
           )}
 
@@ -119,118 +240,108 @@ export default function VaultsPage() {
             </div>
           )}
 
-          {/* Vault cards */}
-          {!loading && !error && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {vaults.map(vault => {
-                const cap = capacityPct(vault.tvl, vault.capacity);
-                const capColor = cap >= 90 ? "var(--put)" : cap >= 70 ? "var(--atm)" : "var(--call)";
-                return (
-                  <div key={vault.id} style={{
-                    border: "1px solid var(--border-default)", background: "var(--bg-raised)",
-                    padding: 20, display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-start",
-                  }}>
-                    {/* Left: identity */}
-                    <div style={{ minWidth: 180, flex: "0 0 200px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                        <div style={{
-                          width: 32, height: 32, borderRadius: 0,
-                          background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, color: "var(--atm)",
-                        }}>
-                          {vault.underlying}
-                        </div>
-                        <div>
-                          <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-hi)" }}>{vault.name}</div>
-                          <div style={{ fontSize: 10, color: "var(--text-lo)" }}>{STRATEGY_LABELS[vault.strategy]}</div>
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 11, color: "var(--text-mid)", lineHeight: 1.5 }}>{vault.description}</div>
-                      {/* Risk rating */}
-                      <div style={{ marginTop: 10 }}>
-                        <span style={{
-                          fontSize: 10, padding: "2px 8px", textTransform: "uppercase", letterSpacing: "0.06em",
-                          background: RISK_BG[vault.riskRating], color: RISK_COLORS[vault.riskRating],
-                          border: `1px solid ${RISK_COLORS[vault.riskRating]}`,
-                        }}>
-                          {vault.riskRating} risk
-                        </span>
-                      </div>
-                    </div>
+          {/* Vaults disabled */}
+          {!loading && !error && !vaultsEnabled && vaults && vaults.length === 0 && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
+          )}
 
-                    {/* Center: stats grid */}
-                    <div style={{ flex: 1, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px 20px" }}>
-                      {/* APY */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>
-                          APY (trailing 12M)
+          {/* Empty */}
+          {vaults && rows.length === 0 && (
+            <div style={{ padding: "32px 16px", border: "1px dashed var(--border-default)", textAlign: "center", fontSize: 13, color: "var(--text-mid)" }}>
+              {vaults.length === 0 ? "No vaults are available yet." : "No vaults match these filters."}
+              {hasFilters && (
+                <div style={{ marginTop: 12 }}>
+                  <button type="button" onClick={() => update({ strategy: null, underlying: null, status: null, risk: null, tenor: null })} style={{
+                    background: "none", border: "1px solid var(--border-default)", color: "var(--text-lo)", padding: "4px 12px", cursor: "pointer", fontSize: 11,
+                  }}>
+                    Clear filters
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Vault table */}
+          {vaults && rows.length > 0 && (
+            <div style={{ overflowX: "auto", border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 960 }}>
+                <caption className="sr-only">
+                  Option-writing vaults. Use the column headers to sort.
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col" style={TH_STYLE}><span className="sr-only">Compare</span></th>
+                    <th scope="col" style={TH_STYLE}>Vault</th>
+                    <th scope="col" style={TH_STYLE}>Strategy</th>
+                    <th scope="col" style={TH_STYLE}>Status</th>
+                    <th scope="col" style={TH_STYLE}>Risk</th>
+                    <th scope="col" style={TH_STYLE}>Tenor</th>
+                    <SortHeader label="APY" sortKey="apy" query={query} onSort={onSort} />
+                    <SortHeader label="Capacity used" sortKey="utilization" query={query} onSort={onSort} />
+                    <SortHeader label="TVL" sortKey="tvl" query={query} onSort={onSort} />
+                    <SortHeader label="Max drawdown" sortKey="drawdown" query={query} onSort={onSort} />
+                    <SortHeader label="Fees" sortKey="fees" query={query} onSort={onSort} />
+                    <th scope="col" style={TH_STYLE}><span className="sr-only">Action</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map(vault => {
+                    const selected = query.ids.includes(vault.id);
+                    const disabled = !selected && query.ids.length >= VAULT_COMPARE_MAX;
+                    const status = effectiveStatus(vault);
+                    return (
+                      <tr key={vault.id}>
+                        <td style={TD_STYLE}>
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={disabled}
+                            onChange={() => toggleCompare(vault.id)}
+                            aria-label={`Compare ${vault.name}`}
+                          />
+                        </td>
+                        <td style={TD_STYLE}>
+                          <div style={{ fontWeight: 700, color: "var(--text-hi)" }}>{vault.name}</div>
+                          <div style={{ fontSize: 10, color: "var(--text-lo)" }}>{vault.underlying}/USD</div>
+                        </td>
+                        <td style={TD_STYLE}>{VAULT_STRATEGY_LABELS[vault.strategy]}</td>
+                        <td style={TD_STYLE}>{VAULT_STATUS_LABELS[status]}</td>
+                        <td style={TD_STYLE}>
+                          <span style={{
+                            fontSize: 10, padding: "2px 8px", textTransform: "uppercase", letterSpacing: "0.06em",
+                            background: RISK_BG[vault.riskRating], color: RISK_COLORS[vault.riskRating],
+                            border: `1px solid ${RISK_COLORS[vault.riskRating]}`,
+                          }}>
+                            {VAULT_RISK_LABELS[vault.riskRating]}
+                          </span>
+                        </td>
+                        <td className="num" style={TD_STYLE}>{vault.epochDays}D</td>
+                        <td className="num" style={{ ...TD_STYLE, color: "var(--call)", fontWeight: 700 }}>
+                          {fmtPct(vault.apy)}
                           <button
+                            type="button"
                             onClick={() => setApyTooltip(vault.apyMethodology)}
+                            aria-label={`APY methodology for ${vault.name}`}
                             title="APY methodology"
                             style={{ marginLeft: 4, background: "none", border: "none", cursor: "pointer", color: "var(--text-lo)", fontSize: 9, padding: 0, textDecoration: "underline" }}
                           >ⓘ</button>
-                        </div>
-                        <div className="num" style={{ fontSize: 18, fontWeight: 700, color: "var(--call)" }}>
-                          {(vault.apy * 100).toFixed(1)}%
-                        </div>
-                      </div>
-                      {/* TVL */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>TVL</div>
-                        <div className="num" style={{ fontSize: 18, fontWeight: 700, color: "var(--text-hi)" }}>{fmtUsd(vault.tvl)}</div>
-                      </div>
-                      {/* Capacity */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>
-                          Capacity
-                        </div>
-                        <div className="num" style={{ fontSize: 12, color: capColor }}>
-                          {fmtUsd(vault.tvl)} / {fmtUsd(vault.capacity)}
-                        </div>
-                        <div style={{ height: 3, background: "var(--bg-overlay)", marginTop: 4 }}>
-                          <div style={{ width: `${cap}%`, height: "100%", background: capColor, transition: "width 400ms" }} />
-                        </div>
-                      </div>
-                      {/* Current epoch strike */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>Current Strike</div>
-                        <div className="num" style={{ fontSize: 13, fontWeight: 600, color: "var(--atm)" }}>
-                          {vault.currentStrike >= 1000
-                            ? `$${vault.currentStrike.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                            : `$${vault.currentStrike.toFixed(4)}`}
-                        </div>
-                      </div>
-                      {/* Expiry */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>Expiry</div>
-                        <div className="num" style={{ fontSize: 13, color: "var(--text-mid)" }}>
-                          {new Date(vault.currentExpiry).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
-                        </div>
-                      </div>
-                      {/* Underlying */}
-                      <div>
-                        <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-lo)", marginBottom: 3 }}>Underlying</div>
-                        <div className="num" style={{ fontSize: 13, color: "var(--text-hi)" }}>{vault.underlying}/USD</div>
-                      </div>
-                    </div>
-
-                    {/* Right: CTA */}
-                    <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "flex-end", gap: 8, minWidth: 120 }}>
-                      <Link href={`/vaults/${vault.id}`} style={{
-                        display: "block", padding: "10px 20px", background: "var(--brand)",
-                        color: "var(--bg)", fontSize: 13, fontWeight: 700, textDecoration: "none",
-                        textAlign: "center",
-                      }}>
-                        View Vault →
-                      </Link>
-                      {cap >= 100 && (
-                        <div style={{ fontSize: 10, color: "var(--put)", textAlign: "center" }}>Vault full</div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+                        </td>
+                        <td className="num" style={{ ...TD_STYLE, color: capacityUtilization(vault) >= 0.9 ? "var(--put)" : capacityUtilization(vault) >= 0.7 ? "var(--atm)" : "var(--call)" }}>
+                          {fmtPct(capacityUtilization(vault), 0)}
+                        </td>
+                        <td className="num" style={TD_STYLE}>{fmtUsd(vault.tvl)}</td>
+                        <td className="num" style={TD_STYLE}>{fmtPct(vault.maxDrawdownPct)}</td>
+                        <td className="num" style={TD_STYLE}>{fmtFeePct(totalFeePct(vault))}</td>
+                        <td style={TD_STYLE}>
+                          <Link href={`/vaults/${vault.id}`} style={{ color: "var(--brand)", fontWeight: 700, textDecoration: "none" }}>
+                            View →
+                          </Link>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           )}
 
@@ -248,5 +359,49 @@ export default function VaultsPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+function FilterSelect({ label, value, options, onChange }: {
+  label: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span style={LABEL_STYLE}>{label}</span>
+      <select value={value} onChange={e => onChange(e.target.value)} style={SELECT_STYLE}>
+        <option value="">All</option>
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function SortHeader({ label, sortKey, query, onSort }: {
+  label: string;
+  sortKey: VaultSortKey;
+  query: VaultQuery;
+  onSort: (key: VaultSortKey) => void;
+}) {
+  const active = query.sort === sortKey;
+  const arrow = query.dir === "asc" ? "▲" : "▼";
+  return (
+    <th scope="col" aria-sort={active ? (query.dir === "asc" ? "ascending" : "descending") : "none"} style={TH_STYLE}>
+      <button type="button" onClick={() => onSort(sortKey)} aria-label={`Sort by ${VAULT_SORT_LABELS[sortKey]}`} style={{
+        ...LABEL_STYLE, background: "none", border: "none", padding: 0, cursor: "pointer", color: active ? "var(--text-hi)" : "var(--text-lo)",
+      }}>
+        {label}{active && <span aria-hidden="true"> {arrow}</span>}
+      </button>
+    </th>
+  );
+}
+
+export default function VaultsPage() {
+  return (
+    <Suspense fallback={<div style={{ background: "var(--bg)", minHeight: "100vh" }} />}>
+      <VaultsIndex />
+    </Suspense>
   );
 }

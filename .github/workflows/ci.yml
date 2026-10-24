@@ -39,6 +39,10 @@ jobs:
       - name: Lint
         run: npm run lint:ci
 
+      # Fails if a flag's production default changes without its rollout config.
+      - name: Flag rollout guard
+        run: node scripts/check-flag-rollout.mjs
+
   # ───────────────────────────────────────────────────────────────────────────
   # TYPECHECK
   # Runs tsc --noEmit against the project's tsconfig.json.
