@@ -82,6 +82,7 @@ import { submitTransactionXdr } from "./stellar";
  *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
+ *   POST /api/v1/vaults/{id}/emergency-redeem  { shares: number }  → { tx_id: string; penalty_bps: number }
  *
  *   GET  /api/v1/vaults/{id}/orders    → VaultOrder[]
  *   POST /api/v1/vaults/{id}/orders    { side, shares, price, partial, expiresAt } → VaultOrder
@@ -250,6 +251,15 @@ import { submitTransactionXdr } from "./stellar";
  * The public surface is a projection over the same vault registry/epoch
  * ledger, served from a cache independent of the authenticated read path.
  * It never exposes per-depositor data (see `toPublicVaultSummary`).
+ *
+ * Realtime (shared spot/vol WebSocket, see SpotFeedContext):
+ *
+ *   subscribe: { op: "subscribe", topic: "vault:<id>", schema: VAULT_TICK_SCHEMA_VERSION }
+ *   message:   { topic: "vault:<id>", schema: VAULT_TICK_SCHEMA_VERSION, data: VaultTick }
+ *
+ * The envelope mirrors the existing spot/vol feed (topic + schema version +
+ * data) so vaults reuse the same connection and versioning scheme rather than
+ * introducing a second realtime contract.
  *
  * See docs/privacy/vault-data-inventory.md for the data inventory, retention
  * windows, and the deletion/export workflow this module mirrors.
@@ -1342,6 +1352,32 @@ export function applyVaultTransition(
   if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
   if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
   return { status: to, changed: true };
+}
+
+/**
+ * Version of the vault realtime tick envelope. Bump alongside the vault event
+ * schema versioning work; clients ignore ticks whose schema they don't know.
+ */
+export const VAULT_TICK_SCHEMA_VERSION = 1;
+
+/**
+ * Live vault state pushed over the shared spot/vol WebSocket, keyed by vault id.
+ * Epoch countdown is derived locally from `epochEndsAt` + `serverTime` so the
+ * client never trusts per-second server pushes and tolerates clock skew.
+ */
+export interface VaultTick {
+  /** NAV per share in USD. */
+  navPerShare: number;
+  /** Current epoch number. */
+  epochNumber: number;
+  /** ISO timestamp when the current epoch closes (authoritative). */
+  epochEndsAt: string;
+  /** Shares queued for redemption at epoch settlement. */
+  queueDepth: number;
+  /** ISO timestamp of the last authoritative update from the backend. */
+  updatedAt: string;
+  /** Server clock at publish time (ISO), used to correct client skew. */
+  serverTime: string;
 }
 
 /**
