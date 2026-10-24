@@ -36,6 +36,9 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /{id}/deposit        { amount }                    → { tx_id }
  *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
+ *   GET /api/v1/vaults/{id}/analytics
+ *   → VaultAnalytics
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
  *     caps are computed server-side). The client only signs and submits it.
@@ -109,7 +112,7 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -750,7 +753,4 @@ export interface ShadowNavPoint {
 
 /**
  * Side-by-side comparison of a shadow run against live and expected
- * performance. All shadow figures are paper trading and must be labeled
- * as such in the UI.
- */
-export interface ShadowComparison {
+ * performance.
