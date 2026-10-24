@@ -1,10 +1,9 @@
 import { z } from "zod";
 import { env } from "../../env";
-import { bffFetch } from "./client";
+import { apiGet, apiPost, ApiError, bffFetch, type RequestOptions } from "./client";
 import { ContractError, reportContractError } from "./contractError";
 import { toCsv, type CsvColumn } from "../csv";
 import freighterApi from "@stellar/freighter-api";
-import { apiPost, type RequestOptions } from "./client";
 import { submitTransactionXdr } from "./stellar";
 
 /**
@@ -444,17 +443,17 @@ export interface VaultSummary {
   mode: VaultMode;
   status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
-  apy: number;
+  apy: number | null;
   /** APY methodology note shown in tooltip. */
   apyMethodology: string;
   /** Total value locked in USD. */
-  tvl: number;
+  tvl: number | null;
   /** Maximum TVL before the vault is full. */
-  capacity: number;
+  capacity: number | null;
   /** tvl / capacity (0–1). */
   utilisation: number;
-  currentStrike: number;
-  currentExpiry: string; // ISO date
+  currentStrike: number | null;
+  currentExpiry: string | null; // ISO date
   riskRating: RiskRating;
   description: string;
   currentEpoch: number;

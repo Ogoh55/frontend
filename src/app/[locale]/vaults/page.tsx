@@ -33,6 +33,8 @@ import {
 } from "../../../lib/api/vaults";
 import { useFlag } from "../../../lib/flags";
 
+const ABSENT = "—";
+
 /** Metrics where a smaller value is the better one, so the first click sorts ascending. */
 const SORT_DEFAULT_DIR: Record<VaultSortKey, "asc" | "desc"> = {
   apy: "desc",
@@ -77,6 +79,7 @@ function capacityPct(tvl: number, capacity: number) {
 }
 
 function VaultsIndex() {
+  const vaultsEnabled = useFlag("vaults");
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -87,9 +90,9 @@ function VaultsIndex() {
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const t = useTranslations("vaults");
-  const vaultsEnabled = useFlag("vaults");
 
   useEffect(() => {
+    if (!vaultsEnabled) return;
     let cancelled = false;
     setError(null);
     fetchVaults({ enabled: vaultsEnabled })
@@ -133,7 +136,7 @@ function VaultsIndex() {
   };
 
   const hasFilters = Boolean(query.strategy || query.underlying || query.status || query.risk) || query.tenor !== null;
-  const loading = vaults === null && error === null;
+  const loading = vaultsEnabled && vaults === null && error === null;
 
   // Re-evaluate limit staleness while the page stays open.
   useEffect(() => {
@@ -161,16 +164,17 @@ function VaultsIndex() {
             <p style={{ fontSize: 13, color: "var(--text-mid)", maxWidth: 620 }}>
               Earn passive yield by providing liquidity to automated option-writing strategies.
               Premiums are collected each epoch and compounded into your share price.
-              {process.env.NEXT_PUBLIC_VAULTS !== "live" && (
-                <span style={{ marginLeft: 8, fontSize: 11, color: "var(--atm)", fontStyle: "italic" }}>
-                  (mock data — contracts not yet deployed)
-                </span>
-              )}
             </p>
           </div>
 
+          {!vaultsEnabled && (
+            <div style={{ padding: "12px 16px", border: "1px solid var(--border-default)", background: "var(--bg-raised)", color: "var(--text-mid)", fontSize: 12 }}>
+              Vaults are not available on this deployment.
+            </div>
+          )}
+
           {/* Filters */}
-          {vaults && (
+          {vaultsEnabled && vaults && (
             <div role="group" aria-label="Filter vaults" style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-end", marginBottom: 16 }}>
               <FilterSelect label="Strategy" value={query.strategy ?? ""} onChange={v => update({ strategy: (v || null) as VaultStrategy | null })}
                 options={Object.entries(VAULT_STRATEGY_LABELS).map(([value, label]) => ({ value, label }))} />
@@ -193,7 +197,7 @@ function VaultsIndex() {
           )}
 
           {/* Compare bar */}
-          {vaults && (
+          {vaultsEnabled && vaults && (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, padding: "10px 12px", marginBottom: 12, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)" }}>
               <span style={{ fontSize: 12, color: "var(--text-mid)" }}>
                 {query.ids.length === 0
@@ -222,7 +226,7 @@ function VaultsIndex() {
           )}
 
           {/* Error with retry */}
-          {error && (
+          {vaultsEnabled && error && (
             <div role="alert" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
               <span>Failed to load vaults: {error}</span>
               <button type="button" onClick={() => setAttempt(a => a + 1)} style={{
@@ -265,7 +269,7 @@ function VaultsIndex() {
           )}
 
           {/* Empty */}
-          {vaults && rows.length === 0 && (
+          {vaultsEnabled && vaults && rows.length === 0 && (
             <div style={{ padding: "32px 16px", border: "1px dashed var(--border-default)", textAlign: "center", fontSize: 13, color: "var(--text-mid)" }}>
               {vaults.length === 0 ? "No vaults are available yet." : "No vaults match these filters."}
               {hasFilters && (
@@ -281,7 +285,7 @@ function VaultsIndex() {
           )}
 
           {/* Vault table */}
-          {vaults && rows.length > 0 && (
+          {vaultsEnabled && vaults && rows.length > 0 && (
             <div style={{ overflowX: "auto", border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 960 }}>
                 <caption className="sr-only">
