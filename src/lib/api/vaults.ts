@@ -48,6 +48,9 @@ import { submitTransactionXdr } from "./stellar";
  *   GET /api/v1/vaults/positions
  *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
  *
+ *   GET /api/v1/vaults/{id}/epochs
+ *   → VaultEpochLedgerEntry[]   (append-only, derived from on-chain epoch events)
+ *
  *   POST /api/v1/vaults/disclosures/acknowledge
  *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
  *   GET  /api/v1/vaults/disclosures/me  → DisclosureAcknowledgement[]
@@ -671,6 +674,27 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: z.infer<typeof EpochOutcomeSchema>;
   pnlPct: number; // epoch return, positive = profit for depositors
+}
+
+/** Schema version of VaultEpochLedgerEntry. Bump on any breaking field change. */
+export const VAULT_EPOCH_LEDGER_SCHEMA_VERSION = 1;
+
+/**
+ * One append-only epoch ledger row, derived from on-chain epoch events.
+ * Rows are never edited in place; a correction is a new reconciliation row.
+ */
+export interface VaultEpochLedgerEntry {
+  schemaVersion: typeof VAULT_EPOCH_LEDGER_SCHEMA_VERSION;
+  vaultId: string;
+  epochNumber: number;
+  strategy: VaultStrategy;
+  startedAt: string; // ISO — on-chain epoch start timestamp
+  endedAt: string | null; // ISO — null while the epoch is still open
+  premium: number; // USD, total premium collected in the epoch
+  realizedPnl: number; // USD
+  navBefore: number; // USD per share at epoch start
+  navAfter: number | null; // USD per share at epoch end; null while open
+  feeTaken: number; // USD, management + performance fees taken in the epoch
 }
 
 /** The user's position in a vault. */
