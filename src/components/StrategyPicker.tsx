@@ -67,7 +67,7 @@ export function StrategyPicker({ selectedId, onSelect }: Props) {
         ))}
       </div>
       {templates.map(t => (
-        <button key={t.id} onClick={() => onSelect(t)} style={{
+        <button key={t.id} onClick={() => onSelect(t)} aria-pressed={selectedId === t.id} style={{
           textAlign: "left", padding: "12px 14px", border: "1px solid var(--border-default)",
           background: selectedId === t.id ? "var(--bg-overlay)" : "var(--bg-raised)",
           cursor: "pointer",

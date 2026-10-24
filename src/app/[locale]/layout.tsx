@@ -18,6 +18,7 @@ import { NetworkMismatchBanner } from "../../components/NetworkMismatchBanner";
 import { SorobanEventBridge } from "../../components/SorobanEventBridge";
 import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
+import { THEME_INIT_SCRIPT } from "../../lib/theme";
 
 const fraunces = Fraunces({
   subsets: ["latin"], weight: ["400","500","600","700"],
@@ -87,8 +88,11 @@ export default async function LocaleLayout({ children, params }: { children: Rea
   }
 
   return (
-    <html lang={locale} className={`${fraunces.variable} ${plexSans.variable} ${jetbrainsMono.variable}`}>
+    // suppressHydrationWarning: the theme script below sets data-theme on <html>
+    // before React hydrates, so the attribute differs from the server markup.
+    <html lang={locale} className={`${fraunces.variable} ${plexSans.variable} ${jetbrainsMono.variable}`} suppressHydrationWarning>
       <body>
+        <script nonce={nonce ?? undefined} dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
           <StoreHydrator />
           <Toaster />
