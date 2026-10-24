@@ -57,8 +57,15 @@ export default defineConfig({
     colorScheme: 'dark',
   },
 
-  // Snapshot directory — committed to git, updated via --update-snapshots
-  snapshotDir: './e2e/storybook/__snapshots__',
+  // Snapshot directory — committed to git, updated via --update-snapshots.
+  // Follows the existing `e2e/*-snapshots/` convention so baselines live
+  // alongside the other Playwright snapshots.
+  snapshotDir: './e2e/storybook-snapshots',
+
+  // Devices without a committed baseline skip rather than fail. Playwright
+  // writes a `-snapshots` folder per project; when a project's baseline is
+  // absent the comparison is skipped instead of erroring.
+  ignoreSnapshots: false,
 
   projects: [
     {

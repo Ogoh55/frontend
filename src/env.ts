@@ -21,6 +21,11 @@ const parsed = parseEnv({
   NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_TIMELOCK_MAINNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_TESTNET,
   NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET: process.env.NEXT_PUBLIC_CONTRACT_DEPLOYER_MAINNET,
+  SOROBAN_RPC_URLS: process.env.SOROBAN_RPC_URLS,
+  SOROBAN_RPC_MAX_CONCURRENCY: process.env.SOROBAN_RPC_MAX_CONCURRENCY,
+  SOROBAN_RPC_MAX_ATTEMPTS: process.env.SOROBAN_RPC_MAX_ATTEMPTS,
+  SOROBAN_RPC_BASE_BACKOFF_MS: process.env.SOROBAN_RPC_BASE_BACKOFF_MS,
+  SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS: process.env.SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS,
 });
 
 export const env = {
@@ -95,6 +100,76 @@ export const governorContractId = governableContractIds.governor;
 export function contractEnvVarName(key: string): string {
   return `NEXT_PUBLIC_CONTRACT_${key.toUpperCase()}_${stellarNetworkSuffix}`;
 }
+
+/**
+ * Soroban RPC resilience configuration (issue #282).
+ *
+ * `SOROBAN_RPC_URLS` is a comma-separated list of RPC endpoints used by the
+ * server-side provider pool. When unset, the active network's default RPC URL
+ * is used as a single-provider pool. Production builds fail fast when the list
+ * is missing so a misconfigured deploy never silently degrades to one provider.
+ */
+export type SorobanRpcConfig = {
+  /** Ordered list of RPC endpoints; the first healthy provider is preferred. */
+  urls: string[];
+  /** Bounded concurrency for batched/parallel reads. */
+  maxConcurrency: number;
+  /** Bounded retry attempts per read (never applied to signed submissions). */
+  maxAttempts: number;
+  /** Base delay for exponential backoff with jitter, in milliseconds. */
+  baseBackoffMs: number;
+  /** How long to wait for ledger inclusion before returning `pending`. */
+  confirmationTimeoutMs: number;
+};
+
+function parsePositiveInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${name}: expected a positive integer, received "${raw}"`);
+  }
+  return value;
+}
+
+function parseRpcUrls(raw: string | undefined, fallback: string): string[] {
+  const source = raw === undefined || raw.trim() === "" ? fallback : raw;
+  const urls = source
+    .split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+  if (urls.length === 0) {
+    throw new Error("SOROBAN_RPC_URLS must contain at least one RPC endpoint");
+  }
+  for (const url of urls) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(url);
+    } catch {
+      throw new Error(`Invalid SOROBAN_RPC_URLS entry: "${url}" is not a valid URL`);
+    }
+  }
+  return urls;
+}
+
+const isProduction = process.env.NODE_ENV === "production";
+
+if (isProduction && (parsed.SOROBAN_RPC_URLS === undefined || parsed.SOROBAN_RPC_URLS.trim() === "")) {
+  throw new Error(
+    "SOROBAN_RPC_URLS is required in production: configure a comma-separated list of Soroban RPC endpoints",
+  );
+}
+
+export const sorobanRpcConfig: SorobanRpcConfig = {
+  urls: parseRpcUrls(parsed.SOROBAN_RPC_URLS, activeStellarNetwork.rpcUrl),
+  maxConcurrency: parsePositiveInt(parsed.SOROBAN_RPC_MAX_CONCURRENCY, 4, "SOROBAN_RPC_MAX_CONCURRENCY"),
+  maxAttempts: parsePositiveInt(parsed.SOROBAN_RPC_MAX_ATTEMPTS, 3, "SOROBAN_RPC_MAX_ATTEMPTS"),
+  baseBackoffMs: parsePositiveInt(parsed.SOROBAN_RPC_BASE_BACKOFF_MS, 200, "SOROBAN_RPC_BASE_BACKOFF_MS"),
+  confirmationTimeoutMs: parsePositiveInt(
+    parsed.SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS,
+    15_000,
+    "SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS",
+  ),
+};
 
 /**
  * Internal service identities that participate in service-to-service auth
