@@ -8,6 +8,7 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
@@ -57,6 +58,7 @@ function fmtDateShort(iso: string) {
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
+  const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
   const t = useTranslations("vaultDisclosure");
 
@@ -90,10 +92,10 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   );
 
   useEffect(() => {
-    fetchVaultDetail(id, token)
+    fetchVaultDetail(id, token, { enabled: vaultsEnabled })
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, [id, token]);
+  }, [id, token, vaultsEnabled]);
 
   const permittedActions = vault ? vaultStatusPolicy(vault.status).permittedActions : [];
 
@@ -147,6 +149,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        enabled: vaultsEnabled,
       });
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
@@ -226,7 +229,11 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
             </div>
           )}
 
-          {!loading && !error && !vault && (
+          {!loading && !error && !vault && !vaultsEnabled && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
+          )}
+
+          {!loading && !error && !vault && vaultsEnabled && (
             <div style={{ fontSize: 13, color: "var(--text-lo)" }}>Vault not found.</div>
           )}
 
@@ -432,7 +439,10 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
                     {/* Tab switcher */}
                     <div style={{ display: "flex", borderBottom: "1px solid var(--border-default)" }}>
-                      {(["deposit", "withdraw"] as const).filter(flow => permittedActions.includes(flow)).map(flow => (
+                      {(["deposit", "withdraw"] as const)
+                        .filter(flow => permittedActions.includes(flow))
+                        .filter(flow => flow !== "deposit" || vaultsEnabled)
+                        .map(flow => (
                         <button key={flow} onClick={() => { setActiveFlow(activeFlow === flow ? null : flow); setTxStatus(null); }}
                           style={{
                             flex: 1, padding: "10px 0", border: "none", cursor: "pointer",
@@ -447,7 +457,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       ))}
                     </div>
 
-                    {activeFlow === "deposit" && permittedActions.includes("deposit") && (
+                    {activeFlow === "deposit" && vaultsEnabled && permittedActions.includes("deposit") && (
                       <div style={{ padding: 16 }}>
                         {acks === null && (
                           <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{t("checking")}</div>
@@ -593,45 +603,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                         </div>
                         <button
                           onClick={handleWithdraw}
-                          disabled={txStatus === "pending" || !withdrawShares || isNaN(parseFloat(withdrawShares)) || parseFloat(withdrawShares) <= 0}
-                          style={{
-                            width: "100%", padding: "10px 0",
-                            background: "var(--bg-elevated)", border: "1px solid var(--border-default)",
-                            color: "var(--text-hi)", fontSize: 13, fontWeight: 700,
-                            cursor: txStatus === "pending" ? "default" : "pointer",
-                            opacity: txStatus === "pending" ? 0.6 : 1,
-                          }}
-                        >
-                          {txStatus === "pending" ? "Queuing…" : "Queue Withdrawal"}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* TX status */}
-                    {txStatus && txStatus !== "pending" && (
-                      <div style={{
-                        margin: "0 16px 16px",
-                        padding: "8px 12px",
-                        border: `1px solid ${txStatus === "success" ? "var(--call)" : "var(--put)"}`,
-                        background: txStatus === "success" ? "var(--call-dim)" : "var(--put-dim)",
-                        fontSize: 11,
-                        color: txStatus === "success" ? "var(--call)" : "var(--put)",
-                      }}>
-                        {txMessage}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Risk disclosure summary */}
-                <div style={{ fontSize: 10, color: "var(--text-lo)", lineHeight: 1.5, padding: "0 4px" }}>
-                  Vault contracts are unaudited. Deposits may be exposed to smart contract risk and
-                  assignment risk. Past returns do not guarantee future results.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Depositor Governance panel (issue #242) */}
-          {vault && (
-            <div style={{ marginTop: 24, border: "
+                          disabled={txStatus === "pending" || !withdrawShares || isNaN(parseFloat(withdrawShares)) || parseFloat(withdrawShares) <= 

@@ -29,6 +29,7 @@ import {
   type VaultStrategy,
   type VaultSummary,
 } from "../../../lib/api/vaults";
+import { useFlag } from "../../../lib/flags";
 
 /** Metrics where a smaller value is the better one, so the first click sorts ascending. */
 const SORT_DEFAULT_DIR: Record<VaultSortKey, "asc" | "desc"> = {
@@ -73,15 +74,16 @@ function VaultsIndex() {
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
+  const vaultsEnabled = useFlag("vaults");
 
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    fetchVaults()
+    fetchVaults({ enabled: vaultsEnabled })
       .then(v => { if (!cancelled) setVaults(v); })
       .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : "Unknown error"); });
     return () => { cancelled = true; };
-  }, [attempt]);
+  }, [attempt, vaultsEnabled]);
 
   const underlyings = useMemo(
     () => [...new Set((vaults ?? []).map(v => v.underlying))].sort(),
@@ -236,6 +238,11 @@ function VaultsIndex() {
                 }}>Close</button>
               </div>
             </div>
+          )}
+
+          {/* Vaults disabled */}
+          {!loading && !error && !vaultsEnabled && vaults && vaults.length === 0 && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
           )}
 
           {/* Empty */}
