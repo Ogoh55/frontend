@@ -8,6 +8,7 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
 import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
@@ -68,6 +69,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const address = useWalletStore(s => s.address);
   const t = useTranslations("vaults");
   const tDisclosure = useTranslations("vaultDisclosure");
+  const { keyFor, complete } = useIdempotencyKey();
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -177,14 +179,18 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        idempotencyKey: keyFor({ vault: vault.id, amount }),
         enabled: vaultsEnabled,
       });
+      complete();
       const pricing = state.pricedInEpoch !== null
         ? t("form.pricedIn", { epoch: state.pricedInEpoch })
         : t("form.pricedWaitlist");
       setTxStatus("success");
       setTxMessage(`${pricing} ${sharesLine(state, vault.phaseEndsAt)} TX: ${result.tx_id}`);
       setDepositAmount("");
+      // Reconcile the displayed position with backend truth.
+      fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
       if (e instanceof VaultPolicyError) {
         setTxStatus(null);
@@ -592,12 +598,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                               {depositState.pricedInEpoch !== null
                                 ? t("form.pricedIn", { epoch: depositState.pricedInEpoch })
                                 : t("form.pricedWaitlist")}{" "}
-                              {sharesLine(depositState, vault.phaseEndsAt)}
-                            </div>
-                            {depositState.status !== "waitlist" && (
-                              <div>{t("form.maxHint", { amount: fmtUsd(depositState.maxDeposit) })}</div>
-                            )}
-                          </div>
-                        )}
-                        {overMax && depositState && (
-                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--put
+                              {sharesLine(dep

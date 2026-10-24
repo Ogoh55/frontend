@@ -95,6 +95,15 @@ await openPosition(params, token, { idempotencyKey: keyFor(params) });
 complete();
 ```
 
+Margin-vault deposits and withdrawals (`src/lib/api/vault.ts`) follow the same
+contract: the BFF forwards `Idempotency-Key` to `build-deposit` and
+`build-withdraw`. A submit that times out or drops its response is not treated
+as a failure. The client computes the transaction hash locally and checks the
+ledger. If the ledger has not confirmed it, the call throws
+`VaultSubmissionUnknownError` with the hash. The UI then shows "awaiting
+confirmation" and blocks Confirm until the outcome is known. The key is kept
+for the intent, and it is released only after the transaction is confirmed.
+
 ## Tests
 
 - `src/lib/api/resilience/__tests__/*` — unit tests with fake timers for every policy branch.

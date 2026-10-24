@@ -142,3 +142,100 @@ export const fmtN = (n: number, d = 4) =>
 export const fmtSpot = (n: number) => (n >= 1000 ? formatPrice("BTC", n) : formatPrice("XLM", n));
 
 export const fmtK = (n: number) => (n >= 1000 ? formatStrike("BTC", n) : formatStrike("XLM", n));
+
+/**
+ * Deposit and withdrawal pricing rule for option-writing vaults (issue #208).
+ *
+ * Economic rationale: a vault's NAV jumps when premium is credited and when
+ * assignment losses are recognized at epoch close. If shares were priced
+ * against realized NAV alone, a depositor entering just before a premium
+ * credit would buy in cheap and collect the credit, and a holder exiting just
+ * before a known loss would sell out rich. Both extract value from remaining
+ * LPs at no risk.
+ *
+ * Rule:
+ * - Pricing NAV includes premium accrued but not yet realized, and subtracts
+ *   known-but-unrealized losses. A minter pays for its share of pending premium
+ *   and a redeemer is charged for its share of pending losses, so the price
+ *   already reflects what the epoch close will book. Excluding pending premium
+ *   instead would dilute existing LPs on every mint, which is why this is the
+ *   default and the only mode here.
+ * - Deposits are closed for `cutoffLedgers` ledgers before the epoch close
+ *   ledger. The close is bounded by ledger number, not wall-clock time, so a
+ *   late or skipped ledger cannot stall the window open. Once the close ledger
+ *   has passed, deposits reopen at the accrual-inclusive price, so an epoch
+ *   that fails to close cannot lock deposits.
+ * - Redemptions use the same pricing ledger as deposits, including queued
+ *   withdrawals. A round trip inside one epoch therefore returns the deposit
+ *   less only the configured early-exit fee.
+ *
+ * The vault contract is the source of truth. These helpers exist for display,
+ * previews, and re-deriving historical share issuance from indexed events.
+ */
+export interface VaultPricingParams {
+  // Deposits are blocked for this many ledgers before the epoch close ledger.
+  cutoffLedgers: number;
+  // Lots are redeemable only after this many epochs have closed since mint.
+  minHoldEpochs: number;
+  // Early-exit fee in basis points for a lot that has been held zero epochs.
+  earlyExitFeeBps: number;
+  // The fee decays linearly to zero over this many epochs.
+  earlyExitFeeDecayEpochs: number;
+}
+
+// Placeholder defaults. Real values are set per vault through the governed
+// parameter path, not by client code.
+export const DEFAULT_PRICING_PARAMS: VaultPricingParams = {
+  cutoffLedgers: 12,
+  minHoldEpochs: 1,
+  earlyExitFeeBps: 50,
+  earlyExitFeeDecayEpochs: 3,
+};
+
+export interface VaultLedgerState {
+  navUsd: number;
+  accruedPremiumUsd: number;
+  knownLossUsd: number;
+  shareSupply: number;
+}
+
+/**
+ * Returns the ledger sequence a deposit or withdrawal at `now` is priced
+ * against, or null when deposits are closed by the pre-close cutoff.
+ */
+export function pricingLedgerSequence(
+  now: number,
+  epochCloseLedger: number,
+  params: VaultPricingParams = DEFAULT_PRICING_PARAMS
+): number | null {
+  const cutoffStart = epochCloseLedger - params.cutoffLedgers;
+  if (now >= cutoffStart && now < epochCloseLedger) return null;
+  return now;
+}
+
+/**
+ * Share price including accrued-but-unrealized premium and excluding known
+ * losses. Returns null when no shares are outstanding.
+ */
+export function pricingNavPerShare(state: VaultLedgerState): number | null {
+  if (!(state.shareSupply > 0)) return null;
+  return (state.navUsd + state.accruedPremiumUsd - state.knownLossUsd) / state.shareSupply;
+}
+
+/**
+ * Whether a lot minted `epochsHeld` epochs ago can be redeemed yet.
+ */
+export function isRedeemable(epochsHeld: number, params: VaultPricingParams = DEFAULT_PRICING_PARAMS): boolean {
+  return epochsHeld >= params.minHoldEpochs;
+}
+
+/**
+ * Early-exit fee in basis points for a lot held `epochsHeld` closed epochs.
+ * Decays linearly to zero, so a holder who stays through the decay window
+ * pays nothing.
+ */
+export function earlyExitFeeBps(epochsHeld: number, params: VaultPricingParams = DEFAULT_PRICING_PARAMS): number {
+  if (epochsHeld >= params.earlyExitFeeDecayEpochs) return 0;
+  const remaining = 1 - Math.max(0, epochsHeld) / params.earlyExitFeeDecayEpochs;
+  return params.earlyExitFeeBps * remaining;
+}
