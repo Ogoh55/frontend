@@ -80,6 +80,51 @@ jobs:
           retention-days: 14
 
   # ───────────────────────────────────────────────────────────────────────────
+  # MIGRATIONS
+  # Applies every vault migration to a clean Postgres schema, asserts the
+  # resulting schema matches the committed model, and verifies each migration
+  # is reversible (up → down → up) and backwards compatible with the previous
+  # deployed version. Runs as a separate deploy step, never on app boot.
+  # ───────────────────────────────────────────────────────────────────────────
+  migrations:
+    name: Migrations (up/down/status + schema drift)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vault -d vault_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://vault:vault@localhost:5432/vault_ci
+    steps:
+      - uses: ./.github/actions/setup
+
+      - name: Apply all migrations to a clean schema
+        run: npm run migrate:up
+
+      - name: Assert schema matches committed model
+        run: npm run migrate:check
+
+      - name: Verify migrations are reversible (up → down → up)
+        run: npm run migrate:test
+
+      - name: Check backwards compatibility with previous deployed version
+        run: npm run migrate:compat
+
+      - name: Report migration status
+        if: always()
+        run: npm run migrate:status
+
+  # ───────────────────────────────────────────────────────────────────────────
   # BUILD
   # Runs `next build`. The .next/cache is restored between runs so
   # incremental builds are fast. The build artifact is uploaded so the
@@ -96,6 +141,55 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - run: npx playwright install --with-deps chromium webkit
+      # RECORD=1 keeps a video of every test; they're uploaded below as the
+      # PR's recordings of the tour, the mode switch and the phone trade flow.
+      - run: npx playwright test
+        env:
+          CI: "true"
+          RECORD: "1"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report
+            test-results
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # RENDER PERFORMANCE (dev-only /__perf harness)
+  # Drives scripted vault NAV / queue-position / epoch ticks through the real
+  # SpotFeedContext provider and asserts recorded render counts against the
+  # documented baseline. Skips cleanly when no vault fixture data is available.
+  # ───────────────────────────────────────────────────────────────────────────
+  perf:
+    name: Render perf (vault render-count budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --config=playwright.perf.config.ts
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report
+          path: |
+            perf-report
+            test-results
+          retention-days: 14
 
   contract-drift:
     runs-on: ubuntu-latest
@@ -110,3 +204,90 @@ jobs:
         env:
           STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
         run: npm run verify:contracts
+
+  lighthouse:
+    name: Lighthouse (mobile perf ≥ 0.85, CLS < 0.05)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx --yes @lhci/cli@0.14.0 autorun
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighthouse-report
+          path: lhci-report
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Storybook: Build, test, visual regression, and publish
+  # ────────────────────────────────────────────────────────────────────────────
+  storybook-build:
+    name: Build Storybook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Storybook
+        run: npm run storybook:build
+        env:
+          # Storybook needs a dummy env so Next.js env validation passes
+          NEXT_PUBLIC_API_URL: http://localhost:8081
+          NEXT_PUBLIC_NETWORK_LABEL: Testnet
+          NEXT_PUBLIC_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
+          NEXT_PUBLIC_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+
+      - name: Upload Storybook build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: storybook-static
+          path: storybook-static/
+          retention-days: 7
+
+  storybook-test-runner:
+    name: Test Runner (interactions + a11y)
+    runs-on: ubuntu-latest
+    needs: storybook-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download Storybook build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: storybook-static
+          path: storybook-static/
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Storybook test runner
+        run: npm run storybook:test
+
+      - name: Upload test runner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storybook-test-report
+          path: storybook-test-report/
+          retention-days: 14
