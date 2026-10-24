@@ -17,6 +17,7 @@ import {
   fetchVaultAnalytics,
   depositToVault,
   withdrawFromVault,
+  deriveDepositState,
   fetchVaultExport,
   vaultStatusPolicy,
   acknowledgeDisclosure,
@@ -24,6 +25,7 @@ import {
   hashDisclosureText,
   VaultPolicyError,
   VAULT_DISCLOSURE_VERSION,
+  type DepositState,
   type VaultAnalytics,
   type VaultDetail,
   type EpochPhase,
@@ -60,19 +62,25 @@ function fmtDateShort(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function fmtDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
   const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
+  const t = useTranslations("vaults");
+  const tDisclosure = useTranslations("vaultDisclosure");
   const { keyFor, complete } = useIdempotencyKey();
-  const t = useTranslations("vaultDisclosure");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [analytics, setAnalytics] = useState<VaultAnalytics | null>(null);
   const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   const [depositAmount, setDepositAmount] = useState("");
   const [withdrawShares, setWithdrawShares] = useState("");
@@ -88,7 +96,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [acknowledging, setAcknowledging] = useState(false);
   const [policyReason, setPolicyReason] = useState<PolicyReasonCode | null>(null);
 
-  const disclosureParagraphs = [t("p1"), t("p2"), t("p3"), t("p4"), t("p5")];
+  const disclosureParagraphs = [tDisclosure("p1"), tDisclosure("p2"), tDisclosure("p3"), tDisclosure("p4"), tDisclosure("p5")];
   const disclosureText = disclosureParagraphs.join("\n\n");
 
   const currentAck = acks?.find(a => a.disclosureVersion === VAULT_DISCLOSURE_VERSION && a.jurisdictionAttested) ?? null;
@@ -107,6 +115,12 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       .then(a => { setAnalytics(a); setAnalyticsError(null); })
       .catch(e => { setAnalytics(null); setAnalyticsError(e.message); });
   }, [id, token, vaultsEnabled]);
+
+  // Re-evaluate limit staleness while the page stays open.
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, []);
 
   const permittedActions = vault ? vaultStatusPolicy(vault.status).permittedActions : [];
 
@@ -149,10 +163,24 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     }
   };
 
+  const depositState = vault ? deriveDepositState(vault, now) : null;
+  const depositAmountNum = parseFloat(depositAmount);
+  const overMax = !!depositState && depositState.status !== "waitlist" && depositAmountNum > depositState.maxDeposit;
+  const statusColor = depositState?.status === "open"
+    ? "var(--call)"
+    : depositState?.status === "queued" || depositState?.status === "waitlist"
+      ? "var(--atm)"
+      : "var(--put)";
+  const sharesLine = (s: DepositState, phaseEndsAt: string) =>
+    s.status === "open"
+      ? t("form.sharesOpen", { date: fmtDateTime(phaseEndsAt) })
+      : s.status === "queued" ? t("form.sharesQueued") : t("form.sharesWaitlist");
+
   const handleDeposit = async () => {
-    if (!vault || !token || !address || !currentAck || gateReason || !disclosuresAcknowledged || !permittedActions.includes("deposit")) return;
+    if (!vault || !token || !address || !currentAck || gateReason || !disclosuresAcknowledged || !permittedActions.includes("deposit") || !depositState?.canSubmit || overMax) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
+    const state = depositState;
     setTxStatus("pending");
     setTxMessage("");
     try {
@@ -164,19 +192,24 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
         enabled: vaultsEnabled,
       });
       complete();
+      const pricing = state.pricedInEpoch !== null
+        ? t("form.pricedIn", { epoch: state.pricedInEpoch })
+        : t("form.pricedWaitlist");
       setTxStatus("success");
-      setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
+      setTxMessage(`${pricing} ${sharesLine(state, vault.phaseEndsAt)} TX: ${result.tx_id}`);
       setDepositAmount("");
       // Reconcile the displayed position with backend truth.
       fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
-      setTxStatus(null);
       if (e instanceof VaultPolicyError) {
+        setTxStatus(null);
         setPolicyReason(e.code);
         refreshAcks();
       } else {
+        // Backend rejections while the vault filled mid-flight get actionable copy, never the raw error.
+        const message = e instanceof Error ? e.message : "";
         setTxStatus("error");
-        setTxMessage(e instanceof Error ? e.message : "Deposit failed");
+        setTxMessage(/capacity|full/i.test(message) ? t("form.capacityChanged") : t("form.submitFailed"));
       }
     }
   };
@@ -450,6 +483,35 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   </div>
                 </div>
 
+                {/* Capacity and deposit limits, derived by the same selector as the listing */}
+                {depositState && (
+                  <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 600, color: "var(--text-mid)", marginBottom: 8 }}>
+                      <span>{t("capacity")}</span>
+                      <span className="num">{fmtUsd(vault.tvl)} / {fmtUsd(vault.capacity)}</span>
+                    </div>
+                    <div style={{ height: 3, background: "var(--bg-overlay)" }}>
+                      <div style={{ width: `${depositState.utilisation}%`, height: "100%", background: "var(--brand)", transition: "width 400ms" }} />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-lo)", marginTop: 6 }}>
+                      <span>{t("remaining", { amount: fmtUsd(depositState.remainingCapacity) })}</span>
+                      <span>{t("utilised", { percent: Math.round(depositState.utilisation) })}</span>
+                    </div>
+                    <div style={{
+                      marginTop: 10, padding: "6px 8px", fontSize: 10, lineHeight: 1.5,
+                      color: statusColor, border: `1px solid ${statusColor}`, borderLeft: `3px solid ${statusColor}`,
+                    }}>
+                      {t(`status.${depositState.status}`, {
+                        epoch: depositState.pricedInEpoch ?? vault.currentEpoch + 1,
+                        date: fmtDateTime(vault.limits.nextDepositStart),
+                      })}
+                    </div>
+                    <div style={{ fontSize: 9, color: depositState.status === "stale" ? "var(--put)" : "var(--text-lo)", marginTop: 6 }}>
+                      {t("limitsAsOf", { time: fmtDateTime(depositState.limitsAsOf) })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Deposit / Withdraw flows */}
                 {!token ? (
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16, fontSize: 12, color: "var(--text-mid)", textAlign: "center" }}>
@@ -486,13 +548,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     {activeFlow === "deposit" && vaultsEnabled && permittedActions.includes("deposit") && (
                       <div style={{ padding: 16 }}>
                         {acks === null && (
-                          <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{t("checking")}</div>
+                          <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{tDisclosure("checking")}</div>
                         )}
                         {acks !== null && !currentAck && (
                           <div style={{ marginBottom: 14, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", padding: 12 }}>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 8 }}>{t("title")}</div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 8 }}>{tDisclosure("title")}</div>
                             <div style={{ fontSize: 10, color: "var(--text-lo)", marginBottom: 8 }}>
-                              {t("versionLabel", { version: VAULT_DISCLOSURE_VERSION })}
+                              {tDisclosure("versionLabel", { version: VAULT_DISCLOSURE_VERSION })}
                             </div>
                             <div style={{ maxHeight: 180, overflowY: "auto", fontSize: 11, color: "var(--text-mid)", lineHeight: 1.6, marginBottom: 10 }}>
                               {disclosureParagraphs.map((p, i) => (
@@ -501,11 +563,11 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                             <label style={{ display: "flex", gap: 8, fontSize: 11, color: "var(--text-mid)", marginBottom: 8, cursor: "pointer" }}>
                               <input type="checkbox" checked={acceptRisks} onChange={e => setAcceptRisks(e.target.checked)} style={{ marginTop: 2 }} />
-                              <span>{t("acceptRisks")}</span>
+                              <span>{tDisclosure("acceptRisks")}</span>
                             </label>
                             <label style={{ display: "flex", gap: 8, fontSize: 11, color: "var(--text-mid)", marginBottom: 10, cursor: "pointer" }}>
                               <input type="checkbox" checked={attestJurisdiction} onChange={e => setAttestJurisdiction(e.target.checked)} style={{ marginTop: 2 }} />
-                              <span>{t("attestJurisdiction")}</span>
+                              <span>{tDisclosure("attestJurisdiction")}</span>
                             </label>
                             <button
                               onClick={handleAcknowledge}
@@ -517,13 +579,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                                 opacity: acknowledging || !acceptRisks || !attestJurisdiction ? 0.6 : 1,
                               }}
                             >
-                              {acknowledging ? t("accepting") : t("accept")}
+                              {acknowledging ? tDisclosure("accepting") : tDisclosure("accept")}
                             </button>
                           </div>
                         )}
                         {currentAck && (
                           <div style={{ marginBottom: 12, fontSize: 10, color: "var(--text-lo)" }}>
-                            {t("versionLabel", { version: VAULT_DISCLOSURE_VERSION })} · {t("acceptedAt", { date: fmtDate(currentAck.acceptedAt) })}
+                            {tDisclosure("versionLabel", { version: VAULT_DISCLOSURE_VERSION })} · {tDisclosure("acceptedAt", { date: fmtDate(currentAck.acceptedAt) })}
                           </div>
                         )}
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
@@ -536,70 +598,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             type="number"
                             min={0}
                             value={depositAmount}
-                            onChange={e => setDepositAmount(e.target.value)}
-                            placeholder="0.00"
-                            style={{
-                              width: "100%", padding: "8px 10px",
-                              background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
-                              color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
-                            }}
-                          />
-                          {depositAmount && !isNaN(parseFloat(depositAmount)) && parseFloat(depositAmount) > 0 && (
-                            <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
-                              ≈ {(parseFloat(depositAmount) / vault.sharePrice).toFixed(4)} shares
-                            </div>
-                          )}
-                        </div>
-                        {/* Queued withdrawal notice if epoch is active */}
-                        {vault.currentPhase === "active" && (
-                          <div style={{ marginBottom: 10, fontSize: 10, color: "var(--atm)", padding: "6px 8px", background: "var(--atm-dim)" }}>
-                            Deposits during active epochs are queued for the next epoch start.
-                          </div>
-                        )}
-                        {/* Depositor disclosures: shown and acknowledged before the deposit can be submitted */}
-                        <div style={{ marginBottom: 12, padding: 10, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", fontSize: 10, color: "var(--text-lo)", lineHeight: 1.6 }}>
-                          <div><span style={{ color: "var(--text-mid)" }}>Risk level:</span> {vault.riskRating}</div>
-                          <div><span style={{ color: "var(--text-mid)" }}>Strategy:</span> {vault.description}</div>
-                          <div>
-                            <span style={{ color: "var(--text-mid)" }}>Fees:</span>{" "}
-                            {vault.feeStructure.managementPct}% management annually, {vault.feeStructure.performancePct}% performance
-                          </div>
-                          <div>
-                            Deposits are queued and redemptions are processed through the withdrawal queue at epoch end;
-                            redemption at the final NAV is not guaranteed to match the current share price.
-                          </div>
-                          <label style={{ display: "flex", gap: 6, alignItems: "flex-start", marginTop: 8, color: "var(--text-hi)", cursor: "pointer" }}>
-                            <input
-                              type="checkbox"
-                              checked={disclosuresAcknowledged}
-                              onChange={e => setDisclosuresAcknowledged(e.target.checked)}
-                              style={{ marginTop: 2 }}
-                            />
-                            <span>I have read the risk level, strategy, fees and queue/redemption terms above.</span>
-                          </label>
-                        </div>
-                        {gateReason && (
-                          <div role="alert" style={{ marginBottom: 10, fontSize: 10, color: "var(--put)", padding: "6px 8px", background: "var(--put-dim)" }}>
-                            <strong>{t("depositBlocked")}:</strong> {t(`reason.${gateReason}`)}
-                          </div>
-                        )}
-                        <button
-                          onClick={handleDeposit}
-                          disabled={!disclosuresAcknowledged || txStatus === "pending" || !currentAck || !!gateReason || !depositAmount || isNaN(parseFloat(depositAmount)) || parseFloat(depositAmount) <= 0}
-                          style={{
-                            width: "100%", padding: "10px 0", background: "var(--brand)",
-                            color: "var(--bg)", border: "none", fontSize: 13, fontWeight: 700,
-                            cursor: txStatus === "pending" || !currentAck || gateReason ? "default" : "pointer",
-                            opacity: txStatus === "pending" || !currentAck || gateReason ? 0.6 : 1,
-                          }}
-                        >
-                          {txStatus === "pending" ? "Confirming…" : "Deposit"}
-                        </button>
-                      </div>
-                    )}
-
-                    {activeFlow === "withdraw" && permittedActions.includes("withdraw") && (
-                      <div style={{ padding: 16 }}>
-                        <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
-                          Withdrawal requests are queued and processed at the end of the current epoch.
-                          Shares are redeemed at
+                            onChange={e => setDepositAmount(e

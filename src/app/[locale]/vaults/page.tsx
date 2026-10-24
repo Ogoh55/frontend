@@ -2,11 +2,13 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useTranslations } from "next-intl";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
 import {
   capacityUtilization,
+  deriveDepositState,
   effectiveStatus,
   filterVaults,
   fetchVaults,
@@ -65,6 +67,15 @@ const TH_STYLE = {
 
 const TD_STYLE = { padding: "10px", fontSize: 12, color: "var(--text-mid)", borderBottom: "1px solid var(--border-subtle)", whiteSpace: "nowrap" } as const;
 
+function fmtDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function capacityPct(tvl: number, capacity: number) {
+  if (capacity <= 0) return 0;
+  return Math.min(100, (tvl / capacity) * 100);
+}
+
 function VaultsIndex() {
   const router = useRouter();
   const pathname = usePathname();
@@ -74,6 +85,8 @@ function VaultsIndex() {
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const t = useTranslations("vaults");
   const vaultsEnabled = useFlag("vaults");
 
   useEffect(() => {
@@ -121,6 +134,12 @@ function VaultsIndex() {
 
   const hasFilters = Boolean(query.strategy || query.underlying || query.status || query.risk) || query.tenor !== null;
   const loading = vaults === null && error === null;
+
+  // Re-evaluate limit staleness while the page stays open.
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, []);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "var(--bg)", overflow: "hidden", fontFamily: "var(--font-sans)" }}>
@@ -289,6 +308,8 @@ function VaultsIndex() {
                     const selected = query.ids.includes(vault.id);
                     const disabled = !selected && query.ids.length >= VAULT_COMPARE_MAX;
                     const status = effectiveStatus(vault);
+                    const deposit = deriveDepositState(vault, now);
+                    const statusColor = deposit.status === "open" ? "var(--call)" : deposit.status === "queued" || deposit.status === "waitlist" ? "var(--atm)" : "var(--put)";
                     return (
                       <tr key={vault.id}>
                         <td style={TD_STYLE}>
@@ -336,6 +357,14 @@ function VaultsIndex() {
                           <Link href={`/vaults/${vault.id}`} style={{ color: "var(--brand)", fontWeight: 700, textDecoration: "none" }}>
                             View →
                           </Link>
+                          {deposit.status !== "open" && (
+                            <div style={{ fontSize: 10, color: statusColor, marginTop: 4, whiteSpace: "normal", maxWidth: 180 }}>
+                              {t(`status.${deposit.status}`, {
+                                epoch: deposit.pricedInEpoch ?? vault.currentEpoch + 1,
+                                date: fmtDateTime(vault.limits.nextDepositStart),
+                              })}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );

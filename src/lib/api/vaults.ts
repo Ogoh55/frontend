@@ -112,7 +112,7 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -416,6 +416,24 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+/**
+ * Backend-supplied deposit limits. Every value here is authoritative only as of
+ * `asOf`; past LIMITS_STALE_AFTER_MS the UI derives a read-only "stale" state
+ * instead of trusting the numbers.
+ */
+export interface VaultLimits {
+  /** Deposits are paused by the operator. */
+  paused: boolean;
+  /** Deposits that cannot be accepted now join the waitlist for the next epoch. */
+  waitlistEnabled: boolean;
+  /** Maximum USD a single depositor may add in one epoch. */
+  perEpochDepositLimit: number;
+  /** ISO start of the next deposit window. */
+  nextDepositStart: string;
+  /** ISO time the backend took this snapshot. */
+  asOf: string;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -439,6 +457,10 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  currentEpoch: number;
+  currentPhase: EpochPhase;
+  phaseEndsAt: string; // ISO — when the current phase ends
+  limits: VaultLimits;
   /** Epoch length (tenor) in days. */
   epochDays: number;
   /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
@@ -750,34 +772,4 @@ export interface ShadowState {
  * progress and block promotion when unmet.
  */
 export interface PromotionCriteria {
-  /** Minimum number of complete shadow epochs required. */
-  minCompleteEpochs: number;
-  /** Max allowed |shadow − expected| NAV deviation per share (USD). */
-  maxNavDeviation: number;
-  /** Whether any invariant violations were recorded during the run. */
-  invariantViolations: number;
-}
-
-export interface QueueState {
-  depositPendingUsd: number;
-  withdrawPendingShares: number;
-  settlesAt: string; // ISO
-}
-
-export interface FeeAccrual {
-  managementAccruedUsd: number;
-  performanceAccruedUsd: number;
-  accruedThrough: string; // ISO
-}
-
-export interface NavPoint {
-  at: string; // ISO
-  sharePrice: number;
-  totalShares: number;
-}
-
-/** Full detail for a single vault. */
-export interface VaultDetail extends VaultSummary {
-  currentEpoch: number;
-  currentPhase: EpochPhase;
-  phaseEndsAt: string; // ISO — when the current phase
+  /**
