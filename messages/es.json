@@ -137,6 +137,23 @@
     "hotkeys": "Atajos de teclado",
     "hotkeysSoon": "Atajos de teclado personalizados próximamente. Exporta/importa tus atajos arriba."
   },
+  "vaults": {
+    "notifications": {
+      "v1": {
+        "epoch_opened": "La época {epoch} está abierta para depósitos en {vault}.",
+        "epoch_closed": "La época {epoch} cerró en {vault}.",
+        "nav_published": "El NAV por cuota de {vault} es ahora {nav}.",
+        "premium_collected": "Prima cobrada para la época {epoch} en {vault}.",
+        "assignment": "{vault} fue asignado en la época {epoch}. Revisa tu posición.",
+        "redemption_claimable": "Tu reembolso de {vault} ya se puede reclamar.",
+        "redemption_expired": "La ventana de reembolso de {vault} ha expirado.",
+        "vault_paused": "{vault} está pausado. Los depósitos y las nuevas épocas están en espera.",
+        "vault_unpaused": "{vault} se ha reanudado.",
+        "capacity_reached": "{vault} alcanzó su capacidad. Los nuevos depósitos están cerrados.",
+        "nav_drift": "El NAV de {vault} se desvió del valor publicado. Revisa la bóveda."
+      }
+    }
+  },
   "notFound": {
     "title": "Página no encontrada",
     "back": "Volver a la terminal"

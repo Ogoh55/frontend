@@ -13,6 +13,7 @@ import {
   depositToVault,
   withdrawFromVault,
   deriveDepositState,
+  vaultStatusPolicy,
   acknowledgeDisclosure,
   fetchMyDisclosureAcknowledgements,
   hashDisclosureText,
@@ -104,6 +105,8 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     return () => clearInterval(timer);
   }, []);
 
+  const permittedActions = vault ? vaultStatusPolicy(vault.status).permittedActions : [];
+
   // Re-query acknowledgements whenever the connected wallet changes, and clear any
   // checkbox or rejection state that belonged to the previous wallet.
   useEffect(() => {
@@ -157,7 +160,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       : s.status === "queued" ? t("form.sharesQueued") : t("form.sharesWaitlist");
 
   const handleDeposit = async () => {
-    if (!vault || !token || !address || !currentAck || gateReason || !depositState?.canSubmit || overMax) return;
+    if (!vault || !token || !address || !currentAck || gateReason || !permittedActions.includes("deposit") || !depositState?.canSubmit || overMax) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
     const state = depositState;
@@ -190,7 +193,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   };
 
   const handleWithdraw = async () => {
-    if (!vault || !token) return;
+    if (!vault || !token || !permittedActions.includes("withdraw")) return;
     const shares = parseFloat(withdrawShares);
     if (isNaN(shares) || shares <= 0) return;
     setTxStatus("pending");
@@ -454,11 +457,16 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     <div style={{ marginBottom: 10 }}>Connect your wallet to deposit or withdraw.</div>
                     <WalletConnect />
                   </div>
+                ) : permittedActions.length === 0 ? (
+                  <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 16, fontSize: 12, color: "var(--text-mid)", textAlign: "center" }}>
+                    <div style={{ marginBottom: 6, fontWeight: 600, color: "var(--text-hi)" }}>Vault {vaultStatusPolicy(vault.status).label}</div>
+                    <div>Deposits and withdrawals are not available in this status.</div>
+                  </div>
                 ) : (
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
                     {/* Tab switcher */}
                     <div style={{ display: "flex", borderBottom: "1px solid var(--border-default)" }}>
-                      {(["deposit", "withdraw"] as const).map(flow => (
+                      {(["deposit", "withdraw"] as const).filter(flow => permittedActions.includes(flow)).map(flow => (
                         <button key={flow} onClick={() => { setActiveFlow(activeFlow === flow ? null : flow); setTxStatus(null); }}
                           style={{
                             flex: 1, padding: "10px 0", border: "none", cursor: "pointer",
@@ -473,7 +481,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       ))}
                     </div>
 
-                    {activeFlow === "deposit" && (
+                    {activeFlow === "deposit" && permittedActions.includes("deposit") && (
                       <div style={{ padding: 16 }}>
                         {acks === null && (
                           <div style={{ marginBottom: 12, fontSize: 11, color: "var(--text-lo)" }}>{tDisclosure("checking")}</div>
@@ -586,20 +594,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       </div>
                     )}
 
-                    {activeFlow === "withdraw" && (
-                      <div style={{ padding: 16 }}>
-                        <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
-                          Withdrawal requests are queued and processed at the end of the current epoch.
-                          Shares are redeemed at the final NAV after settlement.
-                        </div>
-                        <div style={{ marginBottom: 12 }}>
-                          <label style={{ fontSize: 10, color: "var(--text-lo)", display: "block", marginBottom: 4 }}>Shares to Withdraw</label>
-                          <input
-                            type="number"
-                            min={0}
-                            value={withdrawShares}
-                            onChange={e => setWithdrawShares(e.target.value)}
-                            placeholder="0.0000"
-                            style={{
-                              width: "100%", padding: "8px 10px",
-                              background: "var
+                    {activeFlow ===

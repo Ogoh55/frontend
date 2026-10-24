@@ -18,6 +18,7 @@ import { NetworkMismatchBanner } from "../../components/NetworkMismatchBanner";
 import { SorobanEventBridge } from "../../components/SorobanEventBridge";
 import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
+import { A11yRoot } from "../../components/a11y/A11yRoot";
 import { THEME_INIT_SCRIPT } from "../../lib/theme";
 
 const fraunces = Fraunces({
@@ -94,6 +95,7 @@ export default async function LocaleLayout({ children, params }: { children: Rea
       <body>
         <script nonce={nonce ?? undefined} dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
+          <A11yRoot />
           <StoreHydrator />
           <Toaster />
           <SessionBanner />
