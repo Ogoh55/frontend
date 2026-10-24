@@ -18,6 +18,11 @@
  *
  * History comes from Horizon contract-event filtering; we translate those
  * into a lightweight VaultEvent shape for the UI.
+ *
+ * Resilience (#282): the BFF owns the Soroban RPC provider pool, failover,
+ * batching, and read-after-write confirmation. This module surfaces the
+ * freshness/confirmation status the BFF returns so the UI can render
+ * degraded states explicitly instead of showing stale balances.
  */
 
 import { submitTransactionXdr } from "./stellar";
@@ -31,10 +36,32 @@ export const VAULT_CONTRACT_ID =
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Freshness of the state returned by the BFF after a write.
+ * - `confirmed`: ledger inclusion observed and state re-read.
+ * - `pending`: submission accepted but confirmation timed out; the UI should
+ *   show a "pending confirmation" state and poll rather than re-submit.
+ */
+export type VaultConfirmationStatus = "confirmed" | "pending";
+
 export interface VaultOperationResult {
   txHash: string;
   amount: number;
   operation: "deposit" | "withdraw";
+  /** Read-after-write confirmation status from the BFF. */
+  status: VaultConfirmationStatus;
+  /** Ledger the write was observed in, when confirmed. */
+  ledger?: number;
+  /** Re-read state after the write, when the BFF returned it. */
+  state?: VaultStateSnapshot;
+}
+
+/** Post-write snapshot of the balances the UI renders. */
+export interface VaultStateSnapshot {
+  nav?: number;
+  shareBalance?: number;
+  tokenBalance?: number;
+  ledger?: number;
 }
 
 export type VaultEventType = "deposit" | "withdraw";
@@ -45,6 +72,50 @@ export interface VaultEvent {
   txHash: string;
   timestamp: string; // ISO 8601
   ledger: number;
+}
+
+// ---------------------------------------------------------------------------
+// Read-after-write confirmation
+// ---------------------------------------------------------------------------
+
+/**
+ * Documented timeout (ms) the BFF waits for ledger inclusion before falling
+ * back to the `pending` state. Kept in sync with the server-side client.
+ */
+export const VAULT_CONFIRMATION_TIMEOUT_MS = 30_000;
+
+interface ConfirmationResponse {
+  status?: VaultConfirmationStatus;
+  ledger?: number;
+  state?: VaultStateSnapshot;
+}
+
+/**
+ * Asks the BFF to wait for ledger inclusion and re-read affected state.
+ * Never re-submits the signed transaction: on timeout the BFF returns
+ * `pending` and the caller surfaces a degraded state.
+ */
+async function confirmVaultWrite(
+  txHash: string,
+  operation: "deposit" | "withdraw"
+): Promise<ConfirmationResponse> {
+  try {
+    const res = await bffFetch("/api/v1/onchain/confirm", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tx_hash: txHash,
+        operation,
+        timeout_ms: VAULT_CONFIRMATION_TIMEOUT_MS,
+      }),
+    });
+
+    if (!res.ok) return { status: "pending" };
+    return (await res.json()) as ConfirmationResponse;
+  } catch {
+    // Network/parse failure: treat as pending rather than claiming success.
+    return { status: "pending" };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +160,17 @@ export async function depositToVault(
   });
   const { hash } = await submitTransactionXdr(signed);
 
-  return { txHash: hash, amount, operation: "deposit" };
+  // Read-after-write: wait for inclusion and re-read state before returning.
+  const confirmation = await confirmVaultWrite(hash, "deposit");
+
+  return {
+    txHash: hash,
+    amount,
+    operation: "deposit",
+    status: confirmation.status ?? "pending",
+    ledger: confirmation.ledger,
+    state: confirmation.state,
+  };
 }
 
 /**
@@ -140,7 +221,17 @@ export async function withdrawFromVault(
   });
   const { hash } = await submitTransactionXdr(signed);
 
-  return { txHash: hash, amount, operation: "withdraw" };
+  // Read-after-write: wait for inclusion and re-read state before returning.
+  const confirmation = await confirmVaultWrite(hash, "withdraw");
+
+  return {
+    txHash: hash,
+    amount,
+    operation: "withdraw",
+    status: confirmation.status ?? "pending",
+    ledger: confirmation.ledger,
+    state: confirmation.state,
+  };
 }
 
 // ---------------------------------------------------------------------------

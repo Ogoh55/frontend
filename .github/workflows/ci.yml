@@ -80,6 +80,51 @@ jobs:
           retention-days: 14
 
   # ───────────────────────────────────────────────────────────────────────────
+  # MIGRATIONS
+  # Applies every vault migration to a clean Postgres schema, asserts the
+  # resulting schema matches the committed model, and verifies each migration
+  # is reversible (up → down → up) and backwards compatible with the previous
+  # deployed version. Runs as a separate deploy step, never on app boot.
+  # ───────────────────────────────────────────────────────────────────────────
+  migrations:
+    name: Migrations (up/down/status + schema drift)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vault -d vault_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://vault:vault@localhost:5432/vault_ci
+    steps:
+      - uses: ./.github/actions/setup
+
+      - name: Apply all migrations to a clean schema
+        run: npm run migrate:up
+
+      - name: Assert schema matches committed model
+        run: npm run migrate:check
+
+      - name: Verify migrations are reversible (up → down → up)
+        run: npm run migrate:test
+
+      - name: Check backwards compatibility with previous deployed version
+        run: npm run migrate:compat
+
+      - name: Report migration status
+        if: always()
+        run: npm run migrate:status
+
+  # ───────────────────────────────────────────────────────────────────────────
   # BUILD
   # Runs `next build`. The .next/cache is restored between runs so
   # incremental builds are fast. The build artifact is uploaded so the
@@ -145,6 +190,38 @@ jobs:
           name: playwright-report
           path: |
             playwright-report
+            test-results
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # RENDER PERFORMANCE (dev-only /__perf harness)
+  # Drives scripted vault NAV / queue-position / epoch ticks through the real
+  # SpotFeedContext provider and asserts recorded render counts against the
+  # documented baseline. Skips cleanly when no vault fixture data is available.
+  # ───────────────────────────────────────────────────────────────────────────
+  perf:
+    name: Render perf (vault render-count budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --config=playwright.perf.config.ts
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report
+          path: |
+            perf-report
             test-results
           retention-days: 14
 
@@ -215,14 +292,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download Storybook build
+      - name: Download Storybook build artifact
         uses: actions/download-artifact@v4
         with:
           name: storybook-static
           path: storybook-static/
 
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
 
       - name: Run Storybook test runner
         run: npm run storybook:test
@@ -230,6 +307,14 @@ jobs:
           # Point the test runner at the static build served by the built-in
           # reference server.
           TARGET_URL: http://localhost:6006
+
+      - name: Upload test runner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storybook-test-report
+          path: storybook-test-report/
+          retention-days: 14
 
   # ────────────────────────────────────────────────────────────────────────────
   # POST-DEPLOY VERIFICATION (issue #288)
