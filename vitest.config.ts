@@ -1,3 +1,4 @@
+import path from "node:path";
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
@@ -9,8 +10,12 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["./vitest.setup.ts"],
+    restoreMocks: true,
     // userEvent-driven component tests can take a few seconds each when
     // every file runs in parallel on a busy CI runner.
     testTimeout: 15_000,
+  },
+  resolve: {
+    alias: { "@": path.resolve(__dirname, "src") },
   },
 });

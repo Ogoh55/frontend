@@ -10,6 +10,7 @@ import { fmtN } from "../lib/pricing";
 const TABS = [
   { label: "Chain", href: "/options" },
   { label: "Portfolio", href: "/portfolio" },
+  { label: "Compete", href: "/compete" },
   { label: "History", href: "/history" },
   { label: "Contracts", href: "/contracts" },
 ];
