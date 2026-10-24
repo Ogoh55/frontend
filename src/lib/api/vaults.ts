@@ -35,6 +35,9 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /{id}/deposit        { amount }                    → { tx_id }
  *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
+ *   GET /api/v1/vaults/{id}/analytics
+ *   → VaultAnalytics
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
  *     caps are computed server-side). The client only signs and submits it.
@@ -776,7 +779,4 @@ export interface NavPoint {
 }
 
 /** Full detail for a single vault. */
-export interface VaultDetail extends VaultSummary {
-  /** Null until the first epoch has started. */
-  currentEpoch: number | null;
- 
+export interface VaultDetail extends
