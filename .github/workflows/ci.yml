@@ -448,3 +448,65 @@ jobs:
           name: storybook-test-report
           path: storybook-test-report/
           retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # POST-DEPLOY VERIFICATION (issue #288)
+  # Read-only smoke suite + canary gate for vault contract/backend releases.
+  # Runs only when a deployed environment URL is provided (e.g. via a
+  # workflow_dispatch input or a release event). Never submits transactions.
+  # ────────────────────────────────────────────────────────────────────────────
+  post-deploy-verify:
+    name: Post-deploy verification (smoke + canary)
+    runs-on: ubuntu-latest
+    # Only run when a target environment is supplied; skip on plain PRs.
+    if: ${{ vars.DEPLOY_ENV_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Read-only smoke suite: registry, NAV/share price, simulated deposit &
+      # withdrawal, epoch ledger entry, and indexer ledger-lag bound. Fails the
+      # job (triggering rollback) if any check fails.
+      - name: Run post-deploy smoke suite
+        run: npm run verify:smoke
+        env:
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          CANARY_BASE_URL: ${{ vars.CANARY_BASE_URL }}
+          INDEXER_MAX_LAG_LEDGERS: ${{ vars.INDEXER_MAX_LAG_LEDGERS || '30' }}
+          VERIFY_RELEASE: ${{ github.ref_name }}
+
+      # Canary gate: percentage/shadow traffic with structural comparison of
+      # responses to the stable version; promotes only when error rate and
+      # latency are within budget.
+      - name: Run canary comparison gate
+        run: npm run verify:canary
+        env:
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          CANARY_BASE_URL: ${{ vars.CANARY_BASE_URL }}
+          CANARY_ERROR_BUDGET: ${{ vars.CANARY_ERROR_BUDGET || '0.01' }}
+          CANARY_LATENCY_BUDGET_MS: ${{ vars.CANARY_LATENCY_BUDGET_MS || '500' }}
+          VERIFY_RELEASE: ${{ github.ref_name }}
+
+      - name: Upload verification results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-deploy-verification-${{ github.ref_name }}
+          path: verification-results/
+          retention-days: 30
+
+      # Automatic rollback when any gate fails. Manual override is documented
+      # in docs/DEPLOY_ROLLBACK.md (set ROLLBACK_OVERRIDE=true to skip).
+      - name: Automatic rollback on gate failure
+        if: failure() && vars.ROLLBACK_OVERRIDE != 'true'
+        run: npm run deploy:rollback
+        env:
+          DEPLOY_ENV_URL: ${{ vars.DEPLOY_ENV_URL }}
+          VERIFY_RELEASE: ${{ github.ref_name }}

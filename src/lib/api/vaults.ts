@@ -43,6 +43,8 @@ import { submitTransactionXdr } from "./stellar";
  *
  *   GET /api/v1/vaults/{id}/epochs?cursor=<opaque>&limit=<n>
  *   → { items: EpochRecord[]; nextCursor: string | null; cache: CacheMeta }
+ *   GET  /api/v1/vaults/{id}/epoch-schedule?count=N
+ *   → EpochBoundaryPreview   (dry-run: next N boundaries, no side effects)
  *
  *   GET /api/v1/vaults/{id}/analytics
  *   → VaultAnalytics
