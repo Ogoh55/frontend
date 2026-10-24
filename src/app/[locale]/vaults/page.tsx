@@ -82,11 +82,11 @@ function VaultsIndex() {
     if (!vaultsEnabled) return;
     let cancelled = false;
     setError(null);
-    fetchVaults()
+    fetchVaults({ enabled: vaultsEnabled })
       .then(v => { if (!cancelled) setVaults(v); })
       .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : "Unknown error"); });
     return () => { cancelled = true; };
-  }, [vaultsEnabled, attempt]);
+  }, [attempt, vaultsEnabled]);
 
   const underlyings = useMemo(
     () => [...new Set((vaults ?? []).map(v => v.underlying))].sort(),
@@ -242,6 +242,11 @@ function VaultsIndex() {
                 }}>Close</button>
               </div>
             </div>
+          )}
+
+          {/* Vaults disabled */}
+          {!loading && !error && !vaultsEnabled && vaults && vaults.length === 0 && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
           )}
 
           {/* Empty */}

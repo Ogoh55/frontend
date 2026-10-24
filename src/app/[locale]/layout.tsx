@@ -18,6 +18,8 @@ import { NetworkMismatchBanner } from "../../components/NetworkMismatchBanner";
 import { SorobanEventBridge } from "../../components/SorobanEventBridge";
 import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
+import { FlagsProvider, resolveAllFlags } from "../../lib/flags";
+import { fetchRemoteConfig } from "../../lib/flags/fetchRemoteConfig";
 import { A11yRoot } from "../../components/a11y/A11yRoot";
 import { THEME_INIT_SCRIPT } from "../../lib/theme";
 
@@ -88,6 +90,11 @@ export default async function LocaleLayout({ children, params }: { children: Rea
     console.warn("[csp] no x-nonce request header — is src/middleware.ts running for this route?");
   }
 
+  // Flags are resolved here so SSR and the first client render agree; the
+  // provider swaps to live resolution after hydration.
+  const remoteConfig = await fetchRemoteConfig();
+  const initialFlags = resolveAllFlags({ remoteConfig, allowQueryOverride: false });
+
   return (
     // suppressHydrationWarning: the theme script below sets data-theme on <html>
     // before React hydrates, so the attribute differs from the server markup.
@@ -95,23 +102,25 @@ export default async function LocaleLayout({ children, params }: { children: Rea
       <body>
         <script nonce={nonce ?? undefined} dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
-          <A11yRoot />
-          <StoreHydrator />
-          <Toaster />
-          <SessionBanner />
-          <ContractErrorOverlay />
-          <QueryProvider>
-            <SpotFeedProvider>
-              <BackendDataProvider>
-                <NetworkMismatchBanner />
-                <SorobanEventBridge>
-                  <CommandLayer>{children}</CommandLayer>
-                </SorobanEventBridge>
-              </BackendDataProvider>
-              <PwaShell />
-            </SpotFeedProvider>
-          </QueryProvider>
-          <TransactionTracker />
+          <FlagsProvider initialFlags={initialFlags} initialRemoteConfig={remoteConfig}>
+            <A11yRoot />
+            <StoreHydrator />
+            <Toaster />
+            <SessionBanner />
+            <ContractErrorOverlay />
+            <QueryProvider>
+              <SpotFeedProvider>
+                <BackendDataProvider>
+                  <NetworkMismatchBanner />
+                  <SorobanEventBridge>
+                    <CommandLayer>{children}</CommandLayer>
+                  </SorobanEventBridge>
+                </BackendDataProvider>
+                <PwaShell />
+              </SpotFeedProvider>
+            </QueryProvider>
+            <TransactionTracker />
+          </FlagsProvider>
         </NextIntlClientProvider>
       </body>
     </html>
