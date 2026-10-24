@@ -27,6 +27,25 @@ const LATEST_REPORT_PATH = path.join(__dirname, "results/latest.json");
 // Regression threshold: fail if any metric regresses by more than this fraction.
 const REGRESSION_THRESHOLD = 0.2; // 20%
 
+// ─── Vault render-count baseline ──────────────────────────────────────────────
+// Documented baseline for the vault surfaces driven through the real
+// SpotFeedContext provider. Each entry records the expected number of renders
+// for the *target* subtree and the maximum number of renders allowed for
+// unrelated subtrees during a single scripted tick/epoch sequence. Live NAV,
+// queue-position, and epoch updates must not re-render unrelated subtrees, so
+// `unrelatedMax` is pinned to 0.
+//
+// To refresh: run the harness, copy the `renders` values from the report, and
+// bump these numbers in the same PR that changes vault rendering behaviour.
+const VAULT_RENDER_BASELINE: Record<
+  string,
+  { renders: number; unrelatedMax: number }
+> = {
+  "vault-list": { renders: 3, unrelatedMax: 0 },
+  "vault-detail": { renders: 4, unrelatedMax: 0 },
+  "vault-deposit": { renders: 3, unrelatedMax: 0 },
+};
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function loadBaseline(): PerfReport | null {
   if (!fs.existsSync(BASELINE_PATH)) return null;
@@ -107,6 +126,73 @@ test.describe("Performance harness", () => {
       const rows = page.locator('[data-testid="results-table"] tbody tr');
       await expect(rows).toHaveCount(4, { timeout: 5_000 });
     }
+  });
+
+  test("vault surfaces render within baseline and isolate live updates", async ({ page }) => {
+    // Drive the vault list, detail, and deposit surfaces through the real
+    // SpotFeedContext provider using the scripted tick/epoch sequences exposed
+    // by the harness. The harness is skippable when no vault fixture data is
+    // available (e.g. a checkout without seeded vaults).
+    await page.goto("/__perf");
+    await page.waitForSelector('[data-testid="run-all-btn"]', { timeout: 10_000 });
+
+    const hasVaultFixtures = await page.evaluate(() => {
+      // @ts-expect-error — injected by PerfHarnessClient
+      return Boolean((window as unknown as { __perfVaultFixtures?: boolean }).__perfVaultFixtures);
+    });
+    test.skip(!hasVaultFixtures, "No vault fixture data available; skipping vault perf harness.");
+
+    // Trigger the scripted vault tick/epoch sequences.
+    await page.click('[data-testid="run-vault-btn"]');
+    await page.waitForSelector('[data-testid="vault-results-table"]', { timeout: 90_000 });
+
+    const vaultReport = await page.evaluate<
+      | {
+          views: Array<{
+            view: string;
+            renders: number;
+            rerenders: number;
+            unrelatedRenders: number;
+          }>;
+        }
+      | null
+    >(() => {
+      // @ts-expect-error — injected by PerfHarnessClient
+      return (window as unknown as { __perfVaultReport?: unknown }).__perfVaultReport ?? null;
+    });
+
+    expect(vaultReport).not.toBeNull();
+    if (!vaultReport) return;
+
+    const views = vaultReport.views.map((v) => v.view);
+    expect(views).toContain("vault-list");
+    expect(views).toContain("vault-detail");
+    expect(views).toContain("vault-deposit");
+
+    for (const entry of vaultReport.views) {
+      const expected = VAULT_RENDER_BASELINE[entry.view];
+      if (!expected) continue;
+
+      // Render counts must stay at or below the documented baseline.
+      expect(
+        entry.renders,
+        `${entry.view} rendered ${entry.renders} times (baseline ${expected.renders})`,
+      ).toBeLessThanOrEqual(expected.renders);
+
+      // Live updates must not re-render unrelated subtrees.
+      expect(
+        entry.unrelatedRenders,
+        `${entry.view} re-rendered ${entry.unrelatedRenders} unrelated subtrees (max ${expected.unrelatedMax})`,
+      ).toBeLessThanOrEqual(expected.unrelatedMax);
+    }
+
+    // Persist the vault report alongside the main report for CI artifacts.
+    const dir = path.dirname(LATEST_REPORT_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "vault-latest.json"),
+      JSON.stringify(vaultReport, null, 2),
+    );
   });
 
   test("injected regression is detected", async ({ page }) => {

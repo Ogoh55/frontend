@@ -23,6 +23,9 @@ import { apiGet, apiPost } from "./client";
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
+ *   GET /api/v1/vaults/positions
+ *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
+ *
  *   POST /api/v1/vaults/disclosures/acknowledge
  *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
  *   GET  /api/v1/vaults/disclosures/me  → DisclosureAcknowledgement[]
@@ -51,11 +54,67 @@ import { apiGet, apiPost } from "./client";
  *     remains is returned in full. Any part already filled stays paid out.
  *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
  *     requests but still processes queued ones.
+ *
+ * NAV / share-price source of truth (issue #290):
+ *
+ *   Share issuance is priced from the vault's internal book value
+ *   (`bookValue`), NOT from the raw token balance held at the vault
+ *   contract address. Direct token transfers to the contract are
+ *   classified as `ignored` — they do not move NAV and cannot be used
+ *   to inflate the share price. This classification is identical across
+ *   the contract, the backend indexer/registry, and this adapter.
+ *
+ *   Inflation / donation-attack mitigations are per-vault config
+ *   (`inflationDefense`) and are changeable only through the timelocked
+ *   operator path. The adapter surfaces them so the UI can enforce the
+ *   same `minSharesOut` bound the contract enforces on deposit.
+ *
+ * Shadow mode (issue #292):
+ *
+ *   A strategy may run in `shadow` mode — the identical strategy module
+ *   and keeper path execute against live oracle/engine data, but no
+ *   option orders are submitted and no depositor collateral is
+ *   committed. Shadow state lives in its own namespace (`shadow` on the
+ *   detail payload) with its own hypothetical NAV-per-share series and
+ *   epoch record stream. It is NEVER merged into `bookValue`,
+ *   `sharePrice`, `tvl`, or `historicalEpochs`, and shadow runs are
+ *   labeled `mode: "shadow"` everywhere they surface so paper results
+ *   cannot be mistaken for realized performance.
+ *
+ * Depositor privacy (issue #231):
+ *
+ *   GET  /api/v1/vaults/privacy/export?wallet={address}
+ *   → DepositorDataExport
+ *
+ *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
+ *   → DeletionRequestReceipt
+ *
+ *   GET /api/v1/vaults/privacy/deletion-request/{id}
+ *   → DeletionRequestReceipt
+ *
+ * Public read-only partner API (issue #233):
+ *
+ *   GET /api/public/v1/vaults?limit={n}&cursor={c}
+ *   → PublicVaultListResponse
+ *
+ *   GET /api/public/v1/vaults/{id}
+ *   → PublicVaultDetail
+ *
+ *   GET /api/public/v1/vaults/{id}/epochs?limit={n}&cursor={c}
+ *   → PublicEpochHistoryResponse
+ *
+ * The public surface is a projection over the same vault registry/epoch
+ * ledger, served from a cache independent of the authenticated read path.
+ * It never exposes per-depositor data (see `toPublicVaultSummary`).
+ *
+ * See docs/privacy/vault-data-inventory.md for the data inventory, retention
+ * windows, and the deletion/export workflow this module mirrors.
  */
 
+import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
-export type VaultStrategy ="covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
+export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
@@ -136,6 +195,47 @@ export function formatAssetAmount(baseUnits: bigint | number, decimals: number):
   if (value === 0) return "0";
   if (Math.abs(value) < 0.01) return value.toPrecision(4);
   return value.toLocaleString(undefined, { maximumFractionDigits: Math.min(decimals, 6) });
+}
+
+/**
+ * Execution mode of a vault strategy.
+ *
+ * - `live`: real capital is committed and real option orders are submitted.
+ * - `shadow`: paper trading — the same decision path runs, but no orders
+ *   are submitted and no depositor collateral is committed. Shadow state
+ *   is tracked in a separate namespace and must never be conflated with
+ *   live balances.
+ */
+export type VaultMode = "live" | "shadow";
+
+/**
+ * How a direct token transfer to the vault contract address is treated.
+ * Must match the contract and backend indexer/registry exactly.
+ *
+ * - `ignored`: transfer does not affect NAV (default; donation-resistant).
+ * - `swept`: transfer is moved to a defined sink address.
+ * - `windfall`: transfer is absorbed into book value (opt-in only).
+ */
+export type DirectTransferPolicy = "ignored" | "swept" | "windfall";
+
+/**
+ * Per-vault inflation / donation-attack defense parameters.
+ * Stored with the rest of the vault parameters and mutable only via the
+ * timelocked operator path — never hardcoded constants.
+ */
+export interface InflationDefenseConfig {
+  /** Virtual shares added to total supply in the pricing formula. */
+  virtualShares: number;
+  /** Virtual assets added to book value in the pricing formula. */
+  virtualAssets: number;
+  /** Minimum assets required for the first (genesis) deposit. */
+  minFirstDeposit: number;
+  /** Shares minted to the dead/locked address on the first deposit. */
+  deadShares: number;
+  /** Max fractional NAV-per-share move between issuance events in one ledger (0–1). */
+  navJumpGuardPct: number;
+  /** Classification of direct token transfers to the contract. */
+  directTransferPolicy: DirectTransferPolicy;
 }
 
 /**
@@ -235,6 +335,8 @@ export interface VaultSummary {
   strategy: VaultStrategy;
   /** Immutable collateral asset this vault operates in. */
   collateralAsset: CollateralAsset;
+  /** Execution mode; `shadow` results are paper trading, not realized. */
+  mode: VaultMode;
   status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
@@ -527,6 +629,72 @@ export interface VaultShareToken {
   transferable: boolean;
 }
 
+/**
+ * One point in a hypothetical NAV-per-share series produced by a shadow
+ * run. Kept in its own namespace so it can never be read as live NAV.
+ */
+export interface ShadowNavPoint {
+  epochNumber: number;
+  /** Hypothetical NAV per share in USD (paper trading only). */
+  navPerShare: number;
+  /** NAV per share the strategy model expected for this epoch. */
+  expectedNavPerShare: number;
+  /** ISO timestamp the shadow epoch settled. */
+  recordedAt: string;
+}
+
+/**
+ * Side-by-side comparison of a shadow run against live and expected
+ * performance. All shadow figures are paper trading and must be labeled
+ * as such in the UI.
+ */
+export interface ShadowComparison {
+  /** Latest hypothetical NAV per share from the shadow run. */
+  shadowNavPerShare: number;
+  /** Latest realized NAV per share of the live vault (null if none). */
+  liveNavPerShare: number | null;
+  /** NAV per share the strategy model expected for the latest epoch. */
+  expectedNavPerShare: number;
+  /** Shadow minus live NAV per share (null when no live history). */
+  shadowVsLiveDelta: number | null;
+  /** Shadow minus expected NAV per share. */
+  shadowVsExpectedDelta: number;
+  /** Number of complete shadow epochs recorded so far. */
+  completedEpochs: number;
+}
+
+/**
+ * Shadow (paper-trading) state for a vault strategy. Tracked in its own
+ * namespace, with its own hypothetical NAV series and epoch stream, so
+ * the registry, indexer, and this read model never conflate it with real
+ * balances.
+ */
+export interface ShadowState {
+  /** Always `shadow` — makes the paper-trading label explicit in payloads. */
+  mode: "shadow";
+  /** Hypothetical NAV-per-share series, one point per complete epoch. */
+  navSeries: ShadowNavPoint[];
+  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
+  epochs: EpochRecord[];
+  /** Side-by-side comparison data for the operator console/analytics. */
+  comparison: ShadowComparison;
+}
+
+/**
+ * Promotion criteria that must be met before a shadow strategy can be
+ * moved to live allocation. Evaluated by the backend promotion gate; the
+ * adapter surfaces the thresholds so the operator console can display
+ * progress and block promotion when unmet.
+ */
+export interface PromotionCriteria {
+  /** Minimum number of complete shadow epochs required. */
+  minCompleteEpochs: number;
+  /** Max allowed |shadow − expected| NAV deviation per share (USD). */
+  maxNavDeviation: number;
+  /** Whether any invariant violations were recorded during the run. */
+  invariantViolations: number;
+}
+
 /** Full detail for a single vault. */
 export interface VaultDetail extends VaultSummary {
   currentEpoch: number;
@@ -534,6 +702,11 @@ export interface VaultDetail extends VaultSummary {
   phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
+  /** Internal book value backing shares (source of truth for NAV). */
+  bookValue: number;
+  feeStructure: { managementPct: number; performancePct: number };
+  /** Per-vault inflation / donation-attack defense parameters. */
+  inflationDefense: InflationDefenseConfig;
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
@@ -541,8 +714,79 @@ export interface VaultDetail extends VaultSummary {
   shareToken: VaultShareToken;
   /** On-chain fee policy + last crystallization (issue #216). */
   feePolicy: VaultFeePolicy;
+  /**
+   * Shadow (paper-trading) state. Present only when `mode === "shadow"`.
+   * Never merged into live fields above.
+   */
+  shadow?: ShadowState;
+  /** Promotion gate thresholds; present for shadow runs. */
+  promotionCriteria?: PromotionCriteria;
   /** Role assignments scoped to this vault only. */
   roles: VaultRoleGrant[];
+}
+
+/**
+ * Compute the number of shares minted for a deposit, using the same
+ * virtual-offset integer formula as the contract. NAV is derived from
+ * internal book value only — never from the raw token balance.
+ *
+ * shares = amount * (totalShares + virtualShares) / (bookValue + virtualAssets)
+ *
+ * Returns 0 when the deposit would round to zero shares, so callers can
+ * reject it rather than silently forfeiting the depositor's assets.
+ */
+export function quoteSharesOut(
+  amount: number,
+  bookValue: number,
+  totalShares: number,
+  defense: Pick<InflationDefenseConfig, "virtualShares" | "virtualAssets">,
+): number {
+  if (amount <= 0) return 0;
+  const denom = bookValue + defense.virtualAssets;
+  if (denom <= 0) return 0;
+  return Math.floor((amount * (totalShares + defense.virtualShares)) / denom);
+}
+
+/**
+ * Enforce the per-deposit `minSharesOut` bound in the deposit path.
+ * Throws if the quoted shares fall below the caller's bound or round to
+ * zero, guaranteeing honest depositors never receive zero shares for a
+ * non-zero deposit.
+ */
+export function assertMinSharesOut(quotedShares: number, minSharesOut: number): void {
+  if (quotedShares <= 0) {
+    throw new Error("Deposit would mint zero shares; increase amount or lower NAV impact");
+  }
+  if (quotedShares < minSharesOut) {
+    throw new Error(`Slippage: quoted ${quotedShares} shares < minSharesOut ${minSharesOut}`);
+  }
+}
+
+/**
+ * Evaluate the promotion gate for a shadow run. Returns the list of
+ * unmet criteria; an empty list means the strategy may be promoted to
+ * live allocation. Mirrors the backend gate so the operator console can
+ * block promotion when criteria are unmet.
+ */
+export function evaluatePromotionGate(
+  shadow: ShadowState,
+  criteria: PromotionCriteria,
+): string[] {
+  const unmet: string[] = [];
+  if (shadow.comparison.completedEpochs < criteria.minCompleteEpochs) {
+    unmet.push(
+      `Only ${shadow.comparison.completedEpochs}/${criteria.minCompleteEpochs} complete epochs`,
+    );
+  }
+  if (Math.abs(shadow.comparison.shadowVsExpectedDelta) > criteria.maxNavDeviation) {
+    unmet.push(
+      `NAV deviation ${shadow.comparison.shadowVsExpectedDelta} exceeds bound ${criteria.maxNavDeviation}`,
+    );
+  }
+  if (criteria.invariantViolations > 0) {
+    unmet.push(`${criteria.invariantViolations} invariant violation(s) recorded`);
+  }
+  return unmet;
 }
 
 // ---------------------------------------------------------------------------
@@ -562,242 +806,3 @@ export const MAX_FEE_BPS = 3_000;
  * - `managementFeeBps` is charged per epoch on NAV.
  * - `performanceFeeBps` is charged only on new profits above the
  *   persistent high-water mark (never on recovered drawdowns).
- * - `feeRecipient` is the Stellar address that receives crystallized fees.
- *
- * Changes are only possible through the vault governance/timelock path.
- */
-export interface VaultFeePolicy {
-  managementFeeBps: number;
-  performanceFeeBps: number;
-  /** Stellar address (G.../C...) receiving crystallized fees. */
-  feeRecipient: string;
-  /**
-   * Persistent high-water mark: the highest NAV-per-share at which a
-   * performance fee has been crystallized. Stored in contract storage with
-   * an explicit TTL policy (not derived from NAV history).
-   */
-  highWaterMark: number;
-  /** Last epoch at which fees were crystallized, or null if never. */
-  lastCrystallization: FeeCrystallization | null;
-}
-
-/**
- * Result of crystallizing fees at epoch close. Fees are computed and
- * settled inside the same transaction as epoch close, before the epoch NAV
- * is finalized, so the published NAV already reflects fees.
- */
-export interface FeeCrystallization {
-  epochNumber: number;
-  /** NAV per share before fees were deducted. */
-  navBeforeFees: number;
-  /** NAV per share after fees were deducted (the published NAV). */
-  navAfterFees: number;
-  /** High-water mark in effect before this crystallization. */
-  highWaterMarkBefore: number;
-  /** High-water mark after this crystallization (raised only on new highs). */
-  highWaterMarkAfter: number;
-  managementFee: number;
-  performanceFee: number;
-  totalFee: number;
-  /** Recipient the fees were transferred to. */
-  feeRecipient: string;
-  /** Transaction hash of the on-chain settlement transfer. */
-  settlementTxHash: string;
-  /** ISO timestamp of crystallization. */
-  crystallizedAt: string;
-}
-
-/** True when a fee rate is within the hard maximum bound. */
-export function isValidFeeBps(bps: number): boolean {
-  return Number.isInteger(bps) && bps >= 0 && bps <= MAX_FEE_BPS;
-}
-
-/**
- * Compute the fees that would crystallize for an epoch, given the NAV per
- * share before fees and the current high-water mark.
- *
- * Semantics:
- * - Management fee = `navBeforeFees * managementFeeBps / 10_000`.
- * - Performance fee is charged only on the portion of NAV above the
- *   high-water mark: `max(0, navBeforeFees - highWaterMark) * performanceFeeBps / 10_000`.
- *   On loss or zero-profit epochs (NAV <= HWM) no performance fee is charged.
- * - The high-water mark is raised to `navBeforeFees` only when a new high
- *   is reached; it is never lowered on loss epochs.
- * - Dust policy: fees are floored to the smallest representable unit; a
- *   sub-unit fee rounds to zero rather than accruing forever.
- */
-export function computeEpochFees(
-  navBeforeFees: number,
-  policy: Pick<VaultFeePolicy, "managementFeeBps" | "performanceFeeBps" | "highWaterMark">,
-): { managementFee: number; performanceFee: number; totalFee: number; highWaterMarkAfter: number } {
-  const nav = Math.max(0, navBeforeFees);
-  const managementFee = Math.floor((nav * policy.managementFeeBps) / 10_000);
-  const gains = Math.max(0, nav - policy.highWaterMark);
-  const performanceFee = Math.floor((gains * policy.performanceFeeBps) / 10_000);
-  const highWaterMarkAfter = nav > policy.highWaterMark ? nav : policy.highWaterMark;
-  return {
-    managementFee,
-    performanceFee,
-    totalFee: managementFee + performanceFee,
-    highWaterMarkAfter,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Share-lot accounting (cost basis, realized and unrealized PnL)
-//
-// Shared by the API and any client-side display. Rebuilding the ledger from
-// the same event stream always yields the same output: events are ordered by
-// (ledger, seq) and lots by (acquiredLedger, lotId). Schema: docs/vault-lot-ledger.md
-// ---------------------------------------------------------------------------
-
-/** Lot relief method. Stored on every ledger row so a future change cannot rewrite history. */
-export type LotReliefMethod = "fifo";
-export const DEFAULT_LOT_RELIEF_METHOD: LotReliefMethod = "fifo";
-
-/** Share amounts at or below this are rounding residue, never a lot. */
-export const DUST_SHARES = 1e-9;
-
-/** A dated acquisition lot held by one depositor in one vault. */
-export interface VaultShareLot {
-  lotId: string;
-  vaultId: string;
-  acquiredLedger: number;
-  acquiredAt: string; // ledger close time (ISO), never receipt time
-  /** Shares still held from this lot. */
-  shares: number;
-  /** Cost basis still attached to the remaining shares, in USD. */
-  costUsd: number;
-  /** NAV per share used when the shares were minted. */
-  navPerShare: number;
-}
-
-/** A lot-affecting event as indexed from the vault contract. */
-export interface VaultLotEvent {
-  seq: number;
-  kind: "deposit" | "transfer_in" | "redemption" | "transfer_out";
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  /** deposit/transfer_in: cost in USD. redemption/transfer_out: gross proceeds in USD. */
-  amountUsd: number;
-  /** Fees that reduce proceeds. Management fees are already reflected in NAV and are not repeated here. */
-  feesUsd: number;
-  navPerShare: number;
-}
-
-/** One ledger row per lot-affecting event. This is the export row. */
-export interface VaultLedgerRow {
-  seq: number;
-  kind: VaultLotEvent["kind"];
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  amountUsd: number;
-  feesUsd: number;
-  navPerShare: number;
-  costBasisUsd: number;
-  realizedPnlUsd: number;
-  lotMethod: LotReliefMethod;
-}
-
-export interface LotRelief {
-  shares: number;
-  costBasisUsd: number;
-  /** Gross proceeds minus fees. */
-  netProceedsUsd: number;
-  realizedPnlUsd: number;
-  consumed: { lotId: string; shares: number; costUsd: number }[];
-  remainingLots: VaultShareLot[];
-}
-
-function byLotOrder(a: VaultShareLot, b: VaultShareLot): number {
-  return a.acquiredLedger - b.acquiredLedger || a.lotId.localeCompare(b.lotId);
-}
-
-/**
- * Relieves `shares` from the lots in FIFO order and returns the realized PnL.
- * Throws rather than producing a negative basis when `shares` exceeds the tracked lots.
- */
-export function relieveLotsFifo(
-  lots: VaultShareLot[],
-  shares: number,
-  grossProceedsUsd: number,
-  feesUsd: number
-): LotRelief {
-  if (!(shares > DUST_SHARES)) throw new Error(`Relief quantity must be positive, got ${shares}`);
-  if (feesUsd < 0) throw new Error(`Fees cannot be negative, got ${feesUsd}`);
-  const available = lots.reduce((sum, lot) => sum + lot.shares, 0);
-  if (shares > available + DUST_SHARES) {
-    throw new Error(`Cannot relieve ${shares} shares: only ${available} tracked`);
-  }
-
-  let remaining = shares;
-  let costBasisUsd = 0;
-  const consumed: LotRelief["consumed"] = [];
-  const remainingLots: VaultShareLot[] = [];
-
-  for (const lot of [...lots].sort(byLotOrder)) {
-    if (remaining <= DUST_SHARES) {
-      remainingLots.push(lot);
-      continue;
-    }
-    const take = Math.min(lot.shares, remaining);
-    const costUsd = lot.shares > 0 ? lot.costUsd * (take / lot.shares) : 0;
-    remaining -= take;
-    costBasisUsd += costUsd;
-    consumed.push({ lotId: lot.lotId, shares: take, costUsd });
-
-    const left = lot.shares - take;
-    if (left > DUST_SHARES) {
-      remainingLots.push({ ...lot, shares: left, costUsd: lot.costUsd - costUsd });
-    }
-  }
-
-  const netProceedsUsd = grossProceedsUsd - feesUsd;
-  return {
-    shares,
-    costBasisUsd,
-    netProceedsUsd,
-    realizedPnlUsd: netProceedsUsd - costBasisUsd,
-    consumed,
-    remainingLots,
-  };
-}
-
-/** Unrealized PnL on the lots still held, marked at `markNavPerShare`. */
-export function unrealizedPnl(lots: VaultShareLot[], markNavPerShare: number): number {
-  return lots.reduce((sum, lot) => sum + (lot.shares * markNavPerShare - lot.costUsd), 0);
-}
-
-/**
- * Replays lot-affecting events into lots and ledger rows.
- * Deterministic: the same events always produce the same rows and lots.
- */
-export function buildLotLedger(events: VaultLotEvent[]): { rows: VaultLedgerRow[]; lots: VaultShareLot[] } {
-  const ordered = [...events].sort((a, b) => a.ledger - b.ledger || a.seq - b.seq);
-  let lots: VaultShareLot[] = [];
-  const rows: VaultLedgerRow[] = [];
-
-  for (const ev of ordered) {
-    const base = {
-      seq: ev.seq,
-      kind: ev.kind,
-      ledger: ev.ledger,
-      ledgerAt: ev.ledgerAt,
-      vaultId: ev.vaultId,
-      shares: ev.shares,
-      amountUsd: ev.amountUsd,
-      feesUsd: ev.feesUsd,
-      navPerShare: ev.navPerShare,
-      lotMethod: DEFAULT_LOT_RELIEF_METHOD,
-    };
-
-    if (ev.kind === "deposit" || ev.kind === "transfer_in") {
-      // Dust minted from rounding never becomes a lot.
-      if (ev.shares > DUST_SHARES) {
-        lots.push({
-          lotId: `${ev.vaultId}:${ev.seq}`,
-          vaultId: ev.vaultId,
