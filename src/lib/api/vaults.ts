@@ -17,6 +17,11 @@ import { submitTransactionXdr } from "./stellar";
  * internal depositor support console. The diagnostics client is issued a
  * read-scoped token and only ever calls GET endpoints, so a UI regression
  * cannot escalate into a state-changing call.
+ * Typed data adapter for the Vaults feature.
+ *
+ * NEXT_PUBLIC_VAULTS=mock (the default) serves the in-module fixtures below.
+ * NEXT_PUBLIC_VAULTS=live calls the v1 REST contract through the BFF, which
+ * attaches the session bearer server-side (see src/lib/bff/allowlist.ts).
  *
  * Vaults REST contract — v1 (frozen).
  *
@@ -31,6 +36,17 @@ import { submitTransactionXdr } from "./stellar";
  * implementation below is used. Swap in the real implementation by
  * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
  * (Zenith-options/backend) through the REST contract below.
+ *
+ * Contract: docs/api/vaults-v1.openapi.yaml (frozen; additive changes only
+ * within v1, breaking changes go to /api/v2).
+ *
+ *   GET  /api/v1/vaults                     → VaultSummary[]     (not paginated in v1)
+ *   GET  /api/v1/vaults/{id}                → VaultDetail | 404
+ *   POST /api/v1/vaults/{id}/deposit        { amount: Amount }   → { tx_id }
+ *   POST /api/v1/vaults/{id}/withdraw       { shares: Amount }   → { tx_id, queued }
+ *
+ *   GET /api/v1/vaults/{id}
+ *   → VaultDetail
  *
  * Transport
  *   All requests go through the BFF (`bffFetch`). The bearer token lives in
@@ -173,6 +189,10 @@ import { submitTransactionXdr } from "./stellar";
  *   "no external yield" when the lending market is paused/unavailable:
  *   GET  /api/v1/vaults/{id}/collateral-policy     → CollateralDeploymentPolicy
  *   GET  /api/v1/vaults/{id}/collateral-yield      → CollateralYieldBreakdown
+ * Wire conventions: entity fields are camelCase; timestamps are ISO-8601;
+ * USD amounts and share counts are fixed-point decimal strings (e.g. "1042.5000000")
+ * and are converted to number only at the decode boundary for display.
+ * Errors are `{ error: { code, message } }`; see VaultErrorCode.
  *
  * NAV / share-price source of truth (issue #290):
  *
@@ -311,6 +331,9 @@ import { submitTransactionXdr } from "./stellar";
  *   from this module, so flipping the flag needs no page changes.
  */
 import { useWalletStore } from '@/lib/store/wallet';
+
+/** Fixed-point decimal string on the wire, e.g. "1042.5000000". */
+export type Amount = string;
 
 export const VAULTS_API_VERSION = "v1" as const;
 const API = `/api/${VAULTS_API_VERSION}/vaults`;
@@ -865,6 +888,32 @@ export function removeAllowlistEntry(
     createdAt: now,
   };
   return { restrictions: next, audit };
+export const VAULT_STRATEGIES: readonly VaultStrategy[] = ["covered_call", "cash_secured_put", "iron_condor", "wheel"];
+export const RISK_RATINGS: readonly RiskRating[] = ["low", "medium", "high"];
+export const EPOCH_PHASES: readonly EpochPhase[] = ["deposit", "active", "settlement"];
+
+/**
+ * Error codes in the v1 contract. `vault_paused` and `vault_at_capacity` are
+ * both HTTP 409; the UI distinguishes them so it can say "paused" vs "full".
+ * `malformed_response` is client-side only: the body failed decoding.
+ */
+export const VAULT_ERROR_CODES = [
+  "vault_not_found",
+  "vault_paused",
+  "vault_at_capacity",
+  "unauthorized",
+  "invalid_request",
+  "rate_limited",
+  "backend_unavailable",
+  "malformed_response",
+] as const;
+export type VaultErrorCode = (typeof VAULT_ERROR_CODES)[number];
+
+export class VaultApiError extends Error {
+  constructor(readonly status: number, readonly code: VaultErrorCode, message: string) {
+    super(message);
+    this.name = "VaultApiError";
+  }
 }
 
 /**

@@ -221,7 +221,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     setTxStatus("pending");
     setTxMessage("");
     try {
-      const result = await withdrawFromVault(vault.id, shares, token);
+      const result = await withdrawFromVault(vault.id, withdrawShares.trim());
       setTxStatus("success");
       setTxMessage(
         result.queued
