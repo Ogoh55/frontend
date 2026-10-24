@@ -6,6 +6,7 @@ import { use } from "react";
 import { useTranslations } from "next-intl";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
+import { VaultAnalyticsPanel } from "../../../../components/VaultAnalyticsPanel";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
 import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
@@ -13,6 +14,7 @@ import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
+  fetchVaultAnalytics,
   depositToVault,
   withdrawFromVault,
   fetchVaultExport,
@@ -22,6 +24,7 @@ import {
   hashDisclosureText,
   VaultPolicyError,
   VAULT_DISCLOSURE_VERSION,
+  type VaultAnalytics,
   type VaultDetail,
   type EpochPhase,
   type VaultExportFormat,
@@ -66,6 +69,8 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const t = useTranslations("vaultDisclosure");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
+  const [analytics, setAnalytics] = useState<VaultAnalytics | null>(null);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,6 +103,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     fetchVaultDetail(id, token, { enabled: vaultsEnabled })
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
+    fetchVaultAnalytics(id)
+      .then(a => { setAnalytics(a); setAnalyticsError(null); })
+      .catch(e => { setAnalytics(null); setAnalyticsError(e.message); });
   }, [id, token, vaultsEnabled]);
 
   const permittedActions = vault ? vaultStatusPolicy(vault.status).permittedActions : [];
@@ -282,6 +290,17 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       </div>
                     ))}
                   </div>
+                </div>
+
+                {/* Performance analytics */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 12 }}>Performance Analytics</div>
+                  {analyticsError && (
+                    <div style={{ padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
+                      {analyticsError}
+                    </div>
+                  )}
+                  {analytics && <VaultAnalyticsPanel analytics={analytics} />}
                 </div>
 
                 {/* Epoch timeline */}
@@ -583,22 +602,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       <div style={{ padding: 16 }}>
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
                           Withdrawal requests are queued and processed at the end of the current epoch.
-                          Shares are redeemed at the final NAV after settlement.
-                        </div>
-                        <div style={{ marginBottom: 12 }}>
-                          <label style={{ fontSize: 10, color: "var(--text-lo)", display: "block", marginBottom: 4 }}>Shares to Withdraw</label>
-                          <input
-                            type="number"
-                            min={0}
-                            value={withdrawShares}
-                            onChange={e => setWithdrawShares(e.target.value)}
-                            placeholder="0.0000"
-                            style={{
-                              width: "100%", padding: "8px 10px",
-                              background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
-                              color: "var(--text-hi)", fontFamily: "var(--font-mono)", fontSize: 13,
-                            }}
-                          />
-                          {withdrawShares && !isNaN(parseFloat(withdrawShares)) && parseFloat(withdrawShares) > 0 && (
-                            <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 4 }}>
-                              ≈ ${(parseFloat(withdrawShares) * vault.sharePrice).toFixed(2)} USDC at current NAV
+                          Shares are redeemed at
