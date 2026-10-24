@@ -19,7 +19,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -114,6 +117,9 @@ import { apiGet, apiPost } from "./client";
  * windows, and the deletion/export workflow this module mirrors.
  */
 
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -793,14 +799,4 @@ export function relieveLotsFifo(
     throw new Error(`Cannot relieve ${shares} shares: only ${available} tracked`);
   }
 
-  let remaining = shares;
-  let costBasisUsd = 0;
-  const consumed: LotRelief["consumed"] = [];
-  const remainingLots: VaultShareLot[] = [];
-
-  for (const lot of [...lots].sort(byLotOrder)) {
-    if (remaining <= DUST_SHARES) {
-      remainingLots.push(lot);
-      continue;
-    }
-    const take = Math.min(lot.shares,
+  let remaining
