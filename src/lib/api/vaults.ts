@@ -19,7 +19,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -89,7 +92,7 @@ import { apiGet, apiPost } from "./client";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -111,6 +114,9 @@ import { apiGet, apiPost } from "./client";
  * windows, and the deletion/export workflow this module mirrors.
  */
 
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -796,13 +802,4 @@ export function evaluatePromotionGate(
 /**
  * Hard upper bound on any configured fee rate, in basis points (30%).
  * Enforced at configuration time on-chain (governance/timelock path) and
- * mirrored here so the UI can validate before submitting a change.
- */
-export const MAX_FEE_BPS = 3_000;
-
-/**
- * Per-vault fee policy. Rates are in basis points (1 bps = 0.01%).
- *
- * - `managementFeeBps` is charged per epoch on NAV.
- * - `performanceFeeBps` is charged only on new profits above the
- *   persistent high-water mark (never on recovered drawdowns).
+ * mirrored here so
