@@ -1,28 +1,55 @@
-# Security Invariants — Zenith Frontend
+# Security Invariants
 
-## Issue #130: Security Regression Test Suite
+This document records the security invariants the vault stack must uphold, the trust
+boundaries between our own services, and the network surfaces each component exposes.
+It is reviewed with the security preparation workstream. Client-facing rate limiting and
+abuse protection, and on-chain admin key custody/KMS signing, are covered elsewhere.
 
----
+This document enumerates the invariants the vault stack must uphold. Each invariant
+is stated as a property that must hold across every transaction, and is annotated
+with the enforcement point(s) and the tests that guard it.
 
-## Introduction
+## Trust boundaries and network surfaces
 
-Security invariants are properties of the system that must hold unconditionally, regardless of feature changes, refactors, or dependency upgrades. Encoding them as automated tests rather than prose documentation serves three purposes:
+| Service | Externally routable | Accepts internal calls from | Outbound egress allowlist |
+| --- | --- | --- | --- |
+| BFF / API (`src/app/api/`) | Yes (only external entry point) | Browser clients (authenticated) | Stellar RPC, Horizon, price feeds, notification providers |
+| Indexer | No | BFF/API, scheduler | Stellar RPC, Horizon |
+| Scheduler | No | BFF/API | Stellar RPC, Horizon |
+| Keeper | No | BFF/API, scheduler | Stellar RPC, Horizon |
 
-1. **Regression prevention.** A future commit that accidentally removes HTTPS enforcement, weakens nonce validation, or leaks tokens across wallet namespaces will fail CI immediately, with a named invariant ID pointing to the exact contract that was broken.
+- Only the BFF/API layer accepts external traffic. Indexer, scheduler, and keeper
+  endpoints are not publicly routable (enforced by network policy / private networking).
+- Local topology in `docker-compose.yml` mirrors these trust boundaries so development
+  exercises the same isolation as production.
 
-2. **Living specification.** The test file is the authoritative source of truth for each invariant. The table below cross-references it so reviewers can jump from requirement to implementation and back.
+## Service-to-service authentication
 
-3. **Audit trail.** Each invariant has a stable ID (`SEC-NNN`). Security audits, vulnerability reports, and pull requests can reference these IDs without ambiguity. When an invariant is tightened or relaxed, the history of that change is visible in `git log` on both this file and the test.
+- Every internal call is authenticated with mTLS or a short-lived signed service token
+  that carries a service identity and a narrow scope claim. Handlers verify the identity
+  and scope explicitly; they never trust a bare network position.
+- Tokens rotate on a short interval. No shared static bearer secrets are checked into
+  config; secrets are sourced from a managed store and referenced (not inlined) in
+  `.env.local.example`.
+- Token validation tolerates bounded clock skew, and long-running indexer/backfill jobs
+  refresh tokens before expiry rather than relying on a single long-lived credential.
+- Local development may run without mTLS via a documented dev bypass. The bypass cannot
+  be enabled in production; production fails to boot with a missing or placeholder
+  service credential.
 
-All 23 invariants live in a single file so the entire suite can be run in isolation, with no dependency on a running backend or browser extension:
+## Least-privilege credentials per service
 
-```bash
-npm test src/test/security/invariants.test.ts
-```
+- The indexer cannot submit transactions.
+- The keeper cannot read depositor PII it does not need.
+- Each service holds only the scopes required for its role; scope claims are checked at
+  the handler, not inferred from the caller's network location.
 
----
+## Egress controls
 
-## Domain Definitions
+- Outbound traffic is restricted to an explicit allowlist (Stellar RPC, Horizon, price
+  feeds, notification providers).
+- Denied-outbound calls are logged and alerted so a compromise in one service cannot
+  pivot freely.
 
 | Domain | Abbreviation | Scope |
 |---|---|---|
@@ -32,10 +59,84 @@ npm test src/test/security/invariants.test.ts
 | **isolation** | `isolation` | Per-wallet namespacing in `localStorage`. Alert rules, workspace layouts, and anti-phishing phrases must not bleed between wallet accounts. Hotkeys (non-sensitive) are explicitly documented as intentionally global. |
 | **headers** | `headers` | Structural HTTP and subresource security: `X-Frame-Options`, SRI hash format correctness, and the HTTPS-only policy for external resources. |
 | **twab** | `twab` | Time-weighted average balance of vault shares (issue #272). Checkpointed cumulative-balance accumulator on the SEP-41 share token; `balance_at(account, timestamp)` and `twab(account, start, end)` read from binary-searchable checkpoints. |
+| **vault** | `vault` | Vault share accounting: NAV source of truth, direct-transfer classification, and inflation/donation-attack mitigations (virtual offset, minimum first deposit, `minSharesOut`, NAV-jump guard). |
+| **cross-contract** | `cross-contract` | Vault cross-contract call safety: single external-call wrapper, reentrancy lock, call allowlists, and failure containment for calls to the options engine, oracle, and SEP-41 assets. |
 
 ---
 
-## Invariants Table
+## Vault Share Accounting — NAV Source of Truth (Issue #290)
+
+Share issuance in the Phase 2 vault is priced **exclusively from internal book-value accounting** (`total_book_value`), never from the raw token balance held at the vault contract address. The raw token balance is treated as an untrusted input that may drift from book value due to direct transfers, returned collateral, or slashed collateral.
+
+**Direct-transfer classification (identical across contract, backend indexer/registry, and `src/lib/api/vaults.ts`):**
+
+> Direct token transfers to the vault contract address are **IGNORED** for NAV/share-price purposes. They do not increase `total_book_value`, do not change NAV per share, and do not mint shares. They remain in the contract balance as an unaccounted surplus and are **not** swept or absorbed as a windfall by any share-issuance path.
+
+This single choice must be mirrored in:
+- the vault contract share-accounting module (pricing reads `total_book_value`, not `token.balance_of(vault)`),
+- the backend share-accounting service / registry indexer (NAV derived from book value events, not balance snapshots),
+- the `src/lib/api/vaults.ts` adapter (share-price and NAV fields sourced from book value, never from a raw balance read).
+
+**Rounding direction:** all NAV/share math is integer arithmetic with a single documented rounding direction — shares minted round **down** (depositor-favoring on issuance is avoided; the vault never mints more shares than the exact rational value), and assets returned on withdrawal round **down**. This guarantees the vault cannot be drained by rounding.
+
+---
+
+## Vault Share Accounting — Inflation / Donation Attack Mitigations (Issue #290)
+
+All four mitigations below are **per-vault configuration** stored with the rest of the vault parameters and changeable **only through the timelocked operator path** — never hardcoded constants.
+
+| Parameter | Purpose |
+|---|---|
+| `virtual_shares` / `virtual_assets` | Virtual offset added to both numerator and denominator of the share-price formula so the first-depositor / donation attack cannot move NAV per share by a meaningful ratio. |
+| `min_first_deposit` | Minimum assets required for the genesis (zero-supply) deposit; the corresponding shares are minted to a dead/locked sink so the attacker cannot own the entire initial supply. |
+| `min_shares_out` (per-deposit) | Caller-supplied lower bound on shares minted; the deposit path reverts if the computed shares fall below it, defeating read-time-quote vs execution NAV drift. |
+| `max_nav_jump_bps` | Bounds how far NAV per share may move between share-issuance events in the same ledger; a larger jump reverts the issuance. |
+
+**Share-price formula (integer, round-down):**
+
+```
+shares_out = floor( assets_in * (total_shares + virtual_shares)
+                    / (total_book_value + virtual_assets) )
+```
+
+Because `virtual_shares` and `virtual_assets` are non-zero, a donation that inflates `total_book_value` cannot zero out a subsequent depositor's shares, and a 1-unit first deposit cannot capture the whole supply.
+
+---
+
+## Vault Cross-Contract Call Safety (Issue #291)
+
+Vaults custody depositor collateral across epochs and call out to the options engine (sale, settlement, assignment), the oracle, and SEP-41 asset contracts. A single ordering or containment bug in that call graph is a total-loss class of defect, so the following policy is enforced in code and recorded here.
+
+### Single external-call wrapper
+
+Every external call in the vault suite (core vault + strategy modules) is funneled through **one internal wrapper**. The wrapper is the only place that invokes another contract; direct cross-contract invocations elsewhere are a review-blocking defect. The wrapper enforces:
+
+1. **State-write ordering (checks-effects-interactions).** All vault accounting state (`total_book_value`, `total_shares`, per-account balances, pending epoch transition) is written **before** the external call is issued. No accounting mutation may occur after an external call returns within the same entry point.
+2. **Validated return-value handling.** Return values from the engine and oracle are treated as untrusted. Accounting state is **never** derived from an unvalidated external return value; the wrapper validates shape/range and reverts on anything unexpected rather than coercing it.
+3. **Allowlist enforcement.** The wrapper rejects any call whose target is not on the vault's explicit contract allowlist (options engine, oracle, configured SEP-41 assets). A dependency address changed by an upgrade must be re-registered through the timelocked operator path before it is callable.
+
+### Reentrancy lock
+
+An **explicit** reentrancy lock (not implicit in ordering) covers all accounting-mutating entry points: deposit, withdraw, redeem, settlement, assignment, and epoch transition. The lock is acquired on entry and released on exit; a re-entrant call into any locked entry point reverts. The vault's callback entry points additionally enforce an **explicit caller allowlist** — only the registered options engine may invoke settlement/assignment callbacks, and an auth-entry mismatch reverts.
+
+### Failure containment
+
+For each external call it is documented and enforced whether failure **aborts the transaction** (the default) or is **deferred for keeper retry**. No entry point may leave a partially applied epoch transition or a partial deposit/withdrawal: either the full state transition commits or the transaction reverts with vault state byte-identical to before the call. Calls attempted while an emergency pause is active revert. Resource-budget exhaustion mid-call reverts the whole transaction rather than leaving a half-applied transition.
+
+### Pull-based settlement
+
+Where the engine interface allows, settlement is **pull-based** (the vault reads settled results) rather than callback-driven, keeping the engine interface narrow and version-pinned. Callback-driven settlement is used only where the engine interface requires it, and only behind the caller allowlist above.
+
+### Adversarial test contracts
+
+The contract test crate includes adversarial mocks — a malicious SEP-41 token, a re-entrant options engine, an oracle returning garbage, a call that panics, and a call that exhausts the resource budget — each asserting vault state is byte-identical after any failure.
+
+## Frontend-visible configuration
+
+- The frontend-visible subset of secrets/config is validated in `src/env.ts`; values are
+  referenced from the managed store, never inlined.
+
+## Collateral custody
 
 | ID | Domain | Invariant Description | Test File | Test Name | Security / WCAG Ref |
 |---|---|---|---|---|---|
@@ -63,8 +164,6 @@ npm test src/test/security/invariants.test.ts
 | SEC-022 | twab | A zero-length window (`start == end`) must return the instantaneous `balance_at(account, start)` and must never divide by zero. | `src/test/security/invariants.test.ts` | `SEC-022: zero-length twab window returns instantaneous balance without division by zero` | Issue #272; rounding/div-by-zero spec |
 | SEC-023 | twab | The cumulative-balance accumulator must be monotonically non-decreasing across interleaved mint/burn/transfer sequences, and checkpoints are written only on share mutation. | `src/test/security/invariants.test.ts` | `SEC-023: cumulative balance is monotonic and checkpoints only on share mutation` | Issue #272; fuzz target for monotonic accumulator |
 
----
-
 ## TWAB Checkpoint Retention Policy (Issue #272)
 
 The vault share token maintains a per-account checkpointed cumulative-balance accumulator. Each checkpoint stores `(timestamp, cumulative_balance)` where `cumulative_balance` is the integral of the instantaneous share balance up to `timestamp`. `balance_at` and `twab` binary-search these checkpoints; no unbounded loops are performed.
@@ -78,7 +177,95 @@ The vault share token maintains a per-account checkpointed cumulative-balance ac
 - Overflow: cumulative balance is a `u128`; the documented bound is `max_balance * max_window_seconds < 2^128`, enforced by the fixed `MAX_CHECKPOINTS` and ledger-time bounds.
 - TWAB is read-only weighting: it must never be usable to mint value, only to weight governance/allocation/fee tiers.
 
----
+- **INV-1 — Single custodian.** Only the vault core holds collateral custody. Strategy
+  modules never receive raw transfer rights; they may only invoke the scoped callbacks
+  declared in their capability set (see *Strategy module plugin interface* below).
+- **INV-2 — No arbitrary movement.** A module cannot move collateral outside the
+  operations it declared at registration time. Any attempt to reach an undeclared
+  operation must revert.
+
+## Strategy module plugin interface
+
+A strategy module is a contract that implements the following interface. Conformance
+is validated at registration time; a module that fails conformance cannot be enabled.
+
+### Declared parameter schema and defaults
+
+- `parameterSchema() returns (bytes schema)` — ABI-encoded schema describing every
+  configurable parameter (name, type, bounds).
+- `defaultParameters() returns (bytes defaults)` — ABI-encoded default values that
+  must validate against `parameterSchema()`.
+
+### Per-vault capacity / risk-limit hooks
+
+- `capacityLimit(VaultContext ctx) returns (uint256 maxNotional)` — the maximum
+  notional the module may deploy for the given vault.
+- `riskLimits(VaultContext ctx) returns (RiskLimits limits)` — per-epoch exposure,
+  delta, and concentration bounds the vault enforces before dispatching any action.
+
+### Epoch lifecycle responsibilities
+
+- `onEpochOpen(EpochContext ctx)` — allocate within declared capacity; must be
+  idempotent and must not exceed `capacityLimit`.
+- `onEpochRollover(EpochContext ctx)` — roll expiring positions; must leave the
+  vault in a consistent state if it reverts (see failure semantics).
+- `onEpochClose(EpochContext ctx)` — settle and report realized PnL; must be
+  callable even when the module has been disabled so open positions can be wound down.
+
+### Permitted callbacks on collateral and settlement layers
+
+The module may only invoke the following vault callbacks, and only if the
+corresponding capability was declared:
+
+| Capability            | Permitted callback                          |
+|-----------------------|---------------------------------------------|
+| `HOLD_COLLATERAL`     | `vault.holdCollateral(amount)`              |
+| `OPEN_COVERED_CALL`   | `vault.openCoveredCall(strike, expiry, qty)`|
+| `OPEN_CASH_SECURED_PUT`| `vault.openCashSecuredPut(strike, expiry, qty)` |
+| `OPEN_IRON_CONDOR`    | `vault.openIronCondor(legs)`                |
+| `SETTLE_POSITION`     | `settlement.settle(positionId)`             |
+
+Any callback not backed by a declared capability must revert with
+`CapabilityNotDeclared`.
+
+### Failure semantics
+
+- **INV-3 — Atomic epochs.** If a module reverts mid-epoch, the vault must roll back
+  to the pre-epoch state; no partial allocation may persist.
+- **INV-4 — Wind-down after disable.** Disabling a module for a vault must not strand
+  open positions: `onEpochClose` remains reachable for wind-down even after disable.
+- **INV-5 — Immutable enabled entries.** A registry entry is versioned and immutable
+  once enabled. An enabled module cannot be swapped for a different implementation via
+  upgrade; a new version must be registered and enabled through the operator workflow.
+
+## Capability model
+
+- **INV-6 — Declared-only reachability.** A module declares the operations it needs
+  (e.g. `OPEN_COVERED_CALL`, `HOLD_COLLATERAL`). The vault enforces that only declared
+  operations are reachable; undeclared operations revert.
+
+## Registry and operator workflow
+
+- **INV-7 — Governed enablement.** Enabling or disabling a module for a vault is an
+  operator action gated by the existing authorization and timelock workflow. There is
+  no permissionless module enabling.
+- **INV-8 — Sandbox before real deposits.** A candidate module must pass the
+  interface-conformance suite and a backtest in the sandbox harness before it can be
+  enabled for any vault holding real deposits.
+
+## Testing
+
+- Interface-conformance suite: every module must pass before registration.
+- Adversarial tests: a module exceeding its declared capabilities must revert.
+- Integration test: enabling a new module on a live-ish vault testnet scenario.
+
+## Verification
+
+- Negative tests prove an unauthenticated or out-of-scope internal call is rejected, an
+  egress-denied call is blocked and alerted, and an expired token is refused.
+- A configuration test asserts production fails to boot with a missing or placeholder
+  service credential.
+- Auth failures are surfaced through `sentry.server.config.ts`.
 
 ## Notes
 
