@@ -131,3 +131,93 @@ export function getVaultRegistryEntry(
   if (match) return match;
   return { contractId, wasmHash: "", auditRevision: "", verified: false };
 }
+
+/**
+ * Internal service identities that participate in service-to-service auth
+ * (issue #289). Each service authenticates with its own short-lived signed
+ * token; there are no shared static bearer secrets.
+ */
+export type InternalServiceName = "bff" | "api" | "indexer" | "scheduler" | "keeper";
+
+/**
+ * Narrow scope claims a service token may carry. Handlers verify these
+ * explicitly so a compromised service cannot exceed its least-privilege role
+ * (e.g. the indexer cannot submit transactions, the keeper cannot read PII).
+ */
+export type ServiceScope =
+  | "tx:submit"
+  | "epoch:mutate"
+  | "index:read"
+  | "pii:read"
+  | "notify:send";
+
+/**
+ * Frontend-visible subset of the service-auth configuration (issue #289).
+ *
+ * Only non-secret values are surfaced here. Signing keys and managed-store
+ * references are read server-side from the managed secret store and are never
+ * inlined into this module or checked into config.
+ */
+export const serviceAuthConfig = {
+  /** Whether mTLS is required for internal calls (disabled only in local dev). */
+  requireMtls: env.NODE_ENV === "production",
+  /**
+   * Dev bypass for mTLS. Hard-disabled in production so it can never be
+   * enabled there, even if the env var is set.
+   */
+  allowDevBypass: env.NODE_ENV !== "production",
+  /** Clock-skew tolerance (seconds) applied when validating token expiry. */
+  clockSkewSeconds: 60,
+  /** Maximum lifetime (seconds) of a short-lived service token. */
+  maxTokenTtlSeconds: 300,
+} as const;
+
+/**
+ * Least-privilege scope grants per internal service (issue #289).
+ *
+ * The indexer is read-only and cannot submit transactions; the keeper can
+ * mutate epoch state but cannot read depositor PII it does not need.
+ */
+export const serviceScopeGrants: Record<InternalServiceName, readonly ServiceScope[]> = {
+  bff: ["index:read", "notify:send"],
+  api: ["index:read", "tx:submit", "pii:read"],
+  indexer: ["index:read"],
+  scheduler: ["epoch:mutate"],
+  keeper: ["epoch:mutate"],
+};
+
+/**
+ * Egress allowlist (issue #289): the only outbound destinations internal
+ * services may reach. Denied outbound calls are logged and alerted.
+ */
+export const egressAllowlist: readonly string[] = [
+  "soroban-testnet.stellar.org",
+  "soroban.stellar.org",
+  "horizon-testnet.stellar.org",
+  "horizon.stellar.org",
+] as const;
+
+/**
+ * Validate the frontend-visible service-auth subset (issue #289).
+ *
+ * Production must fail to boot when a required service credential reference
+ * is missing or still a placeholder. Returns the list of problems so callers
+ * can surface them via Sentry and abort startup.
+ */
+export function validateServiceAuthConfig(
+  source: Record<string, string | undefined> = process.env,
+): string[] {
+  const problems: string[] = [];
+  if (env.NODE_ENV !== "production") return problems;
+
+  const services: InternalServiceName[] = ["bff", "api", "indexer", "scheduler", "keeper"];
+  for (const service of services) {
+    const ref = source[`SERVICE_CREDENTIAL_REF_${service.toUpperCase()}`];
+    if (!ref) {
+      problems.push(`Missing managed-store reference for service credential: ${service}`);
+    } else if (/placeholder|changeme|example/i.test(ref)) {
+      problems.push(`Placeholder service credential reference rejected: ${service}`);
+    }
+  }
+  return problems;
+}

@@ -88,6 +88,42 @@ export function smileVol(base: number, moneyness: number): number {
   );
 }
 
+/**
+ * Reference for the epoch strike rule in docs/oracle-policy.md §4. Display and
+ * reproduction only: the vault contract is the source of truth.
+ *
+ * Bisects for the call strike whose delta equals `targetDelta`, then snaps to
+ * the nearest listed strike. Ties go to the higher strike. Returns null when
+ * the inputs are out of range, so the caller can halt the epoch.
+ */
+export function selectStrike(
+  spot: number,
+  vol: number,
+  days: number,
+  targetDelta: number,
+  listedStrikes: number[]
+): number | null {
+  if (!(spot > 0 && vol > 0 && days > 0 && targetDelta > 0 && targetDelta < 1)) return null;
+  if (listedStrikes.length === 0) return null;
+  const t = days / 365;
+  // Delta falls as strike rises, so search upward when delta is still too high.
+  let lo = spot * 0.01;
+  let hi = spot * 100;
+  for (let i = 0; i < 200; i++) {
+    const mid = (lo + hi) / 2;
+    if (bs(spot, mid, vol, t, true).delta > targetDelta) lo = mid;
+    else hi = mid;
+  }
+  const target = (lo + hi) / 2;
+  let best = listedStrikes[0];
+  for (const k of listedStrikes) {
+    const d = Math.abs(k - target);
+    const bestD = Math.abs(best - target);
+    if (d < bestD || (d === bestD && k > best)) best = k;
+  }
+  return best;
+}
+
 // Deterministic pseudo-random in [0, 1), seeded by a number. Used for display-only
 // figures (mock vol/OI) that must render identically on the server and client —
 // Math.random() during render causes React hydration mismatches.

@@ -1,0 +1,192 @@
+/* Visually hidden but still read by screen readers (live regions). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/*
+ * Motion policy. Every flash, transition and CSS animation goes through
+ * these rules. `data-motion` is set from the resolved preference
+ * (src/lib/a11y/motion.ts). Before hydration, or with JS off, the OS
+ * `prefers-reduced-motion` query covers the same cases unless the user has
+ * explicitly chosen "full". Inline styles need !important to be overridden.
+ */
+html[data-motion="reduce"] *,
+html[data-motion="reduce"] *::before,
+html[data-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="full"]) *,
+  html:not([data-motion="full"]) *::before,
+  html:not([data-motion="full"]) *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
+  Design tokens. Semantic --color-* variables are the source of truth; the
+  short legacy names (--bg, --call, --text-hi, ...) alias them so existing
+  components keep working. Tailwind's zn-* colours in tailwind.config.ts
+  point at the same semantic variables.
+
+  Themes are selected by <html data-theme> (set before paint by the inline
+  script in src/lib/theme.ts). Dark is the default and lives in :root.
+*/
+
+:root {
+  color-scheme: dark;
+
+  /* ── Surfaces ───────────────────────────────────────────────────── */
+  --color-surface-base:     #14130f;
+  --color-surface-raised:   #1a1812;
+  --color-surface-elevated: #221f17;
+  --color-surface-overlay:  #2c2820;
+
+  /* ── Text ───────────────────────────────────────────────────────── */
+  --color-text-primary:   #f3eee3;
+  --color-text-secondary: #9c9484;
+  --color-text-tertiary:  #5c5648;
+
+  /* ── Borders ────────────────────────────────────────────────────── */
+  --color-border-subtle:  rgba(245, 238, 220, 0.05);
+  --color-border-default: rgba(245, 238, 220, 0.10);
+  --color-border-strong:  rgba(245, 238, 220, 0.18);
+
+  /* ── Option call / put / ATM ────────────────────────────────────── */
+  --color-option-call: #5c9a6b;
+  --color-option-put:  #b65640;
+  --color-option-atm:  #b59665;
+
+  /* ── Profit / loss ──────────────────────────────────────────────── */
+  --color-pnl-positive: var(--color-option-call);
+  --color-pnl-negative: var(--color-option-put);
+
+  /* ── Brand / warning ────────────────────────────────────────────── */
+  --color-brand:   #b59665;
+  --color-warning: var(--color-option-atm);
+
+  /* ── Heat maps ──────────────────────────────────────────────────── */
+  --color-heat-seq-lo:  #362a14;
+  --color-heat-seq-hi:  #e8d6a8;
+  --color-heat-div-lo:  var(--color-option-put);
+  --color-heat-div-mid: #2c2820;
+  --color-heat-div-hi:  var(--color-option-call);
+  --color-heat-bar:     #b59665;
+
+  /* ── Typography stacks (fonts come from next/font in layout.tsx) ── */
+  --font-serif: var(--font-fraunces), Georgia, serif;
+  --font-sans:  var(--font-plex-sans), system-ui, sans-serif;
+  --font-mono:  var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  /* ── Legacy aliases ─────────────────────────────────────────────── */
+  --bg:           var(--color-surface-base);
+  --bg-raised:    var(--color-surface-raised);
+  --bg-elevated:  var(--color-surface-elevated);
+  --bg-overlay:   var(--color-surface-overlay);
+  --border-subtle:  var(--color-border-subtle);
+  --border-default: var(--color-border-default);
+  --border-strong:  var(--color-border-strong);
+  --text-hi:  var(--color-text-primary);
+  --text-mid: var(--color-text-secondary);
+  --text-lo:  var(--color-text-tertiary);
+  --call:     var(--color-option-call);
+  --call-dim: color-mix(in srgb, var(--color-option-call) 12%, transparent);
+  --put:      var(--color-option-put);
+  --put-dim:  color-mix(in srgb, var(--color-option-put) 12%, transparent);
+  --atm:      var(--color-option-atm);
+  --atm-dim:  color-mix(in srgb, var(--color-option-atm) 12%, transparent);
+  --brand:     var(--color-brand);
+  --brand-dim: color-mix(in srgb, var(--color-brand) 14%, transparent);
+  --heat-seq-lo:  var(--color-heat-seq-lo);
+  --heat-seq-hi:  var(--color-heat-seq-hi);
+  --heat-div-lo:  var(--color-heat-div-lo);
+  --heat-div-mid: var(--color-heat-div-mid);
+  --heat-div-hi:  var(--color-heat-div-hi);
+  --heat-bar:     var(--color-heat-bar);
+}
+
+/* Light: WCAG AA text contrast on every surface. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-surface-base:     #faf7f0;
+  --color-surface-raised:   #ffffff;
+  --color-surface-elevated: #f3eee3;
+  --color-surface-overlay:  #e9e2d0;
+
+  --color-text-primary:   #1a1812;
+  --color-text-secondary: #4f4838;
+  --color-text-tertiary:  #6b6353;
+
+  --color-border-subtle:  rgba(26, 24, 18, 0.06);
+  --color-border-default: rgba(26, 24, 18, 0.14);
+  --color-border-strong:  rgba(26, 24, 18, 0.28);
+
+  --color-option-call: #2e7d4a;
+  --color-option-put:  #a8432e;
+  --color-option-atm:  #7a5c22;
+  --color-brand:       #7a5c22;
+
+  --color-heat-seq-lo:  #f3e9cf;
+  --color-heat-seq-hi:  #6b4a14;
+  --color-heat-div-mid: #efeae0;
+  --color-heat-bar:     #7a5c22;
+}
+
+/* High contrast: WCAG AAA (7:1) for text, solid borders, no dim tints. */
+:root[data-theme="high-contrast"] {
+  --color-surface-base:     #000000;
+  --color-surface-raised:   #000000;
+  --color-surface-elevated: #0d0d0d;
+  --color-surface-overlay:  #1a1a1a;
+
+  --color-text-primary:   #ffffff;
+  --color-text-secondary: #e8e8e8;
+  --color-text-tertiary:  #cfcfcf;
+
+  --color-border-subtle:  #3a3a3a;
+  --color-border-default: #7a7a7a;
+  --color-border-strong:  #ffffff;
+
+  --color-option-call: #00e676;
+  --color-option-put:  #ff6b6b;
+  --color-option-atm:  #ffd740;
+  --color-brand:       #ffd740;
+
+  --color-heat-seq-lo:  #1a1a1a;
+  --color-heat-seq-hi:  #ffffff;
+  --color-heat-div-mid: #1a1a1a;
+  --color-heat-bar:     #ffd740;
+}
+
+/* Colourblind-safe: blue / orange replace green / red for call-put and
+   profit-loss (Okabe-Ito palette). Yellow replaces amber for ATM and
+   warnings so neither collides with the orange put. */
+:root[data-theme="colorblind"] {
+  --color-option-call: #56b4e9;
+  --color-option-put:  #e69f00;
+  --color-option-atm:  #f0e442;
+  --color-brand:       #b59665;
+}
+
+html,
+body {
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+}

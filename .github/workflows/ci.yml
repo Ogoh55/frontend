@@ -5,7 +5,86 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref so each push only bills one run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege permissions; individual jobs add what they need.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  pull-requests: write  # for posting VRT diff comments
+
+env:
+  # Required by Next.js env validation in src/env.ts at build time.
+  # These are safe dummy values — nothing is deployed from CI.
+  NEXT_PUBLIC_API_URL: http://localhost:8081
+  NEXT_PUBLIC_STELLAR_NETWORK: testnet
+  NEXT_PUBLIC_STELLAR_TESTNET_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LINT
+# Runs next lint. Treats any warning as an error (--max-warnings 0).
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+        # The composite action does: checkout → setup-node (from .nvmrc) → npm ci
+
+      - name: Lint
+        run: npm run lint:ci
+
+      # Fails if a flag's production default changes without its rollout config.
+      - name: Flag rollout guard
+        run: node scripts/check-flag-rollout.mjs
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TYPECHECK
+  # Runs tsc --noEmit against the project's tsconfig.json.
+  # ───────────────────────────────────────────────────────────────────────────
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+
+      - name: Typecheck
+        run: npm run typecheck
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # UNIT TESTS
+  # Runs Jest with coverage; uploads the report so it's visible in the
+  # GitHub Actions summary and can be picked up by third-party coverage
+  # reporters (Codecov, Coveralls, etc.) if added later.
+  # ───────────────────────────────────────────────────────────────────────────
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+
+      - name: Run unit tests with coverage
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # BUILD
+  # Runs `next build`. The .next/cache is restored between runs so
+  # incremental builds are fast. The build artifact is uploaded so the
+  # bundle workflow can analyse it without re-building.
+  # ───────────────────────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
     steps:

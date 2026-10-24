@@ -43,12 +43,13 @@ export function VolSurfaceHeatmap({ baseVol, selectedExpiryDays }: Props) {
       </div>
       {/* Horizontal scroll belongs to this element, not the page. */}
       <div className="zn-table-scroll zn-no-scrollbar">
-      <table style={{ borderCollapse: "collapse" }}>
+      <table style={{ borderCollapse: "collapse" }}
+        aria-label={`Implied volatility surface, ${(minIv * 100).toFixed(0)}% to ${(maxIv * 100).toFixed(0)}% IV, by strike moneyness and days to expiry`}>
         <thead>
           <tr>
             <th style={{ width: 36 }} />
             {MONEYNESS.map(m => (
-              <th key={m} style={{
+              <th key={m} scope="col" style={{
                 fontSize: 8, fontFamily: "var(--font-mono)", fontWeight: 500,
                 color: m === 1 ? "var(--atm)" : "var(--text-lo)", padding: "0 0 4px",
               }}>
@@ -62,13 +63,13 @@ export function VolSurfaceHeatmap({ baseVol, selectedExpiryDays }: Props) {
             const isSelectedExpiry = EXPIRY_DAYS[i] === selectedExpiryDays;
             return (
               <tr key={i} style={{ background: isSelectedExpiry ? "rgba(201,151,76,0.06)" : undefined }}>
-                <td style={{
+                <th scope="row" style={{
                   fontSize: 9, fontFamily: "var(--font-mono)",
                   color: isSelectedExpiry ? "var(--atm)" : "var(--text-lo)",
                   fontWeight: isSelectedExpiry ? 700 : 400, paddingRight: 6, textAlign: "right",
                 }}>
                   {EXPIRY_DAYS[i]}D
-                </td>
+                </th>
                 {row.map((cell, j) => {
                   const isAtm = cell.moneyness === 1;
                   return (
