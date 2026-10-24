@@ -36,6 +36,9 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /{id}/deposit        { amount }                    → { tx_id }
  *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
+ *   GET /api/v1/vaults/{id}/analytics
+ *   → VaultAnalytics
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
  *     caps are computed server-side). The client only signs and submits it.
@@ -803,5 +806,4 @@ export function parseVaultQuery(
 export function serializeVaultQuery(q: VaultQuery): string {
   const p = new URLSearchParams();
   if (q.strategy) p.set("strategy", q.strategy);
-  if (q.underlying) p.set("underlying", q.underlying);
-  if (q.status) p.set("
+  if (
