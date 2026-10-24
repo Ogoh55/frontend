@@ -235,6 +235,8 @@ export function getVaultRegistryEntry(
   if (match) return match;
   return { contractId, wasmHash: "", auditRevision: "", verified: false };
 
+}
+
 /**
  * Per-network anchor configuration for fiat on-ramp/off-ramp (issue #265).
  *

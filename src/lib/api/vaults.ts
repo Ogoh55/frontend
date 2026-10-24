@@ -904,6 +904,8 @@ export function removeAllowlistEntry(
     createdAt: now,
   };
   return { restrictions: next, audit };
+}
+
 export const VAULT_STRATEGIES: readonly VaultStrategy[] = ["covered_call", "cash_secured_put", "iron_condor", "wheel"];
 export const RISK_RATINGS: readonly RiskRating[] = ["low", "medium", "high"];
 export const EPOCH_PHASES: readonly EpochPhase[] = ["deposit", "active", "settlement"];
@@ -930,6 +932,8 @@ export class VaultApiError extends Error {
     super(message);
     this.name = "VaultApiError";
   }
+}
+
 /** Instrument used to hedge a vault's directional exposure. */
 export type HedgeInstrument = "underlying" | "perp" | "futures";
 
