@@ -4,6 +4,10 @@
     ".": {
       "release-type": "node",
       "package-name": "zenith-frontend"
+    },
+    "packages/vault-sdk": {
+      "release-type": "node",
+      "package-name": "@zenith-options/vault-sdk"
     }
   }
 }
