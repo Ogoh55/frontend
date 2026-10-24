@@ -8,6 +8,7 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
 import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
@@ -60,6 +61,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const token = useWalletStore(s => s.session);
   const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
+  const { keyFor, complete } = useIdempotencyKey();
   const t = useTranslations("vaultDisclosure");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
@@ -149,11 +151,15 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        idempotencyKey: keyFor({ vault: vault.id, amount }),
         enabled: vaultsEnabled,
       });
+      complete();
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
+      // Reconcile the displayed position with backend truth.
+      fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
       setTxStatus(null);
       if (e instanceof VaultPolicyError) {
@@ -598,9 +604,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                           )}
                         </div>
-                        <div style={{ marginBottom: 10, fontSize: 10, color: "var(--text-lo)", lineHeight: 1.5 }}>
-                          Queued withdrawals are processed at epoch settlement. You will receive USDC at the final share price after fees.
-                        </div>
-                        <button
-                          onClick={handleWithdraw}
-                          disabled={txStatus === "pending" || !withdrawShares || isNaN(parseFloat(withdrawShares)) || parseFloat(withdrawShares) <= 
+                        <div style={{ marginBottom:

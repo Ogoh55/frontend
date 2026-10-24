@@ -18,23 +18,57 @@
  *
  * History comes from Horizon contract-event filtering; we translate those
  * into a lightweight VaultEvent shape for the UI.
+ *
+ * Resilience (#282): the BFF owns the Soroban RPC provider pool, failover,
+ * batching, and read-after-write confirmation. This module surfaces the
+ * freshness/confirmation status the BFF returns so the UI can render
+ * degraded states explicitly instead of showing stale balances.
  */
 
 import { submitTransactionXdr } from "./stellar";
 import freighterApi from "@stellar/freighter-api";
+import { Networks, TransactionBuilder } from "@stellar/stellar-sdk";
 import { bffFetch } from "./client";
+import { IDEMPOTENCY_HEADER } from "./resilience/idempotency";
 
 export const VAULT_CONTRACT_ID =
   process.env.NEXT_PUBLIC_VAULT_CONTRACT_ID ?? null;
+
+const NETWORK_PASSPHRASE =
+  process.env.NEXT_PUBLIC_STELLAR_NETWORK === "mainnet"
+    ? Networks.PUBLIC
+    : Networks.TESTNET;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Freshness of the state returned by the BFF after a write.
+ * - `confirmed`: ledger inclusion observed and state re-read.
+ * - `pending`: submission accepted but confirmation timed out; the UI should
+ *   show a "pending confirmation" state and poll rather than re-submit.
+ */
+export type VaultConfirmationStatus = "confirmed" | "pending";
+
 export interface VaultOperationResult {
   txHash: string;
   amount: number;
   operation: "deposit" | "withdraw";
+  /** Read-after-write confirmation status from the BFF. */
+  status: VaultConfirmationStatus;
+  /** Ledger the write was observed in, when confirmed. */
+  ledger?: number;
+  /** Re-read state after the write, when the BFF returned it. */
+  state?: VaultStateSnapshot;
+}
+
+/** Post-write snapshot of the balances the UI renders. */
+export interface VaultStateSnapshot {
+  nav?: number;
+  shareBalance?: number;
+  tokenBalance?: number;
+  ledger?: number;
 }
 
 export type VaultEventType = "deposit" | "withdraw";
@@ -48,17 +82,107 @@ export interface VaultEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Read-after-write confirmation
+// ---------------------------------------------------------------------------
+
+/**
+ * Documented timeout (ms) the BFF waits for ledger inclusion before falling
+ * back to the `pending` state. Kept in sync with the server-side client.
+ */
+export const VAULT_CONFIRMATION_TIMEOUT_MS = 30_000;
+
+interface ConfirmationResponse {
+  status?: VaultConfirmationStatus;
+  ledger?: number;
+  state?: VaultStateSnapshot;
+}
+
+/**
+ * Asks the BFF to wait for ledger inclusion and re-read affected state.
+ * Never re-submits the signed transaction: on timeout the BFF returns
+ * `pending` and the caller surfaces a degraded state.
+ */
+async function confirmVaultWrite(
+  txHash: string,
+  operation: "deposit" | "withdraw"
+): Promise<ConfirmationResponse> {
+  try {
+    const res = await bffFetch("/api/v1/onchain/confirm", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tx_hash: txHash,
+        operation,
+        timeout_ms: VAULT_CONFIRMATION_TIMEOUT_MS,
+      }),
+    });
+
+    if (!res.ok) return { status: "pending" };
+    return (await res.json()) as ConfirmationResponse;
+  } catch {
+    // Network/parse failure: treat as pending rather than claiming success.
+    return { status: "pending" };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Backend-assisted transaction building
 // ---------------------------------------------------------------------------
 
 /**
+ * Thrown when a signed vault transaction may or may not have reached the
+ * ledger: the submit timed out or its response was dropped, and the chain did
+ * not confirm it. This is not a failure. Callers must not re-sign or resubmit
+ * a different transaction for the same intent; they show `txHash` and wait.
+ */
+export class VaultSubmissionUnknownError extends Error {
+  readonly txHash: string;
+
+  constructor(txHash: string) {
+    super("Transaction submitted but not yet confirmed. Check the explorer before trying again.");
+    this.name = "VaultSubmissionUnknownError";
+    this.txHash = txHash;
+  }
+}
+
+/**
+ * Submits a signed vault transaction. The hash is computed locally before
+ * submitting, so an ambiguous failure can be resolved against the ledger
+ * instead of being treated as "not submitted".
+ */
+async function submitSignedVaultTx(
+  signedXdr: string,
+  operation: "deposit" | "withdraw"
+): Promise<{ hash: string; confirmation: ConfirmationResponse }> {
+  const hash = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE).hash().toString("hex");
+  try {
+    await submitTransactionXdr(signedXdr);
+  } catch {
+    // Timeouts, dropped responses and 5xx can all follow an accepted submit.
+    // Only the ledger can say which, so look before deciding.
+    const confirmation = await confirmVaultWrite(hash, operation);
+    if (confirmation.status !== "confirmed") throw new VaultSubmissionUnknownError(hash);
+    return { hash, confirmation };
+  }
+
+  // Read-after-write: wait for inclusion and re-read state before returning.
+  const confirmation = await confirmVaultWrite(hash, operation);
+  return { hash, confirmation };
+}
+
+/**
  * Asks the backend to build an XDR for a vault deposit, has Freighter sign
  * it, submits to Horizon, and returns the tx hash.
+ *
+ * `idempotencyKey` identifies this user intent (see useIdempotencyKey). Reusing
+ * it on a retry makes the backend return the original build, so a resubmit
+ * can't create a second deposit.
  */
 export async function depositToVault(
   address: string,
   amount: number,
-  _session: string
+  _session: string,
+  idempotencyKey: string
 ): Promise<VaultOperationResult> {
   if (!VAULT_CONTRACT_ID) {
     throw new Error(
@@ -69,7 +193,7 @@ export async function depositToVault(
   // Authenticated by the BFF session cookie (#118).
   const buildRes = await bffFetch("/api/v1/onchain/build-deposit", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [IDEMPOTENCY_HEADER]: idempotencyKey },
     body: JSON.stringify({
       wallet_address: address,
       amount: amount.toString(),
@@ -87,22 +211,30 @@ export async function depositToVault(
   const signed = await freighterApi.signTransaction(xdr, {
     accountToSign: address,
   });
-  const { hash } = await submitTransactionXdr(signed);
+  const { hash, confirmation } = await submitSignedVaultTx(signed, "deposit");
 
-  return { txHash: hash, amount, operation: "deposit" };
+  return {
+    txHash: hash,
+    amount,
+    operation: "deposit",
+    status: confirmation.status ?? "pending",
+    ledger: confirmation.ledger,
+    state: confirmation.state,
+  };
 }
 
 /**
  * Withdraw free (unlocked) collateral from the vault back to the wallet.
  * Validates against the backend's free-collateral figure before building the
  * transaction so the user gets an early rejection rather than an on-chain
- * failure.
+ * failure. `idempotencyKey` works as in `depositToVault`.
  */
 export async function withdrawFromVault(
   address: string,
   amount: number,
   _session: string,
-  freeCollateral: number
+  freeCollateral: number,
+  idempotencyKey: string
 ): Promise<VaultOperationResult> {
   if (!VAULT_CONTRACT_ID) {
     throw new Error(
@@ -120,7 +252,7 @@ export async function withdrawFromVault(
   // Authenticated by the BFF session cookie (#118).
   const buildRes = await bffFetch("/api/v1/onchain/build-withdraw", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [IDEMPOTENCY_HEADER]: idempotencyKey },
     body: JSON.stringify({
       wallet_address: address,
       amount: amount.toString(),
@@ -138,9 +270,16 @@ export async function withdrawFromVault(
   const signed = await freighterApi.signTransaction(xdr, {
     accountToSign: address,
   });
-  const { hash } = await submitTransactionXdr(signed);
+  const { hash, confirmation } = await submitSignedVaultTx(signed, "withdraw");
 
-  return { txHash: hash, amount, operation: "withdraw" };
+  return {
+    txHash: hash,
+    amount,
+    operation: "withdraw",
+    status: confirmation.status ?? "pending",
+    ledger: confirmation.ledger,
+    state: confirmation.state,
+  };
 }
 
 // ---------------------------------------------------------------------------
