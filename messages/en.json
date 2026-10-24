@@ -137,6 +137,23 @@
     "hotkeys": "Hotkeys",
     "hotkeysSoon": "Custom keyboard shortcut bindings coming soon. Export/import your bindings above."
   },
+  "vaults": {
+    "notifications": {
+      "v1": {
+        "epoch_opened": "Epoch {epoch} is open for deposits in {vault}.",
+        "epoch_closed": "Epoch {epoch} closed in {vault}.",
+        "nav_published": "NAV per share for {vault} is now {nav}.",
+        "premium_collected": "Premium collected for epoch {epoch} in {vault}.",
+        "assignment": "{vault} was assigned in epoch {epoch}. Review your position.",
+        "redemption_claimable": "Your redemption from {vault} is claimable.",
+        "redemption_expired": "Your redemption window for {vault} has expired.",
+        "vault_paused": "{vault} is paused. Deposits and new epochs are on hold.",
+        "vault_unpaused": "{vault} has resumed.",
+        "capacity_reached": "{vault} has reached capacity. New deposits are closed.",
+        "nav_drift": "NAV for {vault} drifted from the published value. Review the vault."
+      }
+    }
+  },
   "notFound": {
     "title": "Page not found",
     "back": "Back to the terminal"

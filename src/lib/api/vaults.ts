@@ -57,12 +57,82 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -342,6 +412,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    status: "open",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -379,6 +450,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "BTC Cash-Secured Put",
     underlying: "BTC",
     strategy: "cash_secured_put",
+    status: "open",
     apy: 0.15,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
     tvl: 1850000,
@@ -414,6 +486,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "ETH Iron Condor",
     underlying: "ETH",
     strategy: "iron_condor",
+    status: "open",
     apy: 0.18,
     apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
     tvl: 620000,
@@ -448,6 +521,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "SOL Wheel",
     underlying: "SOL",
     strategy: "wheel",
+    status: "winding_down",
     apy: 0.31,
     apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
     tvl: 98000,
@@ -593,74 +667,3 @@ export async function fetchMyDisclosureAcknowledgements(
   wallet: string,
   _token: string
 ): Promise<DisclosureAcknowledgement[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<DisclosureAcknowledgement[]>("/api/v1/vaults/disclosures/me", token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(readMockAcks().filter(a => a.wallet === wallet));
-}
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, roles, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function fetchVaultEpochHistory(
-  id: string,
-  _token?: string | null
-): Promise<VaultEpochLedgerEntry[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultEpochLedgerEntry[]>(`/api/v1/vaults/${id}/epochs`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: no ledger rows; backfill of pre-existing mock epochs is out of scope.
-  return Promise.resolve([]);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string,
-  disclosure: { wallet: string; disclosureVersion: string }
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount, disclosure_version }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock server-side gate: the live backend derives the wallet from the bearer token.
-  assertDisclosureAccepted(disclosure.wallet, disclosure.disclosureVersion);
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
-
-// ---------------------------------------------------------------------------
-// Cross
