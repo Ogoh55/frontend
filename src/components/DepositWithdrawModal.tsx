@@ -4,11 +4,16 @@ import { useState, useEffect, useCallback } from "react";
 import { useWalletStore } from "../lib/store/wallet";
 import { useAccountReadiness } from "../lib/hooks/useAccountReadiness";
 import { useNetworkReady } from "../lib/hooks/useNetworkReady";
-import { depositToVault, withdrawFromVault, fetchVaultHistory, VAULT_CONTRACT_ID, type VaultEvent } from "../lib/api/vault";
+import { depositToVault, withdrawFromVault, fetchVaultHistory, VAULT_CONTRACT_ID, VaultSubmissionUnknownError, type VaultEvent, type VaultConfirmationStatus } from "../lib/api/vault";
 import { COLLATERAL_ASSET_CODE, explorerTxUrl } from "../lib/api/stellar";
+import { IntentKeyManager } from "../lib/api/resilience/idempotency";
 import { useBackendData } from "../lib/context/BackendDataContext";
 
 type Mode = "deposit" | "withdraw";
+
+// Module-level so a closed and reopened modal keeps the key for an unresolved
+// intent. A resubmit of the same deposit then reuses the backend's stored build.
+const vaultIntentKeys = new IntentKeyManager();
 
 interface DepositWithdrawModalProps {
   initialMode?: Mode;
@@ -47,6 +52,8 @@ export function DepositWithdrawModal({
   const [submitting, setSubmitting] = useState(false);
   const [txError, setTxError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
+  // `confirmed` clears the intent. Anything else means the outcome is unresolved.
+  const [txStatus, setTxStatus] = useState<VaultConfirmationStatus | "unknown" | null>(null);
   const [history, setHistory] = useState<VaultEvent[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
@@ -116,23 +123,35 @@ export function DepositWithdrawModal({
   // Handle submit
   async function handleSubmit() {
     if (!address || !token || validationError) return;
+    const idempotencyKey = vaultIntentKeys.keyFor({ mode, address, amount });
     setSubmitting(true);
     setTxError(null);
     setTxHash(null);
+    setTxStatus(null);
     try {
       const result =
         mode === "deposit"
-          ? await depositToVault(address, amount, token)
-          : await withdrawFromVault(address, amount, token, freeCollateral);
+          ? await depositToVault(address, amount, token, idempotencyKey)
+          : await withdrawFromVault(address, amount, token, freeCollateral, idempotencyKey);
 
       setTxHash(result.txHash);
+      setTxStatus(result.status);
+      if (result.status === "confirmed") vaultIntentKeys.complete();
       // Refresh balances after success
       refreshAccount();
       refreshReadiness();
       loadHistory();
       onSuccess?.();
     } catch (err) {
-      setTxError(err instanceof Error ? err.message : "Transaction failed");
+      if (err instanceof VaultSubmissionUnknownError) {
+        // The transaction may already be on the ledger. Show the hash and keep
+        // the key so Confirm can't create a second, different transaction.
+        setTxHash(err.txHash);
+        setTxStatus("unknown");
+      } else {
+        // Nothing was submitted, so the same intent can be retried with the same key.
+        setTxError(err instanceof Error ? err.message : "Transaction failed");
+      }
     } finally {
       setSubmitting(false);
     }
@@ -174,7 +193,7 @@ export function DepositWithdrawModal({
             {(["deposit", "withdraw"] as Mode[]).map((m) => (
               <button
                 key={m}
-                onClick={() => { setMode(m); setAmountStr(""); setTxError(null); setTxHash(null); }}
+                onClick={() => { setMode(m); setAmountStr(""); setTxError(null); setTxHash(null); setTxStatus(null); }}
                 aria-pressed={mode === m}
                 style={{
                   padding: "4px 14px",
@@ -321,11 +340,19 @@ export function DepositWithdrawModal({
             {txError}
           </div>
         )}
-        {txHash && (
+        {txHash && txStatus === "confirmed" && (
           <div style={{ fontSize: 11, color: "var(--call)", padding: "6px 8px", background: "var(--call-dim)", border: "1px solid var(--call)" }}>
-            ✓ Transaction submitted —{" "}
+            ✓ Transaction confirmed —{" "}
             <a href={explorerTxUrl(txHash)} target="_blank" rel="noreferrer" style={{ color: "var(--call)" }}>
               view on explorer ↗
+            </a>
+          </div>
+        )}
+        {txHash && txStatus && txStatus !== "confirmed" && (
+          <div style={{ fontSize: 11, color: "var(--text-mid)", padding: "6px 8px", background: "var(--bg-overlay)", border: "1px solid var(--border-default)" }}>
+            Submitted, awaiting confirmation. Do not retry; the {mode} may already have settled.{" "}
+            <a href={explorerTxUrl(txHash)} target="_blank" rel="noreferrer" style={{ color: "var(--text-hi)" }}>
+              check on explorer ↗
             </a>
           </div>
         )}
@@ -346,7 +373,11 @@ export function DepositWithdrawModal({
             textTransform: "capitalize",
           }}
         >
-          {submitting ? "Signing & submitting…" : txHash ? "Done" : `Confirm ${mode}`}
+          {submitting
+            ? "Signing & submitting…"
+            : txStatus && txStatus !== "confirmed"
+              ? "Awaiting confirmation"
+              : txHash ? "Done" : `Confirm ${mode}`}
         </button>
 
         {validationError && !txHash && (
