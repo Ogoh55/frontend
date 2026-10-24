@@ -1,3 +1,5 @@
+import { apiGet, apiPost } from "./client";
+
 /**
  * Typed data adapter interface for the Vaults feature.
  *
@@ -6,7 +8,8 @@
  * API is not yet available. This module is unrelated to the margin-collateral
  * vault in `./vault.ts`. When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
  * implementation below is used. Swap in the real implementation by
- * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
+ * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
+ * (Zenith-options/backend) through the REST contract below.
  *
  * Backend contract (for when the real API lands):
  *
@@ -28,7 +31,9 @@
  * client check in the UI is advisory only.
  */
 
-export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
+import { toCsv, type CsvColumn } from "../csv";
+
+export type VaultStrategy ="covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
@@ -449,6 +454,204 @@ export function deriveDepositState(
 }
 
 // ---------------------------------------------------------------------------
+// Share-lot accounting (cost basis, realized and unrealized PnL)
+//
+// Shared by the API and any client-side display. Rebuilding the ledger from
+// the same event stream always yields the same output: events are ordered by
+// (ledger, seq) and lots by (acquiredLedger, lotId). Schema: docs/vault-lot-ledger.md
+// ---------------------------------------------------------------------------
+
+/** Lot relief method. Stored on every ledger row so a future change cannot rewrite history. */
+export type LotReliefMethod = "fifo";
+export const DEFAULT_LOT_RELIEF_METHOD: LotReliefMethod = "fifo";
+
+/** Share amounts at or below this are rounding residue, never a lot. */
+export const DUST_SHARES = 1e-9;
+
+/** A dated acquisition lot held by one depositor in one vault. */
+export interface VaultShareLot {
+  lotId: string;
+  vaultId: string;
+  acquiredLedger: number;
+  acquiredAt: string; // ledger close time (ISO), never receipt time
+  /** Shares still held from this lot. */
+  shares: number;
+  /** Cost basis still attached to the remaining shares, in USD. */
+  costUsd: number;
+  /** NAV per share used when the shares were minted. */
+  navPerShare: number;
+}
+
+/** A lot-affecting event as indexed from the vault contract. */
+export interface VaultLotEvent {
+  seq: number;
+  kind: "deposit" | "transfer_in" | "redemption" | "transfer_out";
+  ledger: number;
+  ledgerAt: string;
+  vaultId: string;
+  shares: number;
+  /** deposit/transfer_in: cost in USD. redemption/transfer_out: gross proceeds in USD. */
+  amountUsd: number;
+  /** Fees that reduce proceeds. Management fees are already reflected in NAV and are not repeated here. */
+  feesUsd: number;
+  navPerShare: number;
+}
+
+/** One ledger row per lot-affecting event. This is the export row. */
+export interface VaultLedgerRow {
+  seq: number;
+  kind: VaultLotEvent["kind"];
+  ledger: number;
+  ledgerAt: string;
+  vaultId: string;
+  shares: number;
+  amountUsd: number;
+  feesUsd: number;
+  navPerShare: number;
+  costBasisUsd: number;
+  realizedPnlUsd: number;
+  lotMethod: LotReliefMethod;
+}
+
+export interface LotRelief {
+  shares: number;
+  costBasisUsd: number;
+  /** Gross proceeds minus fees. */
+  netProceedsUsd: number;
+  realizedPnlUsd: number;
+  consumed: { lotId: string; shares: number; costUsd: number }[];
+  remainingLots: VaultShareLot[];
+}
+
+function byLotOrder(a: VaultShareLot, b: VaultShareLot): number {
+  return a.acquiredLedger - b.acquiredLedger || a.lotId.localeCompare(b.lotId);
+}
+
+/**
+ * Relieves `shares` from the lots in FIFO order and returns the realized PnL.
+ * Throws rather than producing a negative basis when `shares` exceeds the tracked lots.
+ */
+export function relieveLotsFifo(
+  lots: VaultShareLot[],
+  shares: number,
+  grossProceedsUsd: number,
+  feesUsd: number
+): LotRelief {
+  if (!(shares > DUST_SHARES)) throw new Error(`Relief quantity must be positive, got ${shares}`);
+  if (feesUsd < 0) throw new Error(`Fees cannot be negative, got ${feesUsd}`);
+  const available = lots.reduce((sum, lot) => sum + lot.shares, 0);
+  if (shares > available + DUST_SHARES) {
+    throw new Error(`Cannot relieve ${shares} shares: only ${available} tracked`);
+  }
+
+  let remaining = shares;
+  let costBasisUsd = 0;
+  const consumed: LotRelief["consumed"] = [];
+  const remainingLots: VaultShareLot[] = [];
+
+  for (const lot of [...lots].sort(byLotOrder)) {
+    if (remaining <= DUST_SHARES) {
+      remainingLots.push(lot);
+      continue;
+    }
+    const take = Math.min(lot.shares, remaining);
+    const costUsd = lot.shares > 0 ? lot.costUsd * (take / lot.shares) : 0;
+    remaining -= take;
+    costBasisUsd += costUsd;
+    consumed.push({ lotId: lot.lotId, shares: take, costUsd });
+
+    const left = lot.shares - take;
+    if (left > DUST_SHARES) {
+      remainingLots.push({ ...lot, shares: left, costUsd: lot.costUsd - costUsd });
+    }
+  }
+
+  const netProceedsUsd = grossProceedsUsd - feesUsd;
+  return {
+    shares,
+    costBasisUsd,
+    netProceedsUsd,
+    realizedPnlUsd: netProceedsUsd - costBasisUsd,
+    consumed,
+    remainingLots,
+  };
+}
+
+/** Unrealized PnL on the lots still held, marked at `markNavPerShare`. */
+export function unrealizedPnl(lots: VaultShareLot[], markNavPerShare: number): number {
+  return lots.reduce((sum, lot) => sum + (lot.shares * markNavPerShare - lot.costUsd), 0);
+}
+
+/**
+ * Replays lot-affecting events into lots and ledger rows.
+ * Deterministic: the same events always produce the same rows and lots.
+ */
+export function buildLotLedger(events: VaultLotEvent[]): { rows: VaultLedgerRow[]; lots: VaultShareLot[] } {
+  const ordered = [...events].sort((a, b) => a.ledger - b.ledger || a.seq - b.seq);
+  let lots: VaultShareLot[] = [];
+  const rows: VaultLedgerRow[] = [];
+
+  for (const ev of ordered) {
+    const base = {
+      seq: ev.seq,
+      kind: ev.kind,
+      ledger: ev.ledger,
+      ledgerAt: ev.ledgerAt,
+      vaultId: ev.vaultId,
+      shares: ev.shares,
+      amountUsd: ev.amountUsd,
+      feesUsd: ev.feesUsd,
+      navPerShare: ev.navPerShare,
+      lotMethod: DEFAULT_LOT_RELIEF_METHOD,
+    };
+
+    if (ev.kind === "deposit" || ev.kind === "transfer_in") {
+      // Dust minted from rounding never becomes a lot.
+      if (ev.shares > DUST_SHARES) {
+        lots.push({
+          lotId: `${ev.vaultId}:${ev.seq}`,
+          vaultId: ev.vaultId,
+          acquiredLedger: ev.ledger,
+          acquiredAt: ev.ledgerAt,
+          shares: ev.shares,
+          costUsd: ev.amountUsd,
+          navPerShare: ev.navPerShare,
+        });
+      }
+      rows.push({ ...base, costBasisUsd: ev.amountUsd, realizedPnlUsd: 0 });
+      continue;
+    }
+
+    const relief = relieveLotsFifo(lots, ev.shares, ev.amountUsd, ev.feesUsd);
+    lots = relief.remainingLots;
+    rows.push({ ...base, costBasisUsd: relief.costBasisUsd, realizedPnlUsd: relief.realizedPnlUsd });
+  }
+
+  return { rows, lots: [...lots].sort(byLotOrder) };
+}
+
+/** Export schema version. Bump on any column change. */
+export const VAULT_EXPORT_SCHEMA_VERSION = 1;
+
+export type VaultExportFormat = "csv" | "json";
+
+export const VAULT_EXPORT_COLUMNS: CsvColumn<VaultLedgerRow>[] = [
+  { header: "schema_version", value: () => VAULT_EXPORT_SCHEMA_VERSION },
+  { header: "seq", value: r => r.seq },
+  { header: "event_kind", value: r => r.kind },
+  { header: "ledger", value: r => r.ledger },
+  { header: "ledger_at", value: r => r.ledgerAt },
+  { header: "vault_id", value: r => r.vaultId },
+  { header: "shares", value: r => r.shares },
+  { header: "amount_usd", value: r => r.amountUsd },
+  { header: "fees_usd", value: r => r.feesUsd },
+  { header: "nav_per_share", value: r => r.navPerShare },
+  { header: "cost_basis_usd", value: r => r.costBasisUsd },
+  { header: "realized_pnl_usd", value: r => r.realizedPnlUsd },
+  { header: "lot_method", value: r => r.lotMethod },
+];
+
+// ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
 
@@ -519,139 +722,4 @@ const MOCK_VAULTS: VaultDetail[] = [
       { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
     ],
     feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    status: "open",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    epochDays: 30,
-    maxDrawdownPct: null,
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    limits: { paused: false, waitlistEnabled: false, perEpochDepositLimit: 50000, nextDepositStart: "2026-10-26T12:00:00Z", asOf: "" },
-    sharePrice: 1.021,
-    totalShares: 607247,
-    roles: [
-      { role: "operator", holder: "GETHIC_OPERATOR_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
-      { role: "guardian", holder: "GETHIC_GUARDIAN_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
-      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
-    ],
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    status: "winding_down",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    epochDays: 7,
-    maxDrawdownPct: null,
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    limits: { paused: false, waitlistEnabled: false, perEpochDepositLimit: 10000, nextDepositStart: "2026-10-05T16:00:00Z", asOf: "" },
-    sharePrice: 1.194,
-    totalShares: 82076,
-    roles: [
-      { role: "operator", holder: "GSOLWHEEL_OPERATOR_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
-      { role: "guardian", holder: "GSOLWHEEL_GUARDIAN_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
-      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
-    ],
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
-    ],
-    userPosition: null,
-  },
-];
-
-// ---------------------------------------------------------------------------
-// Depositor disclosure & eligibility
-// ---------------------------------------------------------------------------
-
-/**
- * Current risk-disclosure version. Bump this whenever the copy under
- * `vaultDisclosure.p1`–`p5` in messages/en.json changes, so every wallet
- * re-acknowledges. Acknowledgements for older versions stay in the audit
- * trail unchanged.
- */
-export const VAULT_DISCLOSURE_VERSION = "2026-10-19.1";
-
-export type PolicyReasonCode =
-  | "DISCLOSURE_NOT_ACCEPTED"
-  | "DISCLOSURE_VERSION_STALE"
-  | "JURISDICTION_NOT_ELIGIBLE";
-
-/** Policy rejection. `code` is stable and is what the UI maps to copy. */
-export class VaultPolicyError extends Error {
-  code: PolicyReasonCode;
-
-  constructor(code: PolicyReasonCode) {
-    super(code);
-    this.name = "VaultPolicyError";
-    this.code = code;
-  }
-}
-
-/**
- * One row in the acknowledgement audit trail. Deliberately holds no personal
- * data beyond the wallet address and the self-declared jurisdiction attestation.
- */
-export interface DisclosureAcknowledgement {
-  wallet: string;
-  disclosureVersion: string;
-  /** SHA-256 (hex) of the disclosure text as rendered to the user. */
-  textHash: string;
-  jurisdictionAttested: boolean;
-  acceptedAt: string; // ISO
-}
-
-export interface AcknowledgeDisclosureInput {
-  wallet: string;
-  disclosureVersion: string;
-  textHash: string;
-  jurisdictionAttested: boolean;
-}
-
-/** SHA-256 hex digest of the disclosure text, used to fingerprint what was accepted. */
-export async function hashDisclosureText(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Mock persistence standing in for the backend's append-only acknowledgement table.
-const MOCK_ACK_STORAGE_KEY =
+    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC

@@ -8,11 +8,13 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
   depositToVault,
   withdrawFromVault,
   deriveDepositState,
+  fetchVaultExport,
   vaultStatusPolicy,
   acknowledgeDisclosure,
   fetchMyDisclosureAcknowledgements,
@@ -22,6 +24,7 @@ import {
   type DepositState,
   type VaultDetail,
   type EpochPhase,
+  type VaultExportFormat,
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
@@ -74,6 +77,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [txStatus, setTxStatus] = useState<null | "pending" | "success" | "error">(null);
   const [txMessage, setTxMessage] = useState("");
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
+  const [disclosuresAcknowledged, setDisclosuresAcknowledged] = useState(false);
 
   // Disclosure gate. `acks` is null while loading for the connected wallet.
   const [acks, setAcks] = useState<DisclosureAcknowledgement[] | null>(null);
@@ -160,7 +164,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       : s.status === "queued" ? t("form.sharesQueued") : t("form.sharesWaitlist");
 
   const handleDeposit = async () => {
-    if (!vault || !token || !address || !currentAck || gateReason || !permittedActions.includes("deposit") || !depositState?.canSubmit || overMax) return;
+    if (!vault || !token || !address || !currentAck || gateReason || !disclosuresAcknowledged || !permittedActions.includes("deposit") || !depositState?.canSubmit || overMax) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
     const state = depositState;
@@ -210,6 +214,17 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     } catch (e) {
       setTxStatus("error");
       setTxMessage(e instanceof Error ? e.message : "Withdrawal failed");
+    }
+  };
+
+  const handleExport = async (format: VaultExportFormat) => {
+    if (!vault || !token) return;
+    try {
+      const blob = await fetchVaultExport(vault.id, format, token);
+      downloadBlob(`${vault.id}-lots.${format}`, blob);
+    } catch (e) {
+      setTxStatus("error");
+      setTxMessage(e instanceof Error ? e.message : "Export failed");
     }
   };
 
@@ -405,6 +420,19 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                         <span className="num" style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)" }}>{s.value}</span>
                       </div>
                     ))}
+                    <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                      {(["csv", "json"] as const).map(format => (
+                        <button
+                          key={format}
+                          type="button"
+                          onClick={() => handleExport(format)}
+                          disabled={!token}
+                          style={{ flex: 1, padding: "6px 0", fontSize: 11, fontWeight: 600, border: "1px solid var(--brand)", background: "transparent", color: "var(--brand)", cursor: token ? "pointer" : "not-allowed" }}
+                        >
+                          Export {format.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
 
@@ -566,32 +594,6 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             {t("form.overMax", { amount: fmtUsd(depositState.maxDeposit) })}
                           </div>
                         )}
-                        {gateReason && (
-                          <div role="alert" style={{ marginBottom: 10, fontSize: 10, color: "var(--put)", padding: "6px 8px", background: "var(--put-dim)" }}>
-                            <strong>{tDisclosure("depositBlocked")}:</strong> {tDisclosure(`reason.${gateReason}`)}
-                          </div>
-                        )}
-                        <button
-                          onClick={handleDeposit}
-                          disabled={txStatus === "pending" || !currentAck || !!gateReason || !depositState?.canSubmit || overMax || !(depositAmountNum > 0)}
-                          style={{
-                            width: "100%", padding: "10px 0",
-                            background: depositState?.canSubmit && !overMax && currentAck && !gateReason ? "var(--brand)" : "var(--bg-overlay)",
-                            color: depositState?.canSubmit && !overMax && currentAck && !gateReason ? "var(--bg)" : "var(--text-lo)",
-                            border: "none", fontSize: 13, fontWeight: 700,
-                            cursor: txStatus === "pending" || !currentAck || gateReason ? "default" : "pointer",
-                            opacity: txStatus === "pending" || !currentAck || gateReason ? 0.6 : 1,
-                          }}
-                        >
-                          {txStatus === "pending"
-                            ? "Confirming…"
-                            : depositState?.status === "queued"
-                              ? t("form.submitQueued", { epoch: depositState.pricedInEpoch ?? 0 })
-                              : depositState?.status === "waitlist"
-                                ? t("form.submitWaitlist")
-                                : t("form.submit")}
-                        </button>
-                      </div>
-                    )}
-
-                    {activeFlow ===
+                        {/* Depositor disclosures: shown and acknowledged before the deposit can be submitted */}
+                        <div style={{ marginBottom: 12, padding: 10, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", fontSize: 10, color: "var(--text-lo)", lineHeight: 1.6 }}>
+                          <div><span style={{ color: "var(--text-mid)" }}>Risk
