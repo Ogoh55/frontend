@@ -41,6 +41,7 @@ import {
   type EligibilityStatus,
 } from "../../../../components/VaultEligibilityGate";
 import { checkVaultEligibility } from "../../../../lib/api/vaultEligibility";
+import { VaultReferralPanel } from "../../../../components/VaultReferralPanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -507,6 +508,14 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                 <VaultEligibilityGate
                   status={eligibilityStatus}
                   walletConnected={!!token}
+                />
+
+                {/* Referral & loyalty rewards */}
+                <VaultReferralPanel
+                  walletAddress={address}
+                  token={token}
+                  vaultId={id}
+                  vaultName={vault.name}
                 />
 
                 {/* Fee disclosure */}
