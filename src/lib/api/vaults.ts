@@ -1,14 +1,17 @@
-import { apiGet, apiPost, ApiError } from "./client";
-import { bffFetch } from "./client";
+import { z } from "zod";
+import { env } from "../../env";
+import { apiGet, apiPost, ApiError, bffFetch, type RequestOptions } from "./client";
+import { ContractError, reportContractError } from "./contractError";
 import { toCsv, type CsvColumn } from "../csv";
 import freighterApi from "@stellar/freighter-api";
-import { type RequestOptions } from "./client";
 import { submitTransactionXdr } from "./stellar";
 
 /**
- * Typed data adapter for the Vaults feature.
+ * Vaults REST contract — v1 (frozen).
  *
- * Reads go through the BFF against the frozen vault REST contract:
+ * Owner: vaults. Counterpart: Zenith-options/backend. Any change to the wire
+ * shapes below is a contract change: bump VAULTS_API_VERSION and land the
+ * backend change in the same release.
  *
  * The Phase 2 options vault contract is scaffolded under `contracts/vault`
  * (crate `zenith-options-vault`), but it is not yet deployed and the backend
@@ -18,18 +21,19 @@ import { submitTransactionXdr } from "./stellar";
  * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
  * (Zenith-options/backend) through the REST contract below.
  *
- * Backend contract (for when the real API lands):
+ * Transport
+ *   All requests go through the BFF (`bffFetch`). The bearer token lives in
+ *   the httpOnly session cookie and is attached server-side; this module never
+ *   reads or sends it. GET routes are auth-optional, POST routes require a
+ *   session (see src/lib/bff/allowlist.ts).
  *
- *   GET /api/v1/vaults
- *   → VaultSummary[]
- *
- *   GET /api/v1/vaults/{id}
- *   → VaultDetail (404 → null)
- *
- * Gating lives in the page layer (`useFlag("vaults")`); this module never
- * returns placeholder data.
- *
- * Deposit/withdraw are not implemented yet (out of scope for the read path):
+ * Endpoints (all under /api/v1/vaults)
+ *   GET  /                    ?limit&cursor                 → Page<VaultRegistryEntry>
+ *   GET  /{id}                                              → VaultDetail | 404
+ *   GET  /{id}/nav            ?from&to&limit&cursor         → Page<NavPoint>
+ *   GET  /{id}/epochs         ?from&to&limit&cursor         → Page<EpochRecord>
+ *   POST /{id}/deposit        { amount }                    → { tx_id }
+ *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
@@ -124,11 +128,159 @@ import { submitTransactionXdr } from "./stellar";
  *
  * See docs/privacy/vault-data-inventory.md for the data inventory, retention
  * windows, and the deletion/export workflow this module mirrors.
+ *
+ * Wire format
+ *   - Every amount, price, share count and ratio is a decimal string
+ *     (/^-?\d+(\.\d+)?$/), never a JSON number. Amounts are USD collateral
+ *     unless the field ends in `_shares`. Ratios are fractions (0.18 = 18%).
+ *   - Instants are RFC 3339 with an offset (`*_at`, `phase_ends_at`).
+ *     Calendar dates are YYYY-MM-DD (`*_expiry`, `*_start`, `settlement_date`).
+ *   - Field names are snake_case (serde output). Unknown extra fields are
+ *     stripped; missing or mistyped fields fail validation (ContractError).
+ *
+ * Pagination and time ranges
+ *   - `cursor` is opaque. `limit` is 1–100 (default 50). `next_cursor: null`
+ *     marks the last page.
+ *   - `from` / `to` are inclusive RFC 3339 bounds. NAV points filter on `at`;
+ *     epochs filter on `settlement_date`.
+ *
+ * Error taxonomy (HTTP status → VaultsApiError.code)
+ *   401  unauthorized     Session expired. Not retried; re-authenticate.
+ *   403  forbidden        Vaults flag off, or wallet not allowlisted. Not retried.
+ *   404  not_found        getVault resolves to null.
+ *   409  epoch_closed     The epoch closed while the request was in flight.
+ *                         Not retried; the user retries in the next deposit window.
+ *   400/422 invalid_request
+ *   5xx  unavailable      Retryable.
+ *   client-side: timeout (10s), network, aborted, contract (schema violation).
+ *
+ * Degradation
+ *   Reads (list, detail, nav, epochs) that fail with a retryable error return
+ *   the last successful response for the same key in this session, so the
+ *   detail view keeps its values. Mutations (deposit, withdraw) are never
+ *   retried by the adapter and always surface their error.
+ *
+ * Mode
+ *   NEXT_PUBLIC_VAULTS=live selects the live client. Any other value (absent
+ *   or "mock") selects the mock client backed by MOCK_VAULTS. Pages import only
+ *   from this module, so flipping the flag needs no page changes.
  */
 
-export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
-export type RiskRating = "low" | "medium" | "high";
-export type EpochPhase = "deposit" | "active" | "settlement";
+export const VAULTS_API_VERSION = "v1" as const;
+const API = `/api/${VAULTS_API_VERSION}/vaults`;
+const REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+const MAX_PAGES = 20;
+
+// ---------------------------------------------------------------------------
+// Wire schemas (source of truth for the frozen contract)
+// ---------------------------------------------------------------------------
+
+const DecimalStringSchema = z.string().regex(/^-?\d+(\.\d+)?$/, "must be a decimal string");
+const InstantSchema = z.string().datetime({ offset: true });
+const DateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD");
+
+export const VaultStrategySchema = z.enum(["covered_call", "cash_secured_put", "iron_condor", "wheel"]);
+export const RiskRatingSchema = z.enum(["low", "medium", "high"]);
+export const EpochPhaseSchema = z.enum(["deposit", "active", "settlement"]);
+export const EpochOutcomeSchema = z.enum(["expired_worthless", "exercised", "active"]);
+
+/** Registry entry: one row on the /vaults listing. */
+export const VaultRegistryEntrySchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  underlying: z.string(),
+  strategy: VaultStrategySchema,
+  apy: DecimalStringSchema,
+  apy_methodology: z.string(),
+  tvl_usd: DecimalStringSchema,
+  capacity_usd: DecimalStringSchema,
+  /** tvl_usd / capacity_usd, as a fraction 0–1. */
+  utilisation: DecimalStringSchema,
+  current_strike: DecimalStringSchema,
+  current_expiry: DateSchema,
+  risk_rating: RiskRatingSchema,
+  description: z.string(),
+});
+
+export const EpochRecordSchema = z.object({
+  epoch_number: z.number().int().nonnegative(),
+  deposit_start: DateSchema,
+  active_start: DateSchema,
+  settlement_date: DateSchema,
+  strike: DecimalStringSchema,
+  expiry_days: z.number().int().nonnegative(),
+  premium_collected: DecimalStringSchema,
+  outcome: EpochOutcomeSchema,
+  /** Epoch return as a fraction; positive = profit for depositors. */
+  pnl_ratio: DecimalStringSchema,
+});
+
+export const UserPositionSchema = z.object({
+  shares: DecimalStringSchema,
+  share_value: DecimalStringSchema,
+  total_value_usd: DecimalStringSchema,
+  accrued_premium_usd: DecimalStringSchema,
+  pending_withdrawal_shares: DecimalStringSchema,
+});
+
+/** Deposit/withdraw queue state for the current epoch. */
+export const QueueStateSchema = z.object({
+  deposit_pending_usd: DecimalStringSchema,
+  withdraw_pending_shares: DecimalStringSchema,
+  settles_at: InstantSchema,
+});
+
+/** Fee accrual breakdown, accrued through `accrued_through`. */
+export const FeeAccrualSchema = z.object({
+  management_accrued_usd: DecimalStringSchema,
+  performance_accrued_usd: DecimalStringSchema,
+  accrued_through: InstantSchema,
+});
+
+/** Full vault detail, including the current epoch and a bounded recent-epoch window. */
+export const VaultDetailSchema = VaultRegistryEntrySchema.extend({
+  current_epoch: z.number().int().nonnegative(),
+  current_phase: EpochPhaseSchema,
+  phase_ends_at: InstantSchema,
+  share_price: DecimalStringSchema,
+  total_shares: DecimalStringSchema,
+  fee_structure: z.object({
+    management_pct: DecimalStringSchema,
+    performance_pct: DecimalStringSchema,
+  }),
+  payoff_explanation: z.string(),
+  queue: QueueStateSchema,
+  fees: FeeAccrualSchema,
+  recent_epochs: z.array(EpochRecordSchema),
+  user_position: UserPositionSchema.nullable(),
+});
+
+export const NavPointSchema = z.object({
+  at: InstantSchema,
+  share_price: DecimalStringSchema,
+  total_shares: DecimalStringSchema,
+});
+
+export const DepositResponseSchema = z.object({ tx_id: z.string().min(1) });
+export const WithdrawResponseSchema = z.object({ tx_id: z.string().min(1), queued: z.boolean() });
+
+export type VaultRegistryEntryWire = z.infer<typeof VaultRegistryEntrySchema>;
+export type VaultDetailWire = z.infer<typeof VaultDetailSchema>;
+export type EpochRecordWire = z.infer<typeof EpochRecordSchema>;
+export type NavPointWire = z.infer<typeof NavPointSchema>;
+
+const pageOf = <T extends z.ZodTypeAny>(item: T) =>
+  z.object({ items: z.array(item), next_cursor: z.string().nullable() });
+
+// ---------------------------------------------------------------------------
+// UI types (camelCase, display-ready)
+// ---------------------------------------------------------------------------
+
+export type VaultStrategy = z.infer<typeof VaultStrategySchema>;
+export type RiskRating = z.infer<typeof RiskRatingSchema>;
+export type EpochPhase = z.infer<typeof EpochPhaseSchema>;
 
 /**
  * Execution mode of a vault strategy.
@@ -169,26 +321,6 @@ export interface InflationDefenseConfig {
   navJumpGuardPct: number;
   /** Classification of direct token transfers to the contract. */
   directTransferPolicy: DirectTransferPolicy;
-}
-
-/**
- * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
- * on one vault has no implicit authority over any other vault.
- *
- * - depositor: may deposit and withdraw/redeem
- * - operator: may set strategy parameters and roll epochs
- * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
- * - emergency_authority: protocol-level emergency authority, scoped to this vault
- */
-export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
-
-/** One role assignment on a vault. */
-export interface VaultRoleGrant {
-  role: VaultRole;
-  /** Account address of the role holder. */
-  holder: string;
-  /** ISO timestamp of when the role was granted. */
-  grantedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +393,26 @@ export function applyVaultTransition(
 }
 
 /**
+ * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
+ * on one vault has no implicit authority over any other vault.
+ *
+ * - depositor: may deposit and withdraw/redeem
+ * - operator: may set strategy parameters and roll epochs
+ * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
+ * - emergency_authority: protocol-level emergency authority, scoped to this vault
+ */
+export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
+
+/** One role assignment on a vault. */
+export interface VaultRoleGrant {
+  role: VaultRole;
+  /** Account address of the role holder. */
+  holder: string;
+  /** ISO timestamp of when the role was granted. */
+  grantedAt: string;
+}
+
+/**
  * Summary shown on the /vaults listing page. Fields the backend does not
  * serve yet are `null` and must render as absent, never as zero.
  */
@@ -280,6 +432,8 @@ export interface VaultSummary {
   tvl: number | null;
   /** Maximum TVL before the vault is full. */
   capacity: number | null;
+  /** tvl / capacity (0–1). */
+  utilisation: number;
   currentStrike: number | null;
   currentExpiry: string | null; // ISO date
   riskRating: RiskRating;
@@ -484,16 +638,16 @@ export function fmtStrike(n: number) {
     : `$${n.toFixed(4)}`;
 }
 
-/** One historical epoch record. */
+/** One epoch record. */
 export interface EpochRecord {
   epochNumber: number;
-  depositStart: string; // ISO
+  depositStart: string; // ISO date
   activeStart: string;
   settlementDate: string;
   strike: number;
   expiryDays: number;
   premiumCollected: number; // per share, in USD
-  outcome: "expired_worthless" | "exercised" | "active";
+  outcome: z.infer<typeof EpochOutcomeSchema>;
   pnlPct: number; // epoch return, positive = profit for depositors
 }
 
@@ -603,200 +757,26 @@ export interface PromotionCriteria {
   invariantViolations: number;
 }
 
+export interface QueueState {
+  depositPendingUsd: number;
+  withdrawPendingShares: number;
+  settlesAt: string; // ISO
+}
+
+export interface FeeAccrual {
+  managementAccruedUsd: number;
+  performanceAccruedUsd: number;
+  accruedThrough: string; // ISO
+}
+
+export interface NavPoint {
+  at: string; // ISO
+  sharePrice: number;
+  totalShares: number;
+}
+
 /** Full detail for a single vault. */
 export interface VaultDetail extends VaultSummary {
   /** Null until the first epoch has started. */
   currentEpoch: number | null;
-  currentPhase: EpochPhase | null;
-  phaseEndsAt: string | null; // ISO — when the current phase ends
-  sharePrice: number | null; // current NAV per share in USD; null or 0 = no NAV
-  totalShares: number;
-  /** Internal book value backing shares (source of truth for NAV). */
-  bookValue: number;
-  feeStructure: { managementPct: number; performancePct: number };
-  /** Per-vault inflation / donation-attack defense parameters. */
-  inflationDefense: InflationDefenseConfig;
-  payoffExplanation: string;
-  historicalEpochs: EpochRecord[];
-  userPosition: UserVaultPosition | null;
-  /**
-   * Shadow (paper-trading) state. Present only when `mode === "shadow"`.
-   * Never merged into live fields above.
-   */
-  shadow?: ShadowState;
-  /** Promotion gate thresholds; present for shadow runs. */
-  promotionCriteria?: PromotionCriteria;
-  /** Role assignments scoped to this vault only. */
-  roles: VaultRoleGrant[];
-}
-
-/**
- * Compute the number of shares minted for a deposit, using the same
- * virtual-offset integer formula as the contract. NAV is derived from
- * internal book value only — never from the raw token balance.
- *
- * shares = amount * (totalShares + virtualShares) / (bookValue + virtualAssets)
- *
- * Returns 0 when the deposit would round to zero shares, so callers can
- * reject it rather than silently forfeiting the depositor's assets.
- */
-export function quoteSharesOut(
-  amount: number,
-  bookValue: number,
-  totalShares: number,
-  defense: Pick<InflationDefenseConfig, "virtualShares" | "virtualAssets">,
-): number {
-  if (amount <= 0) return 0;
-  const denom = bookValue + defense.virtualAssets;
-  if (denom <= 0) return 0;
-  return Math.floor((amount * (totalShares + defense.virtualShares)) / denom);
-}
-
-/**
- * Enforce the per-deposit `minSharesOut` bound in the deposit path.
- * Throws if the quoted shares fall below the caller's bound or round to
- * zero, guaranteeing honest depositors never receive zero shares for a
- * non-zero deposit.
- */
-export function assertMinSharesOut(quotedShares: number, minSharesOut: number): void {
-  if (quotedShares <= 0) {
-    throw new Error("Deposit would mint zero shares; increase amount or lower NAV impact");
-  }
-  if (quotedShares < minSharesOut) {
-    throw new Error(`Slippage: quoted ${quotedShares} shares < minSharesOut ${minSharesOut}`);
-  }
-}
-
-/**
- * Evaluate the promotion gate for a shadow run. Returns the list of
- * unmet criteria; an empty list means the strategy may be promoted to
- * live allocation. Mirrors the backend gate so the operator console can
- * block promotion when criteria are unmet.
- */
-export function evaluatePromotionGate(
-  shadow: ShadowState,
-  criteria: PromotionCriteria,
-): string[] {
-  const unmet: string[] = [];
-  if (shadow.comparison.completedEpochs < criteria.minCompleteEpochs) {
-    unmet.push(
-      `Only ${shadow.comparison.completedEpochs}/${criteria.minCompleteEpochs} complete epochs`,
-    );
-  }
-  if (Math.abs(shadow.comparison.shadowVsExpectedDelta) > criteria.maxNavDeviation) {
-    unmet.push(
-      `NAV deviation ${shadow.comparison.shadowVsExpectedDelta} exceeds bound ${criteria.maxNavDeviation}`,
-    );
-  }
-  if (criteria.invariantViolations > 0) {
-    unmet.push(`${criteria.invariantViolations} invariant violation(s) recorded`);
-  }
-  return unmet;
-}
-
-// ---------------------------------------------------------------------------
-// Share-lot accounting (cost basis, realized and unrealized PnL)
-//
-// Shared by the API and any client-side display. Rebuilding the ledger from
-// the same event stream always yields the same output: events are ordered by
-// (ledger, seq) and lots by (acquiredLedger, lotId). Schema: docs/vault-lot-ledger.md
-// ---------------------------------------------------------------------------
-
-/** Lot relief method. Stored on every ledger row so a future change cannot rewrite history. */
-export type LotReliefMethod = "fifo";
-export const DEFAULT_LOT_RELIEF_METHOD: LotReliefMethod = "fifo";
-
-/** Share amounts at or below this are rounding residue, never a lot. */
-export const DUST_SHARES = 1e-9;
-
-/** A dated acquisition lot held by one depositor in one vault. */
-export interface VaultShareLot {
-  lotId: string;
-  vaultId: string;
-  acquiredLedger: number;
-  acquiredAt: string; // ledger close time (ISO), never receipt time
-  /** Shares still held from this lot. */
-  shares: number;
-  /** Cost basis still attached to the remaining shares, in USD. */
-  costUsd: number;
-  /** NAV per share used when the shares were minted. */
-  navPerShare: number;
-}
-
-/** A lot-affecting event as indexed from the vault contract. */
-export interface VaultLotEvent {
-  seq: number;
-  kind: "deposit" | "transfer_in" | "redemption" | "transfer_out";
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  /** deposit/transfer_in: cost in USD. redemption/transfer_out: gross proceeds in USD. */
-  amountUsd: number;
-  /** Fees that reduce proceeds. Management fees are already reflected in NAV and are not repeated here. */
-  feesUsd: number;
-  navPerShare: number;
-}
-
-/** One ledger row per lot-affecting event. This is the export row. */
-export interface VaultLedgerRow {
-  seq: number;
-  kind: VaultLotEvent["kind"];
-  ledger: number;
-  ledgerAt: string;
-  vaultId: string;
-  shares: number;
-  amountUsd: number;
-  feesUsd: number;
-  navPerShare: number;
-  costBasisUsd: number;
-  realizedPnlUsd: number;
-  lotMethod: LotReliefMethod;
-}
-
-export interface LotRelief {
-  shares: number;
-  costBasisUsd: number;
-  /** Gross proceeds minus fees. */
-  netProceedsUsd: number;
-  realizedPnlUsd: number;
-  consumed: { lotId: string; shares: number; costUsd: number }[];
-  remainingLots: VaultShareLot[];
-}
-
-function byLotOrder(a: VaultShareLot, b: VaultShareLot): number {
-  return a.acquiredLedger - b.acquiredLedger || a.lotId.localeCompare(b.lotId);
-}
-
-/**
- * Relieves `shares` from the lots in FIFO order and returns the realized PnL.
- * Throws rather than producing a negative basis when `shares` exceeds the tracked lots.
- */
-export function relieveLotsFifo(
-  lots: VaultShareLot[],
-  shares: number,
-  grossProceedsUsd: number,
-  feesUsd: number
-): LotRelief {
-  if (!(shares > DUST_SHARES)) throw new Error(`Relief quantity must be positive, got ${shares}`);
-  if (feesUsd < 0) throw new Error(`Fees cannot be negative, got ${feesUsd}`);
-  const available = lots.reduce((sum, lot) => sum + lot.shares, 0);
-  if (shares > available + DUST_SHARES) {
-    throw new Error(`Cannot relieve ${shares} shares: only ${available} tracked`);
-  }
-
-  let remaining = shares;
-  let costBasisUsd = 0;
-  const consumed: LotRelief["consumed"] = [];
-  const remainingLots: VaultShareLot[] = [];
-
-  for (const lot of [...lots].sort(byLotOrder)) {
-    if (remaining <= DUST_SHARES) {
-      remainingLots.push(lot);
-      continue;
-    }
-    const take = Math.min(lot.shares, remaining);
-    const costUsd = lot.shares > 0 ? lot.costUsd * (take / lot.shares) : 0;
-    remaining -= take;
-    costBasisUsd += costUsd;
-    consumed.push({ lotId
+ 
