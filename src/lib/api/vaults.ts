@@ -22,7 +22,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}/epoch-schedule?count=N
  *   → EpochBoundaryPreview   (dry-run: next N boundaries, no side effects)
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -114,6 +117,9 @@ import { apiGet, apiPost } from "./client";
  * windows, and the deletion/export workflow this module mirrors.
  */
 
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -793,19 +799,3 @@ export function computeBoundaryMs(config: EpochScheduleConfig, epochIndex: numbe
   const targetYear = anchor.getUTCFullYear() + Math.floor(targetMonthIndex / 12);
   const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
   const lastDayOfMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
-  const targetDay = Math.min(anchorDay, lastDayOfMonth);
-
-  return Date.UTC(
-    targetYear,
-    targetMonth,
-    targetDay,
-    anchorHour,
-    anchorMinute,
-    anchorSecond,
-    anchorMillis,
-  );
-}
-
-/** Pure boundary computation returning an ISO-8601 UTC string. */
-export function computeBoundary(config: EpochScheduleConfig, epochIndex: number): string {
-  return new Date(compute
