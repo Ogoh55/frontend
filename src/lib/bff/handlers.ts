@@ -27,7 +27,7 @@ export function upstreamUrl(): string {
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const FORWARDED_REQUEST_HEADERS = ["content-type", "accept", "accept-language"];
+const FORWARDED_REQUEST_HEADERS = ["content-type", "accept", "accept-language", "idempotency-key"];
 // content-length / content-encoding are deliberately not forwarded: fetch()
 // has already decoded the upstream body, so they would no longer be accurate.
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "etag", "last-modified", "retry-after"];

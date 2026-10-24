@@ -1,0 +1,8 @@
+[package]
+name = "vault-strategies"
+version = "0.1.0"
+edition = "2021"
+description = "Covered call, cash-secured put, iron condor and wheel strategy modules"
+
+[dependencies]
+vault-core = { path = "../core" }
