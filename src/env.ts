@@ -32,6 +32,10 @@ const parsed = parseEnv({
   NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
   NEXT_PUBLIC_STATUS_PAGE_URL: process.env.NEXT_PUBLIC_STATUS_PAGE_URL,
   NEXT_PUBLIC_INCIDENT_FEED_URL: process.env.NEXT_PUBLIC_INCIDENT_FEED_URL,
+  OTEL_EXPORTER_OTLP_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  OTEL_SERVICE_NAME: process.env.OTEL_SERVICE_NAME,
+  OTEL_TRACES_SAMPLER: process.env.OTEL_TRACES_SAMPLER,
+  OTEL_TRACES_SAMPLER_ARG: process.env.OTEL_TRACES_SAMPLER_ARG,
   SOROBAN_RPC_URLS: process.env.SOROBAN_RPC_URLS,
   SOROBAN_RPC_MAX_CONCURRENCY: process.env.SOROBAN_RPC_MAX_CONCURRENCY,
   SOROBAN_RPC_MAX_ATTEMPTS: process.env.SOROBAN_RPC_MAX_ATTEMPTS,
@@ -282,6 +286,31 @@ export const statusPageConfig: StatusPageConfig = {
 export function isStatusPageConfigured(): boolean {
   return Boolean(statusPageConfig.statusPageUrl);
 }
+
+
+/**
+ * Distributed tracing configuration (issue #299).
+ *
+ * Traces are exported to the existing observability backend via OTLP. The
+ * sampler is parent-based with a ratio so that error traces are never dropped:
+ * the tail-sampling guarantee is enforced by the collector, while the head
+ * sampler here keeps the hot read path cheap. `OTEL_TRACES_SAMPLER_ARG` is the
+ * ratio for non-error spans; error spans are always recorded.
+ */
+export const tracingConfig = {
+  /** OTLP collector endpoint; unset disables export (spans still created locally). */
+  exporterEndpoint: parsed.OTEL_EXPORTER_OTLP_ENDPOINT,
+  /** Service name reported to the trace backend. */
+  serviceName: parsed.OTEL_SERVICE_NAME ?? "vault-frontend",
+  /** Head sampler strategy; defaults to parent-based ratio sampling. */
+  sampler: parsed.OTEL_TRACES_SAMPLER ?? "parentbased_traceidratio",
+  /** Ratio for non-error spans (0–1). Error traces are always sampled. */
+  samplerArg: Number.parseFloat(parsed.OTEL_TRACES_SAMPLER_ARG ?? "0.1"),
+  /** Header carrying the correlation ID across BFF → backend → indexer hops. */
+  correlationHeader: "x-correlation-id",
+  /** Maximum accepted length of an inbound correlation ID (bytes). */
+  maxCorrelationIdLength: 128,
+} as const;
 
 /**
  * Soroban RPC resilience configuration (issue #282).

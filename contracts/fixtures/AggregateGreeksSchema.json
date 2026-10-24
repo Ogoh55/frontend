@@ -1,1 +1,34 @@
-{"delta":0.5,"gamma":0.01,"theta":-0.02,"vega":0.1}
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AggregateGreeks",
+  "description": "Vault-level aggregate Greeks computed from open written positions via the shared pricing library. Consumed by the delta-hedging policy to decide whether exposure has drifted outside the configured band.",
+  "type": "object",
+  "required": ["delta", "gamma", "theta", "vega"],
+  "properties": {
+    "delta": {
+      "type": "number",
+      "description": "Aggregate portfolio delta (net directional exposure)."
+    },
+    "gamma": {
+      "type": "number",
+      "description": "Aggregate portfolio gamma (delta sensitivity to underlying moves)."
+    },
+    "theta": {
+      "type": "number",
+      "description": "Aggregate portfolio theta (time decay)."
+    },
+    "vega": {
+      "type": "number",
+      "description": "Aggregate portfolio vega (volatility sensitivity)."
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "delta": 0.5,
+      "gamma": 0.01,
+      "theta": -0.02,
+      "vega": 0.1
+    }
+  ]
+}

@@ -83,6 +83,11 @@ import { submitTransactionXdr } from "./stellar";
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
+ *   GET  /api/v1/vaults/{id}/orders    → VaultOrder[]
+ *   POST /api/v1/vaults/{id}/orders    { side, shares, price, partial, expiresAt } → VaultOrder
+ *   POST /api/v1/vaults/{id}/orders/{orderId}/fill { shares } → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/orders/{orderId}/cancel → { tx_id: string }
+ *
  *   GET /api/v1/vaults/positions
  *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
  *
@@ -914,6 +919,132 @@ export class VaultApiError extends Error {
     super(message);
     this.name = "VaultApiError";
   }
+/** Instrument used to hedge a vault's directional exposure. */
+export type HedgeInstrument = "underlying" | "perp" | "futures";
+
+/**
+ * Per-vault delta-hedging policy (issue #297).
+ *
+ * The policy is enforced on-chain; the keeper service only proposes hedge
+ * trades. A disabled policy or an engaged kill switch must result in zero
+ * hedge trades. `maxHedgeNotional` is a hard cap in USD that the contract
+ * clamps against so an off-chain bug cannot overshoot.
+ */
+export interface HedgePolicy {
+  /** Master enable flag. When false, no hedge trades are ever executed. */
+  enabled: boolean;
+  /** Hard kill switch — overrides `enabled` and halts all hedging. */
+  killSwitch: boolean;
+  /** Target portfolio delta (e.g. 0 = delta-neutral). */
+  targetDelta: number;
+  /** Allowed drift around the target before a rehedge is triggered. */
+  deltaTolerance: number;
+  /** Instrument used to execute hedge trades. */
+  hedgeInstrument: HedgeInstrument;
+  /** Maximum absolute hedge notional in USD, enforced in-contract. */
+  maxHedgeNotional: number;
+  /** Minimum seconds between rehedges to rate-limit hedge churn. */
+  rehedgeIntervalSecs: number;
+}
+
+/** Current hedge status surfaced for a vault. */
+export interface HedgeStatus {
+  policy: HedgePolicy;
+  /** Aggregate portfolio delta of open written positions. */
+  portfolioDelta: number;
+  /** Aggregate portfolio gamma (informational). */
+  portfolioGamma: number;
+  /** Aggregate portfolio vega (informational). */
+  portfolioVega: number;
+  /** Current hedge position notional in USD (signed). */
+  hedgeNotional: number;
+  /** Whether the current delta is outside the configured band. */
+  outsideBand: boolean;
+  /** Timestamp of the last executed hedge trade, if any. */
+  lastHedgeAt: string | null;
+  /** True when the price feed is stale and hedging is failing safe. */
+  staleOracle: boolean;
+}
+
+/** A single hedge trade recorded in the epoch ledger. */
+export interface HedgeTrade {
+  epochNumber: number;
+  timestamp: string; // ISO
+  instrument: HedgeInstrument;
+  /** Signed notional in USD (positive = long hedge, negative = short). */
+  notional: number;
+  /** Realized hedge P&L in USD, attributed separately from option premium. */
+  hedgePnl: number;
+  /** Portfolio delta before and after the hedge. */
+  deltaBefore: number;
+  deltaAfter: number;
+}
+
+// ---------------------------------------------------------------------------
+// Secondary transfer facility (issue #300)
+// ---------------------------------------------------------------------------
+
+/** Side of a secondary-market order for vault LP shares. */
+export type VaultOrderSide = "bid" | "offer";
+
+/** Lifecycle state of a secondary-market order. */
+export type VaultOrderStatus =
+  | "open"
+  | "partially_filled"
+  | "filled"
+  | "cancelled"
+  | "expired";
+
+/**
+ * A resting or immediately-fillable order for vault LP shares.
+ *
+ * Price is denominated in the vault's share-price terms (USD per share) and
+ * must sit inside the configurable band around the latest attested NAV. The
+ * contract re-verifies price band, expiry, nonce and parties at settlement,
+ * so the off-chain store is only a discovery surface.
+ */
+export interface VaultOrder {
+  id: string;
+  vaultId: string;
+  /** Tranche identifier when the vault is tranched; null for single-tranche. */
+  tranche: string | null;
+  side: VaultOrderSide;
+  /** Maker (order owner) address. */
+  maker: string;
+  /** Remaining shares available to fill. */
+  shares: number;
+  /** Original order size in shares. */
+  originalShares: number;
+  /** Limit price in USD per share. */
+  price: number;
+  /** Whether the order may be partially filled. */
+  partial: boolean;
+  status: VaultOrderStatus;
+  /** ISO timestamp after which the order can no longer be filled. */
+  expiresAt: string;
+  createdAt: string;
+  /** Replay-protection nonce signed into the order parameters. */
+  nonce: number;
+}
+
+/**
+ * Configurable pricing band around the latest attested NAV for a vault's
+ * secondary transfer facility. Prices outside `[nav*(1-discount), nav*(1+premium)]`
+ * are rejected at order creation and at settlement.
+ */
+export interface VaultOrderPricingBand {
+  /** Maximum premium over NAV, e.g. 0.05 = +5%. */
+  maxPremiumPct: number;
+  /** Maximum discount under NAV, e.g. 0.05 = -5%. */
+  maxDiscountPct: number;
+  /** Latest attested NAV per share used as the band anchor. */
+  attestedNav: number;
+  /** ISO timestamp of the NAV attestation. */
+  attestedAt: string;
+  /** True when the attestation is stale or under dispute; settlement is blocked. */
+  stale: boolean;
+  /** True when a NAV dispute is open; settlement is blocked. */
+  disputed: boolean;
 }
 
 /**
