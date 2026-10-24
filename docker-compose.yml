@@ -5,7 +5,7 @@ version: "3.9"
 #
 # Profiles:
 #   (default)  — frontend only, mock mode enabled (no backend required)
-#   full       — frontend + backend API
+#   full       — frontend + backend API + internal services (indexer, scheduler, keeper)
 #
 # Quick start:
 #   docker compose up                     # mock mode, frontend only
@@ -14,6 +14,15 @@ version: "3.9"
 # Runtime overrides (copy .env.compose.example to .env.compose and edit):
 #   ZENITH_BACKEND_IMAGE   backend image tag (default: ghcr.io/zenith-options/backend:latest)
 #   ZENITH_FRONTEND_IMAGE  frontend image tag (default: ghcr.io/zenith-options/frontend:latest)
+#
+# Trust boundaries (see docs/network-surfaces.md):
+#   - Only `frontend` (BFF) and `backend` (API) publish host ports.
+#   - `indexer`, `scheduler`, `keeper` live on the internal `vault-internal`
+#     network only and are NOT publicly routable.
+#   - Service-to-service calls use short-lived signed service tokens
+#     (SERVICE_TOKEN_*) sourced from a managed secret store; no static
+#     bearer secrets are inlined here.
+#   - Outbound egress is restricted to the allowlist in `vault-egress`.
 # ---------------------------------------------------------------------------
 
 services:
@@ -34,6 +43,13 @@ services:
       NEXT_PUBLIC_NETWORK: ${NEXT_PUBLIC_NETWORK:-testnet}
       NEXT_PUBLIC_CONTRACT_ID: ${NEXT_PUBLIC_CONTRACT_ID:-}
       MOCK_MODE: ${MOCK_MODE:-true}
+      # Service identity for outbound calls to the API (short-lived, rotated).
+      SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
+      SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
+      SERVICE_TOKEN_SCOPE: ${SERVICE_TOKEN_SCOPE:-bff:read}
+    networks:
+      - vault-public
+      - vault-internal
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
       interval: 30s
@@ -49,6 +65,13 @@ services:
       - "8081:8081"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
+      # Verifies inbound service tokens; signing keys come from the managed store.
+      SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
+      SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
+      SERVICE_TOKEN_CLOCK_SKEW_SECS: ${SERVICE_TOKEN_CLOCK_SKEW_SECS:-30}
+    networks:
+      - vault-public
+      - vault-internal
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
@@ -56,3 +79,70 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Internal services — no published ports, internal network only.
+  # Each carries a narrow scope claim; least-privilege by construction.
+  # -------------------------------------------------------------------------
+  indexer:
+    profiles: ["full"]
+    image: ${ZENITH_BACKEND_IMAGE:-ghcr.io/zenith-options/backend:latest}
+    command: ["indexer"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
+      SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
+      # Read-only: cannot submit transactions.
+      SERVICE_TOKEN_SCOPE: ${INDEXER_SERVICE_TOKEN_SCOPE:-indexer:read}
+      SERVICE_TOKEN_CLOCK_SKEW_SECS: ${SERVICE_TOKEN_CLOCK_SKEW_SECS:-30}
+    networks:
+      - vault-internal
+      - vault-egress
+    restart: unless-stopped
+
+  scheduler:
+    profiles: ["full"]
+    image: ${ZENITH_BACKEND_IMAGE:-ghcr.io/zenith-options/backend:latest}
+    command: ["scheduler"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
+      SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
+      SERVICE_TOKEN_SCOPE: ${SCHEDULER_SERVICE_TOKEN_SCOPE:-scheduler:epoch}
+      SERVICE_TOKEN_CLOCK_SKEW_SECS: ${SERVICE_TOKEN_CLOCK_SKEW_SECS:-30}
+    networks:
+      - vault-internal
+      - vault-egress
+    restart: unless-stopped
+
+  keeper:
+    profiles: ["full"]
+    image: ${ZENITH_BACKEND_IMAGE:-ghcr.io/zenith-options/backend:latest}
+    command: ["keeper"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      SERVICE_TOKEN_ISSUER: ${SERVICE_TOKEN_ISSUER:-}
+      SERVICE_TOKEN_AUDIENCE: ${SERVICE_TOKEN_AUDIENCE:-backend}
+      # Keeper must not read depositor PII; scope excludes pii:read.
+      SERVICE_TOKEN_SCOPE: ${KEEPER_SERVICE_TOKEN_SCOPE:-keeper:settle}
+      SERVICE_TOKEN_CLOCK_SKEW_SECS: ${SERVICE_TOKEN_CLOCK_SKEW_SECS:-30}
+    networks:
+      - vault-internal
+      - vault-egress
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------------
+# Networks encode the trust boundaries:
+#   vault-public   — externally reachable (BFF + API only)
+#   vault-internal — service-to-service only, not routable from host
+#   vault-egress   — outbound allowlist (Stellar RPC, Horizon, price feeds,
+#                    notification providers); denied egress is logged/alerted
+# ---------------------------------------------------------------------------
+networks:
+  vault-public:
+    driver: bridge
+  vault-internal:
+    driver: bridge
+    internal: true
+  vault-egress:
+    driver: bridge
