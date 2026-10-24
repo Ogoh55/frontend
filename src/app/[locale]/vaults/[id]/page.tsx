@@ -8,6 +8,7 @@ import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
 import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
@@ -62,6 +63,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const token = useWalletStore(s => s.session);
   const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
+  const { keyFor, complete } = useIdempotencyKey();
   const t = useTranslations("vaultDisclosure");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
@@ -156,11 +158,15 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        idempotencyKey: keyFor({ vault: vault.id, amount }),
         enabled: vaultsEnabled,
       });
+      complete();
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
+      // Reconcile the displayed position with backend truth.
+      fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
       setTxStatus(null);
       if (e instanceof VaultPolicyError) {
@@ -598,13 +604,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             opacity: txStatus === "pending" || !currentAck || gateReason ? 0.6 : 1,
                           }}
                         >
-                          {txStatus === "pending" ? "Confirming…" : "Deposit"}
-                        </button>
-                      </div>
-                    )}
-
-                    {activeFlow === "withdraw" && permittedActions.includes("withdraw") && (
-                      <div style={{ padding: 16 }}>
-                        <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
-                          Withdrawal requests are queued and processed at the end of the current epoch.
-                          Shares are redeemed at the
+                          {txStatus === "pending" ? "Confirming
