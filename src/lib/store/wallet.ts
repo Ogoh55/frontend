@@ -62,3 +62,12 @@ export const useWalletStore = create<WalletState>()(
     },
   ),
 );
+
+/**
+ * Selector for the currently connected account address.
+ *
+ * Vault transaction history is scoped per-account; consumers should read the
+ * address through this selector so the history surface re-renders when the
+ * connected wallet changes (e.g. account switch or disconnect).
+ */
+export const selectAccountAddress = (s: WalletState): string | null => s.address;

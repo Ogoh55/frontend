@@ -7,6 +7,17 @@ import freighterApi from "@stellar/freighter-api";
 import { submitTransactionXdr } from "./stellar";
 
 /**
+ * Vault transaction receipts client.
+ *
+ * Receipts are keyed by the client-generated idempotency key so an optimistic
+ * UI row and a later backend row collapse into a single record. Amounts are
+ * carried as decimal strings (never floats) to preserve precision.
+ *
+ * This module also exposes the read-only diagnostics client used by the
+ * internal depositor support console. The diagnostics client is issued a
+ * read-scoped token and only ever calls GET endpoints, so a UI regression
+ * cannot escalate into a state-changing call.
+ *
  * Vaults REST contract — v1 (frozen).
  *
  * Owner: vaults. Counterpart: Zenith-options/backend. Any change to the wire
@@ -254,6 +265,7 @@ import { submitTransactionXdr } from "./stellar";
  *   or "mock") selects the mock client backed by MOCK_VAULTS. Pages import only
  *   from this module, so flipping the flag needs no page changes.
  */
+import { useWalletStore } from '@/lib/store/wallet';
 
 export const VAULTS_API_VERSION = "v1" as const;
 const API = `/api/${VAULTS_API_VERSION}/vaults`;
@@ -306,6 +318,41 @@ export function decodeVaultEvent(raw: Record<string, unknown>): VaultEventEnvelo
     );
   }
   return raw as VaultEventEnvelope & Record<string, unknown>;
+}
+
+export type VaultTxType =
+  | 'deposit'
+  | 'redemption_request'
+  | 'redemption'
+  | 'epoch_payout'
+  | 'fee_charge';
+
+export type VaultTxStatus =
+  | 'pending'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed'
+  | 'reconciled';
+
+export interface VaultReceipt {
+  /** Client-generated idempotency key — the canonical receipt identity. */
+  idempotencyKey: string;
+  vaultId: string;
+  account: string;
+  type: VaultTxType;
+  /** Decimal string, e.g. "1000.00". */
+  amount: string;
+  /** Decimal string share delta (positive for deposits, negative for redemptions). */
+  shareDelta: string;
+  /** NAV that applied at execution, as a decimal string. Null until known. */
+  navAtExecution: string | null;
+  /** Fee charged, as a decimal string. */
+  fee: string;
+  status: VaultTxStatus;
+  /** Stellar transaction hash — only present once submitted. */
+  txHash: string | null;
+  /** ISO timestamp of the last status change. */
+  updatedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,77 +1269,97 @@ export interface VaultEpochLedgerEntry {
   collateralYield?: CollateralYieldLedgerEntry;
 }
 
-/** The user's position in a vault. */
-export interface UserVaultPosition {
-  shares: number;
-  shareValue: number; // current USD value per share
-  totalValue: number;
-  accruedPremium: number;
-  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
+export interface VaultHistoryFilters {
+  vaultId?: string;
+  account?: string;
 }
 
-export type WithdrawalStatus = "queued" | "processed" | "cancelled";
+export interface VaultHistoryResult {
+  receipts: VaultReceipt[];
+  /** True when the backend could not be reached and data is degraded. */
+  degraded: boolean;
+}
 
-/** One redemption request in a vault's withdrawal queue. */
-export interface WithdrawalRequest {
-  id: string;
-  vaultId: string;
-  /** Epoch the request was made in. Earlier epochs are served first. */
-  requestEpoch: number;
-  /** Monotonic tie-break within an epoch, assigned at request time. */
-  seq: number;
-  /** ISO time of the original request. Kept when unfilled requests carry forward. */
-  requestedAt: string;
-  requestedShares: number;
-  /** Shares still escrowed and not yet redeemed. */
-  escrowedShares: number;
-  filledShares: number;
-  /** filledShares / requestedShares, 0–1. Updated on every processing pass. */
-  fillFraction: number;
-  /** USD paid out, summed over every pass at that pass's processing NAV. */
-  payoutUsd: number;
-  status: WithdrawalStatus;
+const RECEIPTS_STORAGE_KEY = 'zenith.vault.receipts.v1';
+
+function readLocalReceipts(): VaultReceipt[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(RECEIPTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as VaultReceipt[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalReceipts(receipts: VaultReceipt[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(RECEIPTS_STORAGE_KEY, JSON.stringify(receipts));
+  } catch {
+    // Storage may be unavailable (private mode / quota) — receipts still live
+    // in memory for the session.
+  }
 }
 
 /**
- * One point in a hypothetical NAV-per-share series produced by a shadow
- * run. Kept in its own namespace so it can never be read as live NAV.
+ * Persist a receipt keyed by its idempotency key. Re-submitting the same key
+ * updates the existing record instead of creating a duplicate.
  */
-export interface ShadowNavPoint {
-  epochNumber: number;
-  /** Hypothetical NAV per share in USD (paper trading only). */
-  navPerShare: number;
-  /** NAV per share the strategy model expected for this epoch. */
-  expectedNavPerShare: number;
-  /** ISO timestamp the shadow epoch settled. */
-  recordedAt: string;
+export function upsertReceipt(receipt: VaultReceipt): void {
+  const existing = readLocalReceipts();
+  const idx = existing.findIndex(
+    (r) => r.idempotencyKey === receipt.idempotencyKey,
+  );
+  if (idx >= 0) {
+    existing[idx] = receipt;
+  } else {
+    existing.push(receipt);
+  }
+  writeLocalReceipts(existing);
 }
 
 /**
- * Side-by-side comparison of a shadow run against live and expected
- * performance. All shadow figures are paper trading and must be labeled
- * as such in the UI.
+ * Fetch vault receipts for the given filters. Falls back to locally persisted
+ * receipts when the backend is unreachable so the surface never renders blank.
  */
-export interface ShadowComparison {
-  /** Latest hypothetical NAV per share from the shadow run. */
-  shadowNavPerShare: number;
-  /** Latest realized NAV per share of the live vault (null if none). */
-  liveNavPerShare: number | null;
-  /** NAV per share the strategy model expected for the latest epoch. */
-  expectedNavPerShare: number;
-  /** Shadow minus live NAV per share (null when no live history). */
-  shadowVsLiveDelta: number | null;
-  /** Shadow minus expected NAV per share. */
-  shadowVsExpectedDelta: number;
-  /** Number of complete shadow epochs recorded so far. */
-  completedEpochs: number;
+export async function fetchVaultHistory(
+  filters: VaultHistoryFilters = {},
+): Promise<VaultHistoryResult> {
+  const account = filters.account ?? useWalletStore.getState().address ?? undefined;
+  const local = readLocalReceipts().filter(
+    (r) =>
+      (!filters.vaultId || r.vaultId === filters.vaultId) &&
+      (!account || r.account === account),
+  );
+
+  try {
+    const params = new URLSearchParams();
+    if (filters.vaultId) params.set('vaultId', filters.vaultId);
+    if (account) params.set('account', account);
+    const res = await fetch(`/api/vaults/history?${params.toString()}`);
+    if (!res.ok) throw new Error(`history ${res.status}`);
+    const remote = (await res.json()) as VaultReceipt[];
+
+    // Collapse remote rows with local optimistic rows by idempotency key.
+    const merged = new Map<string, VaultReceipt>();
+    for (const r of local) merged.set(r.idempotencyKey, r);
+    for (const r of remote) merged.set(r.idempotencyKey, r);
+    return { receipts: Array.from(merged.values()), degraded: false };
+  } catch {
+    return { receipts: local, degraded: true };
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Read-only diagnostics client (internal depositor support console)
+// ---------------------------------------------------------------------------
+
 /**
- * Shadow (paper-trading) state for a vault strategy. Tracked in its own
- * namespace, with its own hypothetical NAV series and epoch stream, so
- * the registry, indexer, and this read model never conflate it with real
- * balances.
+ * The only lookup keys the diagnostics console accepts. Each maps to a single
+ * consolidated diagnostic view returned by the read-only backend endpoint.
  */
 export interface ShadowState {
   /** Always `shadow` — makes the paper-trading label explicit in payloads. */

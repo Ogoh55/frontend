@@ -165,6 +165,44 @@ export const vaultRateLimits: VaultRateLimitConfig = {
 };
 
 /**
+ * Verified-build registry entry for a deployed contract (issue #264).
+ *
+ * Mirrors the versioned machine-readable registry consumed by the SDK and
+ * docs. `verified` is false while a freshly deployed revision is pending
+ * audit sign-off — such entries must be surfaced as unverified, never
+ * silently trusted.
+ */
+export interface VerifiedContractEntry {
+  /** Canonical on-chain contract ID (Strkey `C...`). */
+  contractId: string;
+  /** Hex-encoded SHA-256 of the reproducible WASM build. */
+  wasmHash: string;
+  /** Audited source revision (git SHA) the WASM was built from. */
+  auditRevision: string;
+  /** Whether the audit sign-off has been recorded for this revision. */
+  verified: boolean;
+}
+
+/**
+ * Registry lookup for the active network's vault contract.
+ *
+ * Returns `undefined` when no vault contract is configured. When a contract ID
+ * is configured but has no matching verified registry entry, the returned
+ * entry is marked `verified: false` so consumers can visibly flag it.
+ */
+export function getVaultRegistryEntry(
+  registry: Partial<Record<"testnet" | "mainnet", VerifiedContractEntry[]>>,
+): VerifiedContractEntry | undefined {
+  const contractId = governableContractIds.vault;
+  if (!contractId) return undefined;
+  const network = env.NEXT_PUBLIC_STELLAR_NETWORK === "mainnet" ? "mainnet" : "testnet";
+  const entries = registry[network] ?? [];
+  const match = entries.find((entry) => entry.contractId === contractId);
+  if (match) return match;
+  return { contractId, wasmHash: "", auditRevision: "", verified: false };
+}
+
+/**
  * Soroban RPC resilience configuration (issue #282).
  *
  * `SOROBAN_RPC_URLS` is a comma-separated list of RPC endpoints used by the

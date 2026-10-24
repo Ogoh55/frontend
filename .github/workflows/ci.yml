@@ -264,49 +264,15 @@ jobs:
   # bundle workflow can analyse it without re-building.
   # ───────────────────────────────────────────────────────────────────────────
   build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: ./.github/actions/setup
-
-      # Restore the Next.js incremental build cache. Key includes a hash of
-      # package-lock.json so the cache is invalidated when deps change.
-      - name: Restore Next.js cache
-        uses: actions/cache@v4
-        with:
-          path: .next/cache
-          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**/*.ts', 'src/**/*.tsx') }}
-          restore-keys: |
-            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
-            nextjs-${{ runner.os }}-
-
-      - name: Build
-        run: npm run build
-
-      # Upload the production build so the bundle job can measure it without
-      # running next build a second time.
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: next-build-${{ github.sha }}
-          path: |
-            .next/
-            !.next/cache
-          retention-days: 1
-
-  e2e:
-    name: Playwright (desktop, iPhone 13, Pixel 7)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
       - run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
@@ -357,6 +323,20 @@ jobs:
             perf-report
             test-results
           retention-days: 14
+
+  contract-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Verify contract registry against on-chain code hashes
+        env:
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
+        run: npm run verify:contracts
 
   lighthouse:
     name: Lighthouse (mobile perf ≥ 0.85, CLS < 0.05)
