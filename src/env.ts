@@ -26,6 +26,11 @@ const parsed = parseEnv({
   NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS: process.env.NEXT_PUBLIC_ANCHOR_MAINNET_ASSETS,
   NEXT_PUBLIC_STATUS_PAGE_URL: process.env.NEXT_PUBLIC_STATUS_PAGE_URL,
   NEXT_PUBLIC_INCIDENT_FEED_URL: process.env.NEXT_PUBLIC_INCIDENT_FEED_URL,
+  SOROBAN_RPC_URLS: process.env.SOROBAN_RPC_URLS,
+  SOROBAN_RPC_MAX_CONCURRENCY: process.env.SOROBAN_RPC_MAX_CONCURRENCY,
+  SOROBAN_RPC_MAX_ATTEMPTS: process.env.SOROBAN_RPC_MAX_ATTEMPTS,
+  SOROBAN_RPC_BASE_BACKOFF_MS: process.env.SOROBAN_RPC_BASE_BACKOFF_MS,
+  SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS: process.env.SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS,
 });
 
 export const env = {
@@ -174,4 +179,164 @@ export const statusPageConfig: StatusPageConfig = {
 /** Whether a public status page is configured for the active deployment. */
 export function isStatusPageConfigured(): boolean {
   return Boolean(statusPageConfig.statusPageUrl);
+}
+
+/**
+ * Soroban RPC resilience configuration (issue #282).
+ *
+ * `SOROBAN_RPC_URLS` is a comma-separated list of RPC endpoints used by the
+ * server-side provider pool. When unset, the active network's default RPC URL
+ * is used as a single-provider pool. Production builds fail fast when the list
+ * is missing so a misconfigured deploy never silently degrades to one provider.
+ */
+export type SorobanRpcConfig = {
+  /** Ordered list of RPC endpoints; the first healthy provider is preferred. */
+  urls: string[];
+  /** Bounded concurrency for batched/parallel reads. */
+  maxConcurrency: number;
+  /** Bounded retry attempts per read (never applied to signed submissions). */
+  maxAttempts: number;
+  /** Base delay for exponential backoff with jitter, in milliseconds. */
+  baseBackoffMs: number;
+  /** How long to wait for ledger inclusion before returning `pending`. */
+  confirmationTimeoutMs: number;
+};
+
+function parsePositiveInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${name}: expected a positive integer, received "${raw}"`);
+  }
+  return value;
+}
+
+function parseRpcUrls(raw: string | undefined, fallback: string): string[] {
+  const source = raw === undefined || raw.trim() === "" ? fallback : raw;
+  const urls = source
+    .split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+  if (urls.length === 0) {
+    throw new Error("SOROBAN_RPC_URLS must contain at least one RPC endpoint");
+  }
+  for (const url of urls) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(url);
+    } catch {
+      throw new Error(`Invalid SOROBAN_RPC_URLS entry: "${url}" is not a valid URL`);
+    }
+  }
+  return urls;
+}
+
+const isProduction = process.env.NODE_ENV === "production";
+
+if (isProduction && (parsed.SOROBAN_RPC_URLS === undefined || parsed.SOROBAN_RPC_URLS.trim() === "")) {
+  throw new Error(
+    "SOROBAN_RPC_URLS is required in production: configure a comma-separated list of Soroban RPC endpoints",
+  );
+}
+
+export const sorobanRpcConfig: SorobanRpcConfig = {
+  urls: parseRpcUrls(parsed.SOROBAN_RPC_URLS, activeStellarNetwork.rpcUrl),
+  maxConcurrency: parsePositiveInt(parsed.SOROBAN_RPC_MAX_CONCURRENCY, 4, "SOROBAN_RPC_MAX_CONCURRENCY"),
+  maxAttempts: parsePositiveInt(parsed.SOROBAN_RPC_MAX_ATTEMPTS, 3, "SOROBAN_RPC_MAX_ATTEMPTS"),
+  baseBackoffMs: parsePositiveInt(parsed.SOROBAN_RPC_BASE_BACKOFF_MS, 200, "SOROBAN_RPC_BASE_BACKOFF_MS"),
+  confirmationTimeoutMs: parsePositiveInt(
+    parsed.SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS,
+    15_000,
+    "SOROBAN_RPC_CONFIRMATION_TIMEOUT_MS",
+  ),
+};
+
+/**
+ * Internal service identities that participate in service-to-service auth
+ * (issue #289). Each service authenticates with its own short-lived signed
+ * token; there are no shared static bearer secrets.
+ */
+export type InternalServiceName = "bff" | "api" | "indexer" | "scheduler" | "keeper";
+
+/**
+ * Narrow scope claims a service token may carry. Handlers verify these
+ * explicitly so a compromised service cannot exceed its least-privilege role
+ * (e.g. the indexer cannot submit transactions, the keeper cannot read PII).
+ */
+export type ServiceScope =
+  | "tx:submit"
+  | "epoch:mutate"
+  | "index:read"
+  | "pii:read"
+  | "notify:send";
+
+/**
+ * Frontend-visible subset of the service-auth configuration (issue #289).
+ *
+ * Only non-secret values are surfaced here. Signing keys and managed-store
+ * references are read server-side from the managed secret store and are never
+ * inlined into this module or checked into config.
+ */
+export const serviceAuthConfig = {
+  /** Whether mTLS is required for internal calls (disabled only in local dev). */
+  requireMtls: env.NODE_ENV === "production",
+  /**
+   * Dev bypass for mTLS. Hard-disabled in production so it can never be
+   * enabled there, even if the env var is set.
+   */
+  allowDevBypass: env.NODE_ENV !== "production",
+  /** Clock-skew tolerance (seconds) applied when validating token expiry. */
+  clockSkewSeconds: 60,
+  /** Maximum lifetime (seconds) of a short-lived service token. */
+  maxTokenTtlSeconds: 300,
+} as const;
+
+/**
+ * Least-privilege scope grants per internal service (issue #289).
+ *
+ * The indexer is read-only and cannot submit transactions; the keeper can
+ * mutate epoch state but cannot read depositor PII it does not need.
+ */
+export const serviceScopeGrants: Record<InternalServiceName, readonly ServiceScope[]> = {
+  bff: ["index:read", "notify:send"],
+  api: ["index:read", "tx:submit", "pii:read"],
+  indexer: ["index:read"],
+  scheduler: ["epoch:mutate"],
+  keeper: ["epoch:mutate"],
+};
+
+/**
+ * Egress allowlist (issue #289): the only outbound destinations internal
+ * services may reach. Denied outbound calls are logged and alerted.
+ */
+export const egressAllowlist: readonly string[] = [
+  "soroban-testnet.stellar.org",
+  "soroban.stellar.org",
+  "horizon-testnet.stellar.org",
+  "horizon.stellar.org",
+] as const;
+
+/**
+ * Validate the frontend-visible service-auth subset (issue #289).
+ *
+ * Production must fail to boot when a required service credential reference
+ * is missing or still a placeholder. Returns the list of problems so callers
+ * can surface them via Sentry and abort startup.
+ */
+export function validateServiceAuthConfig(
+  source: Record<string, string | undefined> = process.env,
+): string[] {
+  const problems: string[] = [];
+  if (env.NODE_ENV !== "production") return problems;
+
+  const services: InternalServiceName[] = ["bff", "api", "indexer", "scheduler", "keeper"];
+  for (const service of services) {
+    const ref = source[`SERVICE_CREDENTIAL_REF_${service.toUpperCase()}`];
+    if (!ref) {
+      problems.push(`Missing managed-store reference for service credential: ${service}`);
+    } else if (/placeholder|changeme|example/i.test(ref)) {
+      problems.push(`Placeholder service credential reference rejected: ${service}`);
+    }
+  }
+  return problems;
 }

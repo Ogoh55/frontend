@@ -37,6 +37,7 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+/packages/*/dist
 next-env.d.ts
 
 # test output

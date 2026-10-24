@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["core", "strategies"]
+
+[package]
+name = "zenith-options-vault"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Phase 2 option-writing vault contract (scaffold: storage layout, roles, pause, upgrade, events)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk.workspace = true
+zenith-options-vault-common = { path = "../vault-common" }

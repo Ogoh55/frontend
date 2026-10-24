@@ -1,7 +1,14 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import { useElementWidth } from "../lib/useElementWidth";
+import { useChartA11y } from "../lib/hooks/useChartA11y";
+import { ChartTable } from "./ChartTable";
+
+const visuallyHidden: CSSProperties = {
+  position: "absolute", width: 1, height: 1, overflow: "hidden",
+  clip: "rect(0 0 0 0)", whiteSpace: "nowrap",
+};
 
 interface VolSmileProps {
   baseVol: number;   // e.g. 0.82
@@ -55,8 +62,20 @@ export function VolSmile({ baseVol, width = 260, height = 110 }: VolSmileProps) 
       v, y: toY(v), label: `${Math.round(v * 100)}%`
     }));
 
-    return { pts, path, area, atmX, atmY, yLabels };
+    const lo = Math.min(...smile);
+    const hi = Math.max(...smile);
+    const summary = `Volatility smile, 70% to 130% moneyness. ATM ${Math.round(baseVol * 100)}%, ` +
+      `implied vol ranges from ${Math.round(lo * 100)}% to ${Math.round(hi * 100)}%.`;
+
+    return { pts, path, area, atmX, atmY, yLabels, summary };
   }, [baseVol, W, H]);
+
+  const [showTable, setShowTable] = useState(false);
+  const a11y = useChartA11y(data.pts.length, i => {
+    const p = data.pts[i];
+    return `Moneyness ${Math.round(p.m * 100)}%, implied vol ${Math.round(p.v * 100)}%`;
+  });
+  const active = a11y.active === null ? null : data.pts[a11y.active];
 
   return (
     <div ref={containerRef} className="zn-chart">
@@ -65,8 +84,23 @@ export function VolSmile({ baseVol, width = 260, height = 110 }: VolSmileProps) 
         color: "var(--text-lo)", marginBottom: 8
       }}>
         Volatility Smile
+        <button type="button" aria-pressed={showTable}
+          onClick={() => setShowTable(v => !v)}
+          style={{ marginLeft: 8, fontSize: 10, color: "var(--text-lo)", background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>
+          {showTable ? "View as chart" : "View as table"}
+        </button>
       </div>
-      <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
+      {showTable ? (
+        <ChartTable
+          caption="Volatility smile by moneyness"
+          headers={["Moneyness", "Implied vol"]}
+          rows={data.pts.map(p => [`${Math.round(p.m * 100)}%`, `${Math.round(p.v * 100)}%`])}
+        />
+      ) : (
+      <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}
+        role="img" aria-label={data.summary} tabIndex={0}
+        onKeyDown={a11y.onKeyDown}
+        style={{ outline: "none" }}>
         <defs>
           <linearGradient id="smile-grad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="rgba(139,92,246,0.20)" />
@@ -98,15 +132,27 @@ export function VolSmile({ baseVol, width = 260, height = 110 }: VolSmileProps) 
 
           {/* Smile curve */}
           <path d={data.path} fill="none"
-            stroke="#B59665" strokeWidth={1.5}
+            style={{ stroke: "var(--atm)" }} strokeWidth={1.5}
             strokeLinecap="round" strokeLinejoin="round"
             clipPath="url(#smile-clip)"
           />
 
           {/* ATM dot */}
           <circle cx={data.atmX} cy={data.atmY} r={3}
-            fill="var(--bg-elevated)" stroke="#B59665" strokeWidth={1.5}
+            fill="var(--bg-elevated)" style={{ stroke: "var(--atm)" }} strokeWidth={1.5}
           />
+
+          {/* Keyboard crosshair (arrow keys) */}
+          {active && (
+            <g>
+              <line x1={active.x} y1={0} x2={active.x} y2={H}
+                stroke="var(--text-mid)" strokeWidth={1} strokeDasharray="1 3"
+              />
+              <circle cx={active.x} cy={active.y} r={4}
+                fill="none" stroke="var(--text-hi)" strokeWidth={1.5}
+              />
+            </g>
+          )}
 
           {/* Y labels */}
           {data.yLabels.map(l => (
@@ -141,6 +187,8 @@ export function VolSmile({ baseVol, width = 260, height = 110 }: VolSmileProps) 
           />
         </g>
       </svg>
+      )}
+      <div role="status" aria-live="polite" style={visuallyHidden}>{a11y.announcement}</div>
     </div>
   );
 }

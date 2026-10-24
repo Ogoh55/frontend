@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useId } from "react";
+import { useFocusTrap } from "../lib/hooks/useFocusTrap";
 
 interface Props {
   open: boolean;
@@ -20,8 +21,10 @@ interface Props {
  * screens (matches the .zn-confirm-backdrop / .zn-confirm-panel CSS rules
  * in globals.css).
  *
- * Focus is trapped inside and restored on close; Escape and backdrop
- * click cancel; Enter / Space on the confirm button proceeds.
+ * Focus is trapped inside and restored on close, starting on the confirm
+ * button; Escape and backdrop click cancel; Enter / Space on the confirm
+ * button proceeds. Ids are per-instance so a confirm nested in another
+ * dialog (e.g. the roll wizard) doesn't collide.
  */
 export function ConfirmDialog({
   open,
@@ -34,21 +37,12 @@ export function ConfirmDialog({
   onCancel,
   children,
 }: Props) {
-  const panelRef = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const titleId = `${id}-title`;
+  const descriptionId = `${id}-description`;
 
-  // Restore focus to whatever had it before the dialog opened
-  const triggerRef = useRef<Element | null>(null);
-  useEffect(() => {
-    if (open) {
-      triggerRef.current = document.activeElement;
-      // Move focus into the panel on the next tick so the panel is in the DOM
-      requestAnimationFrame(() => {
-        panelRef.current?.querySelector<HTMLElement>("[autofocus], button")?.focus();
-      });
-    } else {
-      (triggerRef.current as HTMLElement | null)?.focus();
-    }
-  }, [open]);
+  // Traps Tab inside the panel, starts on [data-autofocus], restores focus on close
+  const panelRef = useFocusTrap<HTMLDivElement>(open);
 
   // Escape to cancel
   useEffect(() => {
@@ -67,24 +61,25 @@ export function ConfirmDialog({
   return (
     <div
       className="zn-confirm-backdrop"
-      aria-modal="true"
       onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}
     >
       <div
         ref={panelRef}
         role="dialog"
-        aria-labelledby="confirm-dialog-title"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
         className="zn-confirm-panel"
       >
         <div
-          id="confirm-dialog-title"
+          id={titleId}
           style={{ fontSize: 15, fontWeight: 700, color: "var(--text-hi)", marginBottom: 10 }}
         >
           {title}
         </div>
 
         {description && (
-          <div style={{ fontSize: 13, color: "var(--text-mid)", lineHeight: 1.6, marginBottom: 16 }}>
+          <div id={descriptionId} style={{ fontSize: 13, color: "var(--text-mid)", lineHeight: 1.6, marginBottom: 16 }}>
             {description}
           </div>
         )}
@@ -109,7 +104,7 @@ export function ConfirmDialog({
           </button>
           <button
             type="button"
-            autoFocus
+            data-autofocus
             onClick={onConfirm}
             style={{
               flex: 1,
