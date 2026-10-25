@@ -1,23 +1,46 @@
 /**
- * Vault on-chain operations: deposit collateral into the Zenith vault
- * contract and withdraw free collateral back to the wallet.
+ * @module vault  (MARGIN-COLLATERAL VAULT — single instance)
  *
- * This is the margin-collateral vault (NEXT_PUBLIC_VAULT_CONTRACT_ID). It is
- * unrelated to the Phase 2 options vault scaffolded in `contracts/vault`
- * (wired later via `./vaults.ts`).
+ * On-chain operations for the Zenith **margin-collateral vault**: deposit
+ * collateral and withdraw free collateral back to the wallet.
  *
- * Both flows use the same pattern:
- *   1. Ask the backend to build a Soroban transaction XDR.
- *   2. Ask Freighter to sign it.
- *   3. Submit to Horizon/Soroban RPC.
- *   4. Return the confirmed transaction hash.
+ * ┌──────────────────────────────────────────────────────────────────────────┐
+ * │  SURFACE DISAMBIGUATION — READ THIS BEFORE TOUCHING EITHER FILE          │
+ * │                                                                           │
+ * │  There are TWO unrelated vault surfaces in this codebase:                │
+ * │                                                                           │
+ * │  1. MARGIN-COLLATERAL VAULT  ← YOU ARE HERE                              │
+ * │     • File   : src/lib/api/vault.ts   (singular)                         │
+ * │     • Env    : NEXT_PUBLIC_VAULT_CONTRACT_ID                             │
+ * │     • Purpose: Holds user collateral that backs open option positions.   │
+ * │                One contract, one global instance per network.            │
+ * │     • BFF    : POST /api/v1/onchain/build-deposit                        │
+ * │                POST /api/v1/onchain/build-withdraw                       │
+ * │                                                                          │
+ * │  2. PHASE 2 OPTIONS VAULTS  ← src/lib/api/vaults.ts  (plural)           │
+ * │     • File   : src/lib/api/vaults.ts  (plural)                          │
+ * │     • Env    : NEXT_PUBLIC_VAULTS=mock|live                              │
+ * │     • Purpose: Share-based, epoch-driven option-writing vaults.          │
+ * │                Multiple instances; registry exposed via /api/v1/vaults.  │
+ * │     • BFF    : GET/POST /api/v1/vaults/*                                 │
+ * │                                                                          │
+ * │  Full reference: docs/vault-surfaces.md                                  │
+ * └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * Signing: currently uses Freighter directly (`freighterApi.signTransaction`).
+ * For multi-wallet support (xBull, Ledger, WalletConnect) see the
+ * `VaultWalletAdapter` in src/lib/api/vaultWalletAdapter.ts and issue #252.
+ *
+ * Transaction flow:
+ *   1. Call the BFF to build a Soroban transaction XDR (amounts computed
+ *      server-side; client never constructs the transaction itself).
+ *   2. Sign the XDR via the wallet adapter.
+ *   3. Submit to Horizon/Soroban RPC via submitTransactionXdr.
+ *   4. Ask the BFF to confirm ledger inclusion and re-read state.
  *
  * The contract address lives in NEXT_PUBLIC_VAULT_CONTRACT_ID; if not
  * set the helpers throw so the UI can surface a clear error rather than
  * sending garbage.
- *
- * History comes from Horizon contract-event filtering; we translate those
- * into a lightweight VaultEvent shape for the UI.
  *
  * Resilience (#282): the BFF owns the Soroban RPC provider pool, failover,
  * batching, and read-after-write confirmation. This module surfaces the
@@ -26,10 +49,13 @@
  */
 
 import { submitTransactionXdr } from "./stellar";
-import freighterApi from "@stellar/freighter-api";
 import { Networks, TransactionBuilder } from "@stellar/stellar-sdk";
 import { bffFetch } from "./client";
 import { IDEMPOTENCY_HEADER } from "./resilience/idempotency";
+import {
+  createFreighterAdapter,
+  type VaultWalletAdapter,
+} from "./vaultWalletAdapter";
 
 export const VAULT_CONTRACT_ID =
   process.env.NEXT_PUBLIC_VAULT_CONTRACT_ID ?? null;
@@ -171,24 +197,34 @@ async function submitSignedVaultTx(
 }
 
 /**
- * Asks the backend to build an XDR for a vault deposit, has Freighter sign
- * it, submits to Horizon, and returns the tx hash.
+ * Asks the backend to build an XDR for a vault deposit, signs it via the
+ * provided wallet adapter (Freighter, xBull, Ledger, or WalletConnect), and
+ * submits it to Horizon.
  *
  * `idempotencyKey` identifies this user intent (see useIdempotencyKey). Reusing
  * it on a retry makes the backend return the original build, so a resubmit
  * can't create a second deposit.
+ *
+ * `adapter` defaults to a Freighter adapter for backward compatibility. Pass
+ * the result of `createXBullAdapter`, `createLedgerAdapter`, or
+ * `createWalletConnectAdapter` (all from `./vaultWalletAdapter`) to sign with
+ * a different wallet.
  */
 export async function depositToVault(
   address: string,
   amount: number,
   _session: string,
-  idempotencyKey: string
+  idempotencyKey: string,
+  adapter?: VaultWalletAdapter
 ): Promise<VaultOperationResult> {
   if (!VAULT_CONTRACT_ID) {
     throw new Error(
       "NEXT_PUBLIC_VAULT_CONTRACT_ID is not configured. Vault operations are unavailable."
     );
   }
+
+  const signer =
+    adapter ?? createFreighterAdapter(address, NETWORK_PASSPHRASE);
 
   // Authenticated by the BFF session cookie (#118).
   const buildRes = await bffFetch("/api/v1/onchain/build-deposit", {
@@ -208,9 +244,7 @@ export async function depositToVault(
   }
 
   const { xdr } = (await buildRes.json()) as { xdr: string };
-  const signed = await freighterApi.signTransaction(xdr, {
-    accountToSign: address,
-  });
+  const signed = await signer.signTransaction(xdr);
   const { hash, confirmation } = await submitSignedVaultTx(signed, "deposit");
 
   return {
@@ -228,13 +262,17 @@ export async function depositToVault(
  * Validates against the backend's free-collateral figure before building the
  * transaction so the user gets an early rejection rather than an on-chain
  * failure. `idempotencyKey` works as in `depositToVault`.
+ *
+ * `adapter` defaults to a Freighter adapter for backward compatibility. See
+ * `depositToVault` for the multi-wallet pattern.
  */
 export async function withdrawFromVault(
   address: string,
   amount: number,
   _session: string,
   freeCollateral: number,
-  idempotencyKey: string
+  idempotencyKey: string,
+  adapter?: VaultWalletAdapter
 ): Promise<VaultOperationResult> {
   if (!VAULT_CONTRACT_ID) {
     throw new Error(
@@ -248,6 +286,9 @@ export async function withdrawFromVault(
         "Close or reduce positions to unlock collateral first."
     );
   }
+
+  const signer =
+    adapter ?? createFreighterAdapter(address, NETWORK_PASSPHRASE);
 
   // Authenticated by the BFF session cookie (#118).
   const buildRes = await bffFetch("/api/v1/onchain/build-withdraw", {
@@ -267,9 +308,7 @@ export async function withdrawFromVault(
   }
 
   const { xdr } = (await buildRes.json()) as { xdr: string };
-  const signed = await freighterApi.signTransaction(xdr, {
-    accountToSign: address,
-  });
+  const signed = await signer.signTransaction(xdr);
   const { hash, confirmation } = await submitSignedVaultTx(signed, "withdraw");
 
   return {
