@@ -6,6 +6,7 @@ import { toCsv, type CsvColumn } from "../csv";
 import freighterApi from "@stellar/freighter-api";
 import { submitTransactionXdr } from "./stellar";
 import { computeVaultHealthScore, type VaultHealthScore } from "../vaultHealth";
+import type { BootstrapPhase, VaultBootstrapConfig } from "./vaultBootstrap";
 
 /**
  * Vault transaction receipts client.
@@ -1468,6 +1469,13 @@ export interface VaultSummary {
   maxDrawdownPct: number | null;
   /** Computed health score for depositor decision support. */
   healthScore: VaultHealthScore;
+  /**
+   * Bootstrap phase for new vaults. Null once the vault has started writing
+   * options (phase === "live"). Present during treasury seeding and the
+   * genesis epoch so the listing page can surface a "Bootstrapping" badge
+   * instead of normal deposit/APY UX.
+   */
+  bootstrapPhase: BootstrapPhase | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1897,6 +1905,18 @@ export interface VaultDetail extends VaultSummary {
   inflationDefense?: InflationDefenseConfig;
   /** Computed health score and grade for depositor decision support. */
   healthScore: VaultHealthScore;
+  /**
+   * Bootstrap configuration for this vault. Present for all vaults during and
+   * after bootstrap so operators can review the policy. Null for vaults that
+   * predate the bootstrap feature.
+   */
+  bootstrapConfig: VaultBootstrapConfig | null;
+  /**
+   * USD value of treasury seed capital still held in the vault.
+   * Zero once the seed has been withdrawn (for temporary seeds) or
+   * for vaults with no treasury seed. Never null after bootstrap.
+   */
+  treasurySeedRetainedUsd: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,7 +1953,7 @@ const MOCK_VAULTS: Omit<VaultDetail, "healthScore">[] = [
       { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
       { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
     ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
+    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0, distributions: [] },
   },
   {
     id: "btc-csp-v1",
@@ -2028,6 +2048,8 @@ export async function fetchVaults(): Promise<VaultSummary[]> {
   return Promise.resolve(
     MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => ({
       ...summary,
+      // Bootstrap: all fixtures are mature vaults already in live phase.
+      bootstrapPhase: null as import("./vaultBootstrap").BootstrapPhase | null,
       healthScore: computeVaultHealthScore(
         { strategy: summary.strategy, tvl: summary.tvl, capacity: summary.capacity },
         historicalEpochs,
@@ -2047,7 +2069,14 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     { strategy: raw.strategy, tvl: raw.tvl, capacity: raw.capacity },
     raw.historicalEpochs,
   );
-  return Promise.resolve({ ...raw, healthScore });
+  return Promise.resolve({
+    ...raw,
+    healthScore,
+    // Bootstrap: fixtures are mature vaults; no bootstrap state or treasury seed.
+    bootstrapPhase: null as import("./vaultBootstrap").BootstrapPhase | null,
+    bootstrapConfig: null,
+    treasurySeedRetainedUsd: 0,
+  });
 }
 
 export async function depositToVault(
